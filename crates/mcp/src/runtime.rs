@@ -9,7 +9,10 @@
 //! - `server_status` and `job_status` are answered by the main thread at any time;
 //! - on SIGTERM / SIGINT / SIGHUP (or Ctrl+C, closing the console on Windows), on the client
 //!   going away with unsaved changes, and on a panic, the open document is auto-saved to a
-//!   recovered file ([`crate::recover`]).
+//!   recovered file ([`crate::recover`]);
+//! - while there is unsaved work, it is checkpointed to that recovered file every
+//!   `checkpoint_edits` edits or `checkpoint_every` (in the background), so a kill that can't be
+//!   caught (SIGKILL, the OOM killer, `TerminateProcess` on Windows) loses at most that much.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -37,6 +40,8 @@ pub struct Shared {
     pub backend: String,
     /// The document state last auto-saved (not saved twice).
     pub autosaved: Option<(u64, u64)>,
+    /// The last checkpoint: its file, the document state it holds, when.
+    pub checkpoint: Option<Value>,
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
@@ -61,11 +66,110 @@ pub struct Options {
     pub job_after: Duration,
     /// How long to let a running call finish when the client goes away.
     pub drain: Duration,
+    /// Checkpoint unsaved work after this many edits (0: not by edits).
+    pub checkpoint_edits: u32,
+    /// Checkpoint unsaved work this long after its first edit since the last checkpoint (`None`:
+    /// not by time).
+    pub checkpoint_every: Option<Duration>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { job_after: Duration::from_millis(15_000), drain: Duration::from_secs(30) }
+        Options {
+            job_after: Duration::from_millis(15_000),
+            drain: Duration::from_secs(30),
+            checkpoint_edits: 20,
+            checkpoint_every: Some(Duration::from_secs(60)),
+        }
+    }
+}
+
+/// The checkpoint bookkeeping of the main thread.
+#[derive(Default)]
+struct Checkpoints {
+    /// The document state last seen.
+    seen: Option<(u64, u64)>,
+    /// Edits since the last checkpoint.
+    edits: u32,
+    /// The first unsaved edit since the last checkpoint.
+    since: Option<Instant>,
+    /// The checkpoint being written.
+    running: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Checkpoints {
+    /// Let a checkpoint being written finish (before an auto-save on the way out).
+    fn finish(&mut self) {
+        if let Some(h) = self.running.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// After every event: count edits, and write a checkpoint in the background when it is due;
+    /// drop the checkpoint once the document is saved.
+    fn tick(&mut self, shared: &SharedState, options: &Options) {
+        if self.running.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            self.finish();
+        }
+        let Some((rev, dirty, root)) = shared.lock().ok().and_then(|g| g.snapshot.as_ref().map(|s| (s.rev, s.dirty, g.write_root.clone()))) else {
+            return;
+        };
+        if self.seen != Some(rev) {
+            match self.seen {
+                Some((doc, _)) if doc == rev.0 && dirty => self.edits = self.edits.saturating_add(1),
+                Some((doc, _)) if doc != rev.0 => self.edits = u32::from(dirty),
+                _ => {}
+            }
+            if dirty && self.since.is_none() {
+                self.since = Some(Instant::now());
+            }
+            self.seen = Some(rev);
+        }
+        if !dirty {
+            self.edits = 0;
+            self.since = None;
+            if self.running.is_none() {
+                let dir = recover::recovery_dir(root.as_deref(), None);
+                recover::discard_checkpoint(rev.0, &dir);
+                if let Ok(mut g) = shared.lock()
+                    && g.checkpoint.as_ref().is_some_and(|c| c["document"] == json!(rev.0))
+                {
+                    g.checkpoint = None;
+                }
+            }
+            return;
+        }
+        if self.running.is_some() {
+            return;
+        }
+        let by_edits = options.checkpoint_edits > 0 && self.edits >= options.checkpoint_edits;
+        let by_time = options.checkpoint_every.is_some_and(|d| self.since.is_some_and(|t| t.elapsed() >= d));
+        if !(by_edits || by_time) {
+            return;
+        }
+        let Some(snap) = shared.lock().ok().and_then(|g| g.snapshot.clone()) else { return };
+        let (edits, shared) = (self.edits, shared.clone());
+        self.edits = 0;
+        self.since = None;
+        let spawned = std::thread::Builder::new().name("mcp-checkpoint".into()).spawn(move || {
+            let dir = recover::recovery_dir(root.as_deref(), Some(&snap));
+            match recover::checkpoint(&snap, &dir) {
+                Ok(Some(p)) => {
+                    if let Ok(mut g) = shared.lock() {
+                        g.checkpoint = Some(json!({
+                            "path": p.to_string_lossy(),
+                            "document": snap.rev.0,
+                            "revision": snap.rev.1,
+                            "edits": edits,
+                            "at": wordcraft_engine::cmd::now_iso(),
+                        }));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("wordcraft-cli: could not write a checkpoint: {e}"),
+            }
+        });
+        self.running = spawned.ok();
     }
 }
 
@@ -97,6 +201,18 @@ struct Job {
 
 /// The status `server_status` answers.
 pub fn status_json(shared: &Shared, jobs: Vec<Value>, busy: Value, started: Instant, limits: &crate::whiq::Limits) -> Value {
+    status_json_with(shared, jobs, busy, started, limits, None)
+}
+
+/// [`status_json`] with the runtime's checkpoint policy.
+fn status_json_with(
+    shared: &Shared,
+    jobs: Vec<Value>,
+    busy: Value,
+    started: Instant,
+    limits: &crate::whiq::Limits,
+    options: Option<&Options>,
+) -> Value {
     let doc = shared.snapshot.as_ref().map(Snapshot::info);
     let doc_bytes = shared.snapshot.as_ref().map(|s| recover::doc_bytes(&s.doc));
     json!({
@@ -115,6 +231,11 @@ pub fn status_json(shared: &Shared, jobs: Vec<Value>, busy: Value, started: Inst
         },
         "author": shared.author,
         "limits": {"max_result_bytes": limits.max_result_bytes, "max_image_bytes": limits.max_image_bytes},
+        "checkpoints": {
+            "every_edits": options.map(|o| o.checkpoint_edits),
+            "every_ms": options.and_then(|o| o.checkpoint_every).map(|d| d.as_millis() as u64),
+            "last": shared.checkpoint,
+        },
     })
 }
 
@@ -247,6 +368,7 @@ pub fn serve(
         });
     }
     let mut inflight: Option<Inflight> = None;
+    let mut checkpoints = Checkpoints::default();
     let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
     let mut next_job = 1u64;
     let mut eof = false;
@@ -273,6 +395,10 @@ pub fn serve(
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
+        // Unsaved work is checkpointed every few edits or seconds (in the background).
+        if !matches!(ev, Some(Event::Signal | Event::Eof)) {
+            checkpoints.tick(&shared, &options);
+        }
         match ev {
             Some(Event::Line(line)) => {
                 let line = line.trim().to_string();
@@ -329,7 +455,10 @@ pub fn serve(
                         let result = match t {
                             "server_status" => {
                                 let g = shared.lock().map_err(|_| std::io::Error::other("state poisoned"))?;
-                                crate::whiq::json_result(status_json(&g, jobs_json(&jobs), busy_json(&inflight), started, &limits), &[])
+                                crate::whiq::json_result(
+                                    status_json_with(&g, jobs_json(&jobs), busy_json(&inflight), started, &limits, Some(&options)),
+                                    &[],
+                                )
                             }
                             _ => job_status(&args, &mut jobs, &inflight),
                         };
@@ -392,6 +521,7 @@ pub fn serve(
                     jobs.remove(&oldest);
                 }
                 if eof && inflight.is_none() {
+                    checkpoints.finish();
                     autosave_shared(&shared, "the client disconnected");
                     return Ok(());
                 }
@@ -400,11 +530,13 @@ pub fn serve(
                 eof = true;
                 eof_at = Some(Instant::now());
                 if inflight.is_none() {
+                    checkpoints.finish();
                     autosave_shared(&shared, "the client disconnected");
                     return Ok(());
                 }
             }
             Some(Event::Signal) => {
+                checkpoints.finish();
                 autosave_shared(&shared, "the server was stopped");
                 let _ = output.flush();
                 std::process::exit(0);
@@ -423,6 +555,7 @@ pub fn serve(
                     f.deadline = None;
                 }
                 if eof && eof_at.is_some_and(|t| t.elapsed() > options.drain) {
+                    checkpoints.finish();
                     autosave_shared(&shared, "the client disconnected during a call");
                     return Ok(());
                 }

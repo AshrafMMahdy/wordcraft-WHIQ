@@ -33,6 +33,7 @@ USAGE:
   wordcraft-cli parity [--markdown]           feature-catalog parity
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
                     [--job-after-ms N] [--max-result-bytes N] [--max-memory-mb N]
+                    [--checkpoint-edits N] [--checkpoint-secs N]
                                               MCP server on stdio (headless, or bridged to the app).
                                               --automation-read-root / --automation-write-root confine
                                               the files the agent's commands read (open, insert text
@@ -46,7 +47,11 @@ USAGE:
                                               (default 100000) are trimmed with continue_from; past
                                               --max-memory-mb the document is auto-saved and closed.
                                               SIGTERM / SIGINT auto-save unsaved work to
-                                              <name>.recovered-<stamp>.docx in the write root.
+                                              <name>.recovered-<stamp>.docx in the write root;
+                                              unsaved work is checkpointed there every
+                                              --checkpoint-edits edits (default 20) or
+                                              --checkpoint-secs (default 60; 0 turns either off),
+                                              so a hard kill (SIGKILL, TerminateProcess) loses little.
   wordcraft-cli zotero <command> <file> [--cmd 'id={json}' …] [--save OUT] [--trace] [--port P]
                                               run a Zotero command on a document (Zotero must be
                                               running): addEditCitation, addEditBibliography,
@@ -269,6 +274,8 @@ const MCP_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--job-after-ms", takes_value: true },
     OptionSpec { name: "--max-result-bytes", takes_value: true },
     OptionSpec { name: "--max-memory-mb", takes_value: true },
+    OptionSpec { name: "--checkpoint-edits", takes_value: true },
+    OptionSpec { name: "--checkpoint-secs", takes_value: true },
 ];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
@@ -542,6 +549,12 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             let mut options = wordcraft_mcp::runtime::Options::default();
             if let Some(ms) = number("--job-after-ms")? {
                 options.job_after = std::time::Duration::from_millis(ms.clamp(10, 600_000));
+            }
+            if let Some(n) = number("--checkpoint-edits")? {
+                options.checkpoint_edits = n.min(1_000_000) as u32;
+            }
+            if let Some(s) = number("--checkpoint-secs")? {
+                options.checkpoint_every = (s > 0).then(|| std::time::Duration::from_secs(s.min(86_400)));
             }
             let mut limits = wordcraft_mcp::whiq::Limits::default();
             if let Some(b) = number("--max-result-bytes")? {

@@ -130,6 +130,78 @@ fn sigterm_auto_saves_and_the_next_call_names_the_file() {
     assert!(!d.path(".wordcraft-recovered.json").exists());
 }
 
+/// Wait (bounded) until `f` finds something.
+fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < until, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The text of a .docx file on disk.
+fn file_text(path: &std::path::Path) -> String {
+    let doc = wordcraft_docx::read(&std::fs::read(path).unwrap()).unwrap();
+    doc.plain_text(wordcraft_doc::StoryRef::Body).trim_end().to_string()
+}
+
+// §3 A kill that can't be caught (SIGKILL here; TerminateProcess on Windows, the OOM killer):
+// unsaved work is checkpointed every N edits, so it loses at most the edits since the last one,
+// and the next server on the root reports the checkpoint like any recovered work.
+#[test]
+fn a_hard_kill_loses_at_most_the_edits_since_the_last_checkpoint() {
+    let d = Dir::new("checkpoint");
+    let mut m = Mcp::start(&d.0, &["--checkpoint-edits", "3", "--checkpoint-secs", "0"]);
+    m.ok("save_document", json!({"path": "work.docx"}));
+    for w in ["one ", "two ", "three"] {
+        m.ok("type_text", json!({"text": w}));
+    }
+    let ck = wait_for("the checkpoint", || d.names().into_iter().find(|n| n.starts_with("work.recovered-") && n.ends_with(".docx")));
+    let st = wait_for("the checkpoint in server_status", || {
+        let st = m.ok("server_status", json!({}));
+        st["checkpoints"]["last"]["path"].as_str().is_some_and(|p| p.ends_with(&ck)).then_some(st)
+    });
+    assert_eq!(st["checkpoints"]["every_edits"], 3, "{st}");
+    assert!(d.path(".wordcraft-recovered.json").is_file());
+    assert_eq!(file_text(&d.path(&ck)), "one two three");
+    // After the checkpoint: this edit is what a hard kill loses.
+    m.ok("type_text", json!({"text": " four"}));
+    m.child.kill().unwrap();
+    client::wait_exit(&mut m.child);
+    let recovered: Vec<String> = d.names().into_iter().filter(|n| n.starts_with("work.recovered-")).collect();
+    assert_eq!(recovered, std::slice::from_ref(&ck), "{:?}", d.names());
+    let mut m = Mcp::start(&d.0, &[]);
+    let e = m.err("type_text", json!({"text": "x"}), "evicted");
+    assert!(e["next_step"].as_str().unwrap().contains(&ck), "{e}");
+    m.ok("open_document", json!({"path": ck}));
+    assert_eq!(text_of(&mut m), "one two three");
+}
+
+// §3 Checkpoints by time: one file per stretch of unsaved work (rewritten in place), gone once
+// the work is saved.
+#[test]
+fn checkpoints_follow_the_clock_and_go_once_the_work_is_saved() {
+    let d = Dir::new("checkpoint-clock");
+    let mut m = Mcp::start(&d.0, &["--checkpoint-edits", "0", "--checkpoint-secs", "1"]);
+    m.ok("save_document", json!({"path": "clock.docx"}));
+    m.ok("type_text", json!({"text": "tick"}));
+    let ck = wait_for("the checkpoint", || d.names().into_iter().find(|n| n.starts_with("clock.recovered-") && n.ends_with(".docx")));
+    m.ok("type_text", json!({"text": " tock"}));
+    wait_for("the second checkpoint", || (file_text(&d.path(&ck)) == "tick tock").then_some(()));
+    let recovered: Vec<String> = d.names().into_iter().filter(|n| n.starts_with("clock.recovered-")).collect();
+    assert_eq!(recovered, std::slice::from_ref(&ck), "one file for the whole stretch: {:?}", d.names());
+    m.ok("save_document", json!({"path": "clock.docx", "overwrite": true}));
+    wait_for("the checkpoint to go", || (!d.names().iter().any(|n| n.starts_with("clock.recovered-"))).then_some(()));
+    assert!(!d.path(".wordcraft-recovered.json").exists(), "{:?}", d.names());
+    // Nothing unsaved: a hard kill now loses nothing and leaves nothing behind.
+    m.child.kill().unwrap();
+    client::wait_exit(&mut m.child);
+    assert_eq!(d.names(), ["clock.docx"], "{:?}", d.names());
+}
+
 // §3 The client going away with unsaved changes: auto-saved; without changes: nothing written.
 #[test]
 fn disconnecting_with_unsaved_work_auto_saves_it() {

@@ -115,6 +115,21 @@ positional tabs (`w:ptab`, written as tabs), a text-wrapping break's `w:clear`, 
 (`w:sym`, written as text), bookmarks on table columns (`w:colFirst`/`w:colLast`), some VML shapes,
 `docProps/custom.xml`, and a mail-merge data source relationship in `settings.xml`.
 
+## Round 2, 2. Checkpoints: a hard kill loses little
+
+A kill that can't be caught (SIGKILL, the Linux OOM killer, and on Windows `TerminateProcess`,
+which is how a supervisor, Task Manager or a closing parent ends a process there) runs no
+handler, so the auto-saves above (SIGTERM, disconnect, panic, eviction) can't cover it.
+**This is how Windows is covered:** while there is unsaved work, the runtime checkpoints it to the
+document's recovered file every `--checkpoint-edits` edits (default 20) or `--checkpoint-secs`
+seconds after the first unsaved edit (default 60), whichever comes first (0 turns either off). A
+hard kill then loses at most the edits since the last checkpoint, and the next server started on
+the same root reports the checkpoint as `evicted` with its path, like any recovered work.
+
+| Change | Where | Tested by |
+|---|---|---|
+| The main thread counts edits (document revisions) and time; a due checkpoint is written in the background from the last published snapshot, never blocking an answer. One recovered file serves the whole unsaved stretch of a document: each checkpoint replaces it atomically, a later auto-save (SIGTERM, disconnect, panic, eviction, `close_document`) writes its final state there, and an older state never overwrites a newer one (one recovery save at a time, by document revision). The marker lists it (`checkpoint: true`). Once the document is saved, its checkpoint (never reported to the agent) and its marker entry go; a file an auto-save reported stays. `server_status` shows the policy and the last checkpoint (`checkpoints`). | `crates/mcp/src/runtime.rs` (`Checkpoints`, `Options::checkpoint_edits` / `checkpoint_every`), `crates/mcp/src/recover.rs` (`checkpoint`, `discard_checkpoint`), `apps/wordcraft-cli/src/main.rs` (`--checkpoint-edits`, `--checkpoint-secs`) | `a_hard_kill_loses_at_most_the_edits_since_the_last_checkpoint` (SIGKILL after a checkpoint: the checkpoint holds the edits up to it, the next server reports it, reopening it restores them), `checkpoints_follow_the_clock_and_go_once_the_work_is_saved` |
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
