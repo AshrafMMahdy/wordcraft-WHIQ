@@ -16,7 +16,7 @@ const USAGE: &str = "\
 wordcraft-cli — WordCraft from the command line
 
 USAGE:
-  wordcraft-cli convert <in> <out> [--markup] [--format wordml2003|flatopc]
+  wordcraft-cli convert <in> <out> [--markup] [--format wordml2003|flatopc] [--pages 2-4]
                                               convert between formats (docx, doc [read], pdf, odt, rtf, html, md, tex, txt, json, png,
                                               xml); an .xml file is a Word XML Document (Flat OPC), or with
                                               --format wordml2003 a Word 2003 XML Document;
@@ -25,7 +25,7 @@ USAGE:
   wordcraft-cli info <file>                   pages, words, paragraphs, properties (JSON)
   wordcraft-cli text <file>                   plain text
   wordcraft-cli inspect <file>                document structure (JSON)
-  wordcraft-cli render <file> <out.png> [--page N] [--scale S]
+  wordcraft-cli render <file> <out.png> [--page N] [--scale S] [--dpi D] [--pages 2-4 (out-2.png…)] [--markup]
   wordcraft-cli run [--file F | --template T] --cmd 'id={json}' [--cmd …] [--save OUT] [--print]
                     [--author NAME]           run commands headlessly, then save (--author names
                                               who tracked changes and comments are by)
@@ -236,8 +236,19 @@ fn automation_roots(
 }
 
 const NO_OPTIONS: &[OptionSpec] = &[];
-const CONVERT_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markup", takes_value: false }, OptionSpec { name: "--format", takes_value: true }];
-const RENDER_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--page", takes_value: true }, OptionSpec { name: "--scale", takes_value: true }];
+const CONVERT_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--markup", takes_value: false },
+    OptionSpec { name: "--format", takes_value: true },
+    OptionSpec { name: "--pages", takes_value: true },
+];
+const RENDER_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--page", takes_value: true },
+    OptionSpec { name: "--scale", takes_value: true },
+    // WHIQ: a page range, a resolution, Print Markup.
+    OptionSpec { name: "--pages", takes_value: true },
+    OptionSpec { name: "--dpi", takes_value: true },
+    OptionSpec { name: "--markup", takes_value: false },
+];
 const RUN_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--file", takes_value: true },
     OptionSpec { name: "--template", takes_value: true },
@@ -331,15 +342,19 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             let paths: Vec<&String> = rest
                 .iter()
                 .enumerate()
-                .filter(|(n, a)| !a.starts_with("--") && !(*n > 0 && rest.get(n - 1).is_some_and(|p| p == "--format")))
+                .filter(|(n, a)| !a.starts_with("--") && !(*n > 0 && rest.get(n - 1).is_some_and(|p| p == "--format" || p == "--pages")))
                 .map(|(_, a)| a)
                 .collect();
             let missing = || format!("missing argument\n\n{USAGE}");
             let (i, o) = (paths.first().ok_or_else(missing)?.to_string(), paths.get(1).ok_or_else(missing)?.to_string());
             let markup = rest.iter().any(|a| a == "--markup");
             let mut s = open(&i)?;
+            let pages = arg_value(&rest, "--pages");
             let r = if o.to_ascii_lowercase().ends_with(".png") {
                 s.run("file.exportPng", &json!({"path": o, "page": 1, "markup": markup}))
+            } else if let Some(spec) = pages.filter(|_| o.to_ascii_lowercase().ends_with(".pdf")) {
+                // WHIQ: some pages of the PDF.
+                s.run("file.printPdf", &json!({"path": o, "pages": spec, "markup": markup}))
             } else {
                 let mut params = json!({"path": o, "markup": markup});
                 if let Some(f) = format {
@@ -373,10 +388,36 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             validate_options("render", &rest, RENDER_OPTIONS)?;
             let (i, o) = (pos(0)?, pos(1)?);
             let page = parse_page_arg("render", &rest)?.unwrap_or(1);
-            let scale = parse_scale_arg("render", &rest)?.unwrap_or(2.0);
+            let mut scale = parse_scale_arg("render", &rest)?.unwrap_or(2.0);
+            if let Some(d) = arg_value(&rest, "--dpi") {
+                let dpi: f64 = d
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|x: &f64| x.is_finite() && (7.0..=576.0).contains(x))
+                    .ok_or_else(|| format!("render: invalid --dpi `{d}`: 7–576"))?;
+                scale = dpi / 72.0;
+            }
+            let markup = rest.iter().any(|a| a == "--markup");
             let mut s = open(&i)?;
-            let r = s.run("file.exportPng", &json!({"path": o, "page": page, "scale": scale})).map_err(|e| e.to_string())?;
-            write_stdout(|o| writeln!(o, "{r}"))
+            // WHIQ: `--pages 2-4` writes out-2.png, out-3.png, out-4.png.
+            let Some(spec) = arg_value(&rest, "--pages") else {
+                let r = s.run("file.exportPng", &json!({"path": o, "page": page, "scale": scale, "markup": markup})).map_err(|e| e.to_string())?;
+                return write_stdout(|w| writeln!(w, "{r}"));
+            };
+            let total = s.export_layout_with(markup).pages.len();
+            let pages = wordcraft_engine::print::parse_page_range(&spec, total)
+                .map_err(|e| format!("render: --pages {spec}: {e} (the document has {total} pages)"))?;
+            let (stem, ext) = o.rsplit_once('.').map_or((o.as_str(), "png"), |(a, b)| (a, b));
+            let mut out = Vec::new();
+            for p in pages {
+                let path = format!("{stem}-{}.{ext}", p + 1);
+                out.push(
+                    s.run("file.exportPng", &json!({"path": path, "page": p + 1, "scale": scale, "markup": markup})).map_err(|e| e.to_string())?,
+                );
+            }
+            let list = Value::Array(out);
+            write_stdout(|w| writeln!(w, "{list}"))
         }
         "run" => {
             validate_options("run", &rest, RUN_OPTIONS)?;

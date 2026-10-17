@@ -541,3 +541,80 @@ fn markdown_imports_the_platforms_document_shapes_with_a_theme() {
     assert!(t["applied"].as_array().unwrap().iter().any(|x| x == "body font"), "{t}");
     m.err("import_markdown", json!({}), "bad_params");
 }
+
+/// Pages of a PDF (`/Type /Page` objects, not `/Pages`).
+fn pdf_pages(bytes: &[u8]) -> usize {
+    // Objects may sit in compressed object streams: inflate every stream first.
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut at = 0;
+    while let Some(i) = find(bytes, b"stream", at) {
+        let start = i + 6 + if bytes.get(i + 6) == Some(&b'\r') { 2 } else { 1 };
+        let Some(end) = find(bytes, b"endstream", start) else { break };
+        if let Ok(out) = miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[start..end]) {
+            text.push_str(&String::from_utf8_lossy(&out));
+        }
+        at = end + 9;
+    }
+    let t = text.replace("/Type/", "/Type /");
+    t.matches("/Type /Page").count() - t.matches("/Type /Pages").count()
+}
+
+fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
+}
+
+fn png_size(b64: &str) -> (u32, u32) {
+    // The PNG header (IHDR) lies within the first bytes: decode just enough of the base64.
+    let head: String = b64.chars().take(44).collect();
+    let mut bytes = Vec::new();
+    let val = |c: char| "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".find(c).unwrap() as u32;
+    for chunk in head.as_bytes().chunks(4) {
+        let n = chunk.iter().fold(0u32, |acc, c| (acc << 6) | val(*c as char));
+        bytes.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+    }
+    (u32::from_be_bytes(bytes[16..20].try_into().unwrap()), u32::from_be_bytes(bytes[20..24].try_into().unwrap()))
+}
+
+// Render: PNG at a chosen DPI and PDF, with and without markup, for a page range.
+#[test]
+fn pages_render_to_png_and_pdf_by_range_with_and_without_markup() {
+    let d = Dir::new("render");
+    let mut m = Mcp::start(&d.0, &[]);
+    m.ok("import_markdown", json!({"markdown": "# One\n\nFirst page text.\n\n\\pagebreak\n\n# Two\n\nSecond page text.\n\n\\pagebreak\n\n# Three\n\nThird page text.", "footer": "none"}));
+    m.ok("review_edit", json!({"caller": "Reviewer", "ops": [{"op": "replace", "anchor": "Second page", "with": "Middle page"}, {"op": "comment", "anchor": "Third page", "text": "A remark for the margin."}]}));
+    // A range at a DPI: one image per page, sized by the DPI.
+    let r = m.call("render_page", json!({"pages": "1-3", "dpi": 72}));
+    let imgs: Vec<String> =
+        r["content"].as_array().unwrap().iter().filter(|c| c["type"] == "image").map(|c| c["data"].as_str().unwrap().to_string()).collect();
+    assert_eq!(imgs.len(), 3);
+    assert_eq!(png_size(&imgs[0]), (612, 792), "Letter at 72 dpi");
+    let hi = m.call("render_page", json!({"page": 2, "dpi": 144}));
+    assert_eq!(png_size(hi["content"][0]["data"].as_str().unwrap()), (1224, 1584));
+    let some = m.call("render_page", json!({"pages": "2-", "dpi": 36}));
+    assert_eq!(some["structuredContent"]["pages"].as_array().unwrap().iter().map(|p| p["page"].as_u64().unwrap()).collect::<Vec<_>>(), [2, 3]);
+    // With and without markup: the page with the change and comment differs.
+    let plain = m.call("render_page", json!({"page": 3, "dpi": 50, "markup": false}));
+    let marked = m.call("render_page", json!({"page": 3, "dpi": 50, "markup": true}));
+    assert_ne!(plain["content"][0]["data"], marked["content"][0]["data"], "markup shows the comment");
+    assert_eq!(marked["structuredContent"]["markup"], true);
+    m.err("render_page", json!({"pages": "4-9"}), "out_of_range");
+    m.err("render_page", json!({"page": 1, "dpi": 5000}), "bad_params");
+    // PDF: all pages, a range, with and without markup.
+    m.ok("export_pdf", json!({"path": "all.pdf"}));
+    m.ok("export_pdf", json!({"path": "two.pdf", "pages": "2-3"}));
+    m.ok("export_pdf", json!({"path": "marked.pdf", "pages": "2-3", "markup": true}));
+    let (all, two, marked) =
+        (std::fs::read(d.path("all.pdf")).unwrap(), std::fs::read(d.path("two.pdf")).unwrap(), std::fs::read(d.path("marked.pdf")).unwrap());
+    assert_eq!((pdf_pages(&all), pdf_pages(&two), pdf_pages(&marked)), (3, 2, 2));
+    assert_ne!(two, marked, "markup changes the PDF");
+    m.err("export_pdf", json!({"path": "bad.pdf", "pages": "7"}), "out_of_range");
+    // The command line does the same.
+    m.ok("save_document", json!({"path": "doc.docx"}));
+    let cli = |args: &[&str]| std::process::Command::new(client::binary()).args(args).current_dir(&d.0).output().unwrap();
+    let o = cli(&["render", "doc.docx", "page.png", "--pages", "2-3", "--dpi", "36", "--markup"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(d.path("page-2.png").is_file() && d.path("page-3.png").is_file() && !d.path("page-1.png").exists());
+    let o = cli(&["convert", "doc.docx", "cli.pdf", "--pages", "1-2"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(pdf_pages(&std::fs::read(d.path("cli.pdf")).unwrap()), 2);
+}

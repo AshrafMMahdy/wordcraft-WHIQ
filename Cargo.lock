@@ -5188,6 +5188,7 @@ dependencies = [
 name = "wordcraft-cli"
 version = "0.7.0"
 dependencies = [
+ "miniz_oxide 0.8.9",
  "serde_json",
  "sys-locale",
  "wordcraft-doc",

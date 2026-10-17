@@ -25,6 +25,7 @@ sys-locale = "0.3"
 
 [dev-dependencies]
 zip = { workspace = true }
+miniz_oxide = { workspace = true }
 
 # WHIQ: the "no dead stops" contract, proven against the built binary over stdio.
 [[test]]
