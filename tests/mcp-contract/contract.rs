@@ -235,6 +235,11 @@ fn a_panic_is_answered_and_the_work_auto_saved() {
 fn memory_pressure_evicts_with_the_work_auto_saved() {
     let d = Dir::new("evict");
     let mut m = Mcp::start(&d.0, &["--max-memory-mb", "1"]);
+    // The process's resident memory as the operating system counts it (not an estimate).
+    let st = m.ok("server_status", json!({}));
+    let rss = st["memory"]["rss_bytes"].as_u64().unwrap_or(0);
+    assert!(rss > 1024 * 1024, "{st}");
+    assert!(st["memory"]["rss_source"].as_str().is_some_and(|s| !s.is_empty()), "{st}");
     let r = m.ok("type_text", json!({"text": "Precious"}));
     assert!(r["warnings"].to_string().contains("evicted"), "{r}");
     let e = m.err("get_text", json!({}), "evicted");

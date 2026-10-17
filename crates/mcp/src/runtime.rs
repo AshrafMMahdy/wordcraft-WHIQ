@@ -220,7 +220,12 @@ fn status_json_with(
         "pid": std::process::id(),
         "uptime_ms": started.elapsed().as_millis() as u64,
         "backend": shared.backend,
-        "memory": {"rss_bytes": recover::rss_bytes(), "document_bytes": doc_bytes, "limit_bytes": limits.max_memory_bytes},
+        "memory": {
+            "rss_bytes": recover::rss_bytes(),
+            "rss_source": recover::rss_source(),
+            "document_bytes": doc_bytes,
+            "limit_bytes": limits.max_memory_bytes,
+        },
         "document": doc,
         "busy": busy,
         "jobs": jobs,

@@ -189,8 +189,15 @@ pub fn clear_marker(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(MARKER));
 }
 
-/// Resident memory of this process in bytes, where the platform tells it cheaply.
+/// Resident memory of this process in bytes, as the operating system counts it: the working set
+/// on Windows (`GetProcessMemoryInfo`), the resident size on macOS (`task_info`), `VmRSS` on Linux.
+/// `None` only where the platform doesn't say (the web build).
 pub fn rss_bytes() -> Option<u64> {
+    memory_stats::memory_stats().map(|m| m.physical_mem as u64).filter(|b| *b > 0).or_else(proc_rss)
+}
+
+/// Linux's own count, should the call above fail.
+fn proc_rss() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let s = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -203,10 +210,39 @@ pub fn rss_bytes() -> Option<u64> {
     }
 }
 
+/// Where [`rss_bytes`] comes from on this platform (for `server_status`).
+pub fn rss_source() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "GetProcessMemoryInfo working set"
+    } else if cfg!(target_os = "macos") {
+        "task_info resident size"
+    } else if cfg!(target_os = "linux") {
+        "/proc resident set size"
+    } else {
+        "operating system"
+    }
+}
+
 /// A portable estimate of the memory the open document holds: its media, kept parts and text.
 pub fn doc_bytes(doc: &Document) -> u64 {
     let media: u64 = doc.media.values().map(|m| m.len() as u64).sum();
     let kept: u64 = doc.passthrough.values().map(|b| b.len() as u64).sum();
     let text: u64 = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.len() as u64 * 8).sum();
     media + kept + text
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn resident_memory_comes_from_the_operating_system() {
+        // This process holds a few megabytes at least; the count isn't an estimate of documents.
+        let rss = super::rss_bytes();
+        if cfg!(any(target_os = "linux", target_os = "windows", target_os = "macos")) {
+            assert!(rss.is_some_and(|b| b > 1024 * 1024), "{rss:?}");
+        }
+        let grow: Vec<u8> = vec![1; 64 * 1024 * 1024];
+        let after = super::rss_bytes();
+        assert!(after >= rss, "{rss:?} {after:?}");
+        assert_eq!(grow.iter().map(|b| *b as u64).sum::<u64>(), 64 * 1024 * 1024);
+    }
 }
