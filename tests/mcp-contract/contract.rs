@@ -483,3 +483,61 @@ fn review_edits_by_anchor_are_tracked_reported_and_resolvable() {
     let cmp = m.ok("compare_documents", json!({"original": "contract.docx", "revised": "reviewed.docx", "author": "Comparer"}));
     assert!(!cmp["changes"].as_array().unwrap().is_empty(), "{cmp}");
 }
+
+/// Unzipped parts of a saved package, by name.
+fn parts(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(std::fs::read(path).unwrap())).unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).unwrap();
+        let mut b = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut b).unwrap();
+        out.insert(f.name().to_string(), String::from_utf8_lossy(&b).into_owned());
+    }
+    out
+}
+
+// Markdown import of the platform's document shapes, with a theme.
+#[test]
+fn markdown_imports_the_platforms_document_shapes_with_a_theme() {
+    let d = Dir::new("markdown");
+    std::fs::create_dir_all(d.path("figures")).unwrap();
+    std::fs::write(d.path("figures/chart.png"), corpus::PNG).unwrap();
+    std::fs::write(d.path("logo.png"), corpus::PNG).unwrap();
+    let md = "---\ntitle: Site Survey\nsubtitle: Building C\ndate: 17 October 2026\nauthor: Field Team\nheader: \"{title}\"\n---\n\n[TOC]\n\n# Findings\n\nThe roof is sound.\n\n## Measurements\n\n| Room | Area |\n|---|---|\n| Hall | 40 m² |\n| Office | 12 m² |\n\n![Floor plan](figures/chart.png)\n\n> [!WARNING]\n> The east stair needs a handrail.\n\n1. First step\n2. Second step\n\n- Bullet\n  - Nested bullet\n\n```\nreading = 42\n```\n\n\\pagebreak\n\n### Appendix\n\n#### Detail\n\n:::tip Remember\nKeep the photos.\n:::\n";
+    std::fs::write(d.path("survey.md"), md).unwrap();
+    let mut m = Mcp::start(&d.0, &[]);
+    let r = m.ok("import_markdown", json!({"path": "survey.md", "theme": {"fonts": {"body": "Source Sans 3", "heading": "Source Serif 4"}, "colors": {"primary": "1F3864", "accent": "2E75B6"}, "logo": "logo.png"}}));
+    assert_eq!((r["images"].as_u64(), r["callouts"].as_u64(), r["pageBreaks"].as_u64()), (Some(1), Some(2), Some(1)), "{r}");
+    assert_eq!(r["cover"], true);
+    assert_eq!(r["toc"], true);
+    assert!(r["theme"].as_array().unwrap().iter().any(|x| x == "logo"), "{r}");
+    let doc = m.ok("inspect_document", json!({}));
+    let styles: Vec<&str> = doc["blocks"].as_array().unwrap().iter().filter_map(|b| b["style"].as_str()).collect();
+    for s in ["Title", "Subtitle", "TOC1", "Heading1", "Heading2", "Heading3", "Heading4", "ListParagraph", "Code"] {
+        assert!(styles.contains(&s), "{s} in {styles:?}");
+    }
+    m.ok("save_document", json!({"path": "survey.docx"}));
+    let p = parts(&d.path("survey.docx"));
+    let body = &p["word/document.xml"];
+    assert!(body.contains("<w:drawing>") || body.contains("<w:drawing "), "the picture is embedded");
+    assert!(body.contains("TOC \\o"), "a TOC field");
+    assert!(body.contains("<w:tblHeader") && body.contains("w:fill=\"1F3864\""), "header row repeated and shaded in the theme colour");
+    assert!(body.contains("w:pageBreakBefore") || body.contains("w:type=\"page\""), "page breaks");
+    assert!(body.contains("<w:titlePg"), "the cover page has no header or footer");
+    let footer = p.iter().find(|(k, _)| k.starts_with("word/footer")).map(|(_, v)| v.clone()).unwrap();
+    assert!(footer.contains("PAGE") && footer.contains("NUMPAGES"), "page numbers in the footer: {footer}");
+    let header = p.iter().find(|(k, _)| k.starts_with("word/header")).map(|(_, v)| v.clone()).unwrap();
+    assert!(header.contains("Site Survey") && header.contains("<w:drawing"), "title and logo in the header");
+    assert!(p["word/styles.xml"].contains("Source Serif 4"), "the theme's heading font is in the styles");
+    assert!(p.keys().any(|k| k.starts_with("word/media/")));
+    // It renders, cover and content.
+    let img = m.call("render_page", json!({"pages": "1-2", "dpi": 50}));
+    assert_eq!(img["content"].as_array().unwrap().iter().filter(|c| c["type"] == "image").count(), 2);
+    // The theme alone, on another document.
+    m.ok("new_document", json!({}));
+    m.ok("type_text", json!({"text": "Hello"}));
+    let t = m.ok("apply_theme", json!({"theme": {"font": "Inter", "primary": "#880000"}}));
+    assert!(t["applied"].as_array().unwrap().iter().any(|x| x == "body font"), "{t}");
+    m.err("import_markdown", json!({}), "bad_params");
+}

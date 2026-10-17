@@ -47,6 +47,7 @@ pub mod templates;
 pub mod text;
 pub mod tools;
 pub mod view;
+pub mod whiq_markdown;
 pub mod whiq_review;
 pub mod wordart;
 
@@ -83,6 +84,8 @@ pub fn registry() -> Registry {
     v.extend(review::specs());
     // WHIQ: review by anchor text, change report, accept/reject by change, author or kind.
     v.extend(whiq_review::specs());
+    // WHIQ: Markdown import of the platform's document shapes; themes.
+    v.extend(whiq_markdown::specs());
     v.extend(file::specs());
     v.extend(options::specs());
     v.extend(design::specs());

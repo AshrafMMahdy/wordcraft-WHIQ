@@ -63,6 +63,8 @@ fn ann(name: &str) -> Ann {
         // Review edits are tracked (reversible), but a batch can delete text and paragraphs;
         // accepting or rejecting a change is final; a comparison rewrites the open document.
         "review_edit" | "accept_changes" | "reject_changes" | "compare_documents" => CHANGES,
+        // A theme restyles the document: the same theme twice is the same document.
+        "apply_theme" => REPLACES,
         // Anything else edits the document and can delete or replace content.
         _ => CHANGES,
     }
@@ -122,7 +124,7 @@ fn own_tools() -> Vec<Value> {
                 "pages": s("Page range instead of one page, e.g. \"1-3,5\" or \"4-\""),
                 "dpi": n("Resolution (default 96; 72 = one pixel per point)"),
                 "scale": n("Pixels per point (overrides dpi)"),
-                "markup": b("true: print markup (changes and comments shown); false: the final document without balloons; omitted: as the editing view shows it"),
+                "markup": b("true: Print Markup (tracked changes marked up, comments in balloons beside the page); false (default): the printed page"),
             }),
             &[],
         ),
@@ -136,6 +138,32 @@ fn own_tools() -> Vec<Value> {
                 "markup": b("Print Markup: tracked changes marked up and comments beside each page (default false)"),
             }),
             &["path"],
+        ),
+        def(
+            "import_markdown",
+            "Import Markdown",
+            "Start a document from Markdown with the platform's shapes: headings 1–4, tables (header row shaded, bold, repeated), pictures by path, callouts (> [!NOTE], !!! tip, :::warning), numbered and bulleted lists, code blocks, page breaks (\\pagebreak, <!-- pagebreak -->), a table of contents ([TOC]), a cover block (front matter title, subtitle, date, author), headers and footers with page numbers ({page} of {pages}). The theme (fonts, colours, logo) is applied as one style batch. Replaces the open document.",
+            json!({
+                "markdown": s("The Markdown text"),
+                "path": s("A .md file instead (pictures are read relative to it)"),
+                "theme": {"type": "object", "description": "{fonts: {body, heading}, colors: {text, primary, accent, tableHeader, tableHeaderText}, logo: path, size: pt}"},
+                "toc": b("Add a table of contents at the top (also: a [TOC] line)"),
+                "cover": b("Cover block from title/subtitle/date/author (default when there is a title)"),
+                "title": s("Cover title (else front matter)"),
+                "subtitle": s("Cover subtitle"),
+                "date": s("Cover date"),
+                "author": s("Cover author (also the document's author)"),
+                "header": s("Header text; {page} {pages} {title} {date}"),
+                "footer": s("Footer text (default \"Page {page} of {pages}\"; \"none\" for none)"),
+            }),
+            &[],
+        ),
+        def(
+            "apply_theme",
+            "Apply theme",
+            "Apply a theme to the open document as one style batch: body and heading fonts, text, heading and accent colours, table header colours, a logo in the header.",
+            json!({"theme": {"type": "object", "description": "{fonts: {body, heading}, colors: {text, primary, accent, tableHeader, tableHeaderText}, logo: path, size: pt}"}}),
+            &["theme"],
         ),
         def(
             "roundtrip_check",
@@ -339,7 +367,8 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                 (None, None) => vec![1],
             };
             let from = a.get("continue_from").and_then(Value::as_u64).map(|n| n as usize);
-            let markup = a.get("markup").and_then(Value::as_bool);
+            // The printed page by default (no spelling marks or editing view furniture).
+            let markup = Some(a.get("markup").and_then(Value::as_bool).unwrap_or(false));
             let mut images = Vec::new();
             let mut info = Vec::new();
             let mut used = 0usize;
@@ -406,6 +435,23 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             }
             exec(b, "file.printPdf", p).map(Out::Json).map_err(|e| contract::classify(&e, "export_pdf", a, &[]))
         }
+        "import_markdown" => {
+            let mut p = a.as_object().cloned().unwrap_or_default();
+            for k in crate::contract::COMMON_ARGS {
+                p.remove(*k);
+            }
+            if p.get("markdown").is_none() && p.get("path").is_none() {
+                return Err(ToolError::new(
+                    "bad_params",
+                    "missing `markdown` or `path`",
+                    "pass the Markdown text as `markdown`, or a .md file as `path`",
+                ));
+            }
+            exec(b, "file.importMarkdown", Value::Object(p)).map(Out::Json).map_err(|e| contract::classify(&e, "import_markdown", a, &[]))
+        }
+        "apply_theme" => exec(b, "styles.applyTheme", json!({"theme": a.get("theme").cloned().unwrap_or(json!({}))}))
+            .map(Out::Json)
+            .map_err(|e| contract::classify(&e, "apply_theme", a, &[])),
         "roundtrip_check" => {
             let path = st("path").unwrap_or("");
             let bytes = wordcraft_engine::io::read_file(path).map_err(|e| contract::classify(&e, "roundtrip_check", a, &[]))?;

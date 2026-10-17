@@ -53,6 +53,9 @@ check review_edit '{"caller":"Smoke Reviewer","ops":[{"op":"replace","anchor":"S
 check list_changes '{}' '"author":"Smoke Reviewer"'
 check accept_changes '{"author":"Smoke Reviewer"}' '"resolved":\['
 check roundtrip_check '{"path":"report.docx"}' '"lossless":true'
+check import_markdown '{"markdown":"---\ntitle: Smoke\n---\n\n[TOC]\n\n# One\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n> [!NOTE]\n> Callout.\n\n\\pagebreak\n\n## Two\n"}' '"callouts":1'
+check render_page '{"pages":"1-2","dpi":36}' '"total_pages"'
+check save_document '{"path":"markdown.docx"}' '"saved":true'
 check server_status '{}' '"version"'
 check job_status '{"job_id":"job-1"}' '"code":"job_not_found"'
 exec {MCP[1]}>&-
