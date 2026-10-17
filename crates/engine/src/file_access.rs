@@ -190,6 +190,68 @@ pub fn check_write(path: &str) -> Result<(), String> {
     current().map_or(Ok(()), |r| r.check(path, Access::Write))
 }
 
+/// WHIQ: what a save does to a file already at its destination (#contract item 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Replace it (the default outside automation, and with `overwrite: true`).
+    Replace,
+    /// Keep it as `OLD_<name>` (`OLD_2_<name>`, … when taken) beside the new file first.
+    KeepOld,
+}
+
+thread_local! {
+    static OVERWRITE: std::cell::Cell<Overwrite> = const { std::cell::Cell::new(Overwrite::Replace) };
+    static KEPT: RefCell<Vec<(PathBuf, PathBuf)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `policy` for every save on this thread; returns what it returned and the files
+/// kept as `OLD_…` meanwhile: (destination, kept copy).
+pub fn with_overwrite<T>(policy: Overwrite, f: impl FnOnce() -> T) -> (T, Vec<(PathBuf, PathBuf)>) {
+    struct Back(Overwrite);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            OVERWRITE.with(|o| o.set(self.0));
+        }
+    }
+    let _back = Back(OVERWRITE.with(|o| o.replace(policy)));
+    KEPT.with(|k| k.borrow_mut().clear());
+    let out = f();
+    (out, KEPT.with(|k| std::mem::take(&mut *k.borrow_mut())))
+}
+
+/// Called by a save just before it replaces `dest`: under [`Overwrite::KeepOld`], an existing
+/// file there is kept as `OLD_<name>` (a hard link, or a copy where links aren't possible), never
+/// replaced. An error stops the save (the destination is left as it was).
+pub(crate) fn keep_old(dest: &Path) -> std::io::Result<()> {
+    if OVERWRITE.with(|o| o.get()) != Overwrite::KeepOld || !dest.is_file() {
+        return Ok(());
+    }
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else { return Ok(()) };
+    let name = name.to_string_lossy();
+    for n in 1..1000u32 {
+        let old = if n == 1 { dir.join(format!("OLD_{name}")) } else { dir.join(format!("OLD_{n}_{name}")) };
+        let made = match std::fs::hard_link(dest, &old) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // No hard links here (FAT, some network shares): a copy, without replacing anything.
+            Err(_) => std::fs::OpenOptions::new().write(true).create_new(true).open(&old).and_then(|mut f| {
+                let mut src = std::fs::File::open(dest)?;
+                std::io::copy(&mut src, &mut f)?;
+                f.sync_all()
+            }),
+        };
+        return match made {
+            Ok(()) => {
+                KEPT.with(|k| k.borrow_mut().push((dest.to_path_buf(), old)));
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => Err(e),
+        };
+    }
+    Err(std::io::Error::other("too many OLD_ copies of this file"))
+}
+
 /// `path` made absolute with its links followed; for a path that doesn't exist (yet), its nearest
 /// existing folder's links followed and the rest appended.
 fn resolve(path: &str) -> Result<PathBuf, String> {

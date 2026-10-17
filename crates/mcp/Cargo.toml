@@ -15,3 +15,6 @@ wordcraft-render = { workspace = true }
 wordcraft-control-key = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+# WHIQ: SIGTERM / SIGINT / SIGHUP (and console close on Windows) auto-save the open document.
+# MIT/Apache-2.0, safe API (the platform calls are inside the crate).
+ctrlc = { version = "3.4", features = ["termination"] }

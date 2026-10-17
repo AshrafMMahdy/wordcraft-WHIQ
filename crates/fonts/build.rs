@@ -39,8 +39,9 @@ fn main() {
 }
 
 /// Scripts a release build (`CRAFT_FONTS_REQUIRED`, native) must embed a font for: the CJK
-/// interface languages' (Japanese, Simplified Chinese).
-const REQUIRED_SCRIPTS: &[&str] = &["Jpan", "Hans"];
+/// interface languages' (Japanese, Simplified Chinese), and (WHIQ) Arabic, so Arabic text is
+/// always shaped with a real face even on a machine without one.
+const REQUIRED_SCRIPTS: &[&str] = &["Jpan", "Hans", "Arab"];
 
 /// One `CraftFont { .. }` initialiser per manifest line, and the scripts the embedded fonts cover.
 fn craft_fonts(dir: &std::path::Path) -> Result<(String, Vec<String>), String> {

@@ -1,0 +1,613 @@
+//! WHIQ: the tool layer agents call. It wraps the upstream tools (`tools.rs`) with the "no dead
+//! stops" contract (`contract.rs`):
+//!
+//! - every result carries `structuredContent`; every error `{code, reason, next_step}`;
+//! - tool names, command ids and arguments are matched forgivingly, with warnings;
+//! - oversized results are trimmed with `truncated` / `continue_from`;
+//! - saves never silently replace a file (`OLD_<name>` unless `overwrite: true`);
+//! - `caller` names who tracked changes and comments are by, for one call;
+//! - annotations say what each tool does (`readOnlyHint` only on reads, `destructiveHint` on
+//!   tools that can delete or overwrite, `idempotentHint` where true);
+//! - new tools: `server_status`, `job_status` (answered by the runtime while a call runs),
+//!   `render_page` with a DPI, a page range and markup, `export_pdf`, `close_document`.
+
+use serde_json::{Map, Value, json};
+use wordcraft_engine::file_access::{Overwrite, with_overwrite};
+
+use crate::backend::Backend;
+use crate::contract::{self, ToolError, closest, normalise_args, trim, unique_match};
+use crate::tools::{self, ToolResult};
+
+/// Limits a call works within (set from `wordcraft-cli mcp` flags).
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Largest JSON result before it is trimmed.
+    pub max_result_bytes: usize,
+    /// Largest total of PNG data (base64) one `render_page` call returns.
+    pub max_image_bytes: usize,
+    /// Hidden test tools (`__sleep`, `__panic`) are available (`WORDCRAFT_MCP_TEST_HOOKS=1`).
+    pub test_hooks: bool,
+    /// Above this much memory (resident, or the document's own estimate where the platform
+    /// doesn't tell), the open document is auto-saved and closed after the call (evicted).
+    pub max_memory_bytes: Option<u64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { max_result_bytes: 100_000, max_image_bytes: 16 * 1024 * 1024, test_hooks: false, max_memory_bytes: None }
+    }
+}
+
+/// What a tool does, for its annotations.
+struct Ann {
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+}
+
+const READ: Ann = Ann { read_only: true, destructive: false, idempotent: true };
+const STATE: Ann = Ann { read_only: false, destructive: false, idempotent: true };
+const ADDS: Ann = Ann { read_only: false, destructive: false, idempotent: false };
+const CHANGES: Ann = Ann { read_only: false, destructive: true, idempotent: false };
+const REPLACES: Ann = Ann { read_only: false, destructive: true, idempotent: true };
+
+fn ann(name: &str) -> Ann {
+    match name {
+        "list_commands" | "get_text" | "inspect_document" | "render_page" | "parity" | "screenshot" | "ui_inspect" | "server_status"
+        | "job_status" | "list_changes" | "compare_documents" => READ,
+        "select_text" => STATE,
+        // Opening or starting a document replaces the open one (auto-saved first when it has
+        // unsaved changes): the same arguments give the same result.
+        "new_document" | "open_document" | "import_markdown" | "close_document" => REPLACES,
+        // Writing files: never silently over another one, but `overwrite: true` can.
+        "save_document" | "export_pdf" => CHANGES,
+        "review_comment" => ADDS,
+        // Anything else edits the document and can delete or replace content.
+        _ => CHANGES,
+    }
+}
+
+fn s(desc: &str) -> Value {
+    json!({"type": "string", "description": desc})
+}
+fn n(desc: &str) -> Value {
+    json!({"type": "number", "description": desc})
+}
+fn b(desc: &str) -> Value {
+    json!({"type": "boolean", "description": desc})
+}
+
+/// Arguments every tool takes.
+fn common_props(name: &str) -> Vec<(&'static str, Value)> {
+    let mut v = vec![
+        ("caller", s("Who is calling: the author of tracked changes and comments made by this call (default: --author)")),
+        ("background", b("Run as a job: answer at once with a job_id; job_status gives progress and the result")),
+        ("continue_from", n("Where to resume a trimmed result (its continue_from)")),
+        ("max_bytes", n("Largest result to return before trimming (default 100000)")),
+    ];
+    if matches!(name, "save_document" | "export_pdf" | "execute" | "batch") || name.starts_with("review") {
+        v.push(("overwrite", b("Replace an existing file at the path. Without it the existing file is kept as OLD_<name> and the response says so")));
+    }
+    v
+}
+
+fn def(name: &str, title: &str, desc: &str, props: Value, req: &[&str]) -> Value {
+    json!({"name": name, "title": title, "description": desc, "inputSchema": {"type": "object", "properties": props, "required": req}})
+}
+
+/// The tools WHIQ adds or redefines (by name, replacing an upstream one of the same name).
+fn own_tools() -> Vec<Value> {
+    vec![
+        def(
+            "server_status",
+            "Server status",
+            "Memory, the open document (name, path, unsaved changes), running and finished jobs, recovered files, roots, author and version. Answered even while another call runs.",
+            json!({}),
+            &[],
+        ),
+        def(
+            "job_status",
+            "Job status",
+            "Progress of a job (a call that took long or ran with background: true) and, once done, its result. Results stay available after the client times out.",
+            json!({"job_id": s("The job_id a call returned")}),
+            &["job_id"],
+        ),
+        def(
+            "render_page",
+            "Render page",
+            "Render pages to PNG to look at the result: one page, or a range (\"2-4,7\"), at a DPI, with or without markup (tracked changes and comment balloons, as Print Markup prints them).",
+            json!({
+                "page": n("1-based page (default 1)"),
+                "pages": s("Page range instead of one page, e.g. \"1-3,5\" or \"4-\""),
+                "dpi": n("Resolution (default 96; 72 = one pixel per point)"),
+                "scale": n("Pixels per point (overrides dpi)"),
+                "markup": b("true: print markup (changes and comments shown); false: the final document without balloons; omitted: as the editing view shows it"),
+            }),
+            &[],
+        ),
+        def(
+            "export_pdf",
+            "Export PDF",
+            "Write the document (or some pages) as PDF, with or without markup. Fonts are embedded as subsets; Arabic and other complex scripts are shaped.",
+            json!({
+                "path": s("Output .pdf path (relative paths are inside the write root)"),
+                "pages": s("Page range, e.g. \"1-3,5\" (default all)"),
+                "markup": b("Print Markup: tracked changes marked up and comments beside each page (default false)"),
+            }),
+            &["path"],
+        ),
+        def(
+            "close_document",
+            "Close document",
+            "Close the open document and start a blank one. Unsaved changes are never discarded: they are auto-saved to a recovered file first (named in the response) unless discard: true.",
+            json!({"discard": b("Throw away unsaved changes instead of auto-saving them")}),
+            &[],
+        ),
+    ]
+}
+
+/// Every tool with its schema and annotations: the upstream tools (with WHIQ's fixes) and WHIQ's.
+pub fn tool_definitions() -> Value {
+    let own = own_tools();
+    let mut out: Vec<Value> = Vec::new();
+    let upstream = match tools::tool_definitions() {
+        Value::Array(v) => v,
+        _ => Vec::new(),
+    };
+    let own_names: Vec<String> = own.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect();
+    for t in upstream.into_iter().filter(|t| !own_names.iter().any(|n| Some(n.as_str()) == t["name"].as_str())) {
+        out.push(t);
+    }
+    out.extend(own);
+    out.extend(crate::whiq_review::tool_definitions());
+    for t in out.iter_mut() {
+        let name = t["name"].as_str().unwrap_or("").to_string();
+        let title = t["title"].as_str().unwrap_or(&name).to_string();
+        if let Some(props) = t.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut) {
+            for (k, v) in common_props(&name) {
+                props.entry(k).or_insert(v);
+            }
+        }
+        // `save_document` writes files: say so, and how existing ones are treated.
+        if name == "save_document"
+            && let Some(p) = t.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut)
+        {
+            p.insert("format".into(), s("\"wordml2003\" or \"flatopc\" for an .xml file"));
+            p.insert("markup".into(), b("Print Markup in a PDF, PNG, HTML, Markdown or text copy"));
+        }
+        let a = ann(&name);
+        t["annotations"] = json!({"title": title, "readOnlyHint": a.read_only, "destructiveHint": a.destructive, "idempotentHint": a.idempotent, "openWorldHint": false});
+    }
+    Value::Array(out)
+}
+
+/// Short names agents use for tools.
+const ALIASES: &[(&str, &str)] = &[
+    ("open", "open_document"),
+    ("save", "save_document"),
+    ("new", "new_document"),
+    ("close", "close_document"),
+    ("render", "render_page"),
+    ("status", "server_status"),
+    ("text", "get_text"),
+    ("inspect", "inspect_document"),
+    ("type", "type_text"),
+    ("select", "select_text"),
+    ("export", "export_pdf"),
+    ("pdf", "export_pdf"),
+    ("job", "job_status"),
+    ("commands", "list_commands"),
+    ("run", "execute"),
+];
+
+/// The tool `name` means: exact, or in another spelling or case, or an alias (with a warning).
+pub fn resolve_tool(name: &str, defs: &Value) -> Result<(String, Option<String>), ToolError> {
+    let names: Vec<&str> = defs.as_array().map(|v| v.iter().filter_map(|t| t["name"].as_str()).collect()).unwrap_or_default();
+    if names.contains(&name) {
+        return Ok((name.to_string(), None));
+    }
+    if let Some(m) = unique_match(name, names.iter().copied()) {
+        return Ok((m.to_string(), Some(format!("tool `{name}` read as `{m}`"))));
+    }
+    if let Some((_, to)) = ALIASES.iter().find(|(a, _)| contract::norm(a) == contract::norm(name)) {
+        return Ok(((*to).to_string(), Some(format!("tool `{name}` read as `{to}`"))));
+    }
+    let near = closest(name, names.iter().copied(), 5);
+    Err(ToolError::new(
+        "unknown_tool",
+        format!("no tool `{name}`"),
+        if near.is_empty() { "call tools/list for the tools".to_string() } else { format!("call one of: {}", near.join(", ")) },
+    )
+    .with("closest", json!(near)))
+}
+
+/// The JSON a tool result's first text block carries (the result itself).
+fn result_json(r: &ToolResult) -> Value {
+    let text = r.content.iter().find_map(|c| c.get("text").and_then(Value::as_str)).unwrap_or("");
+    serde_json::from_str(text).unwrap_or_else(|_| json!({"text": text}))
+}
+
+/// An error result in the contract's shape: the error as JSON text and as structured content.
+pub fn error_result(e: &ToolError, warnings: &[String]) -> Value {
+    let mut err = e.to_json();
+    if !warnings.is_empty() {
+        err["warnings"] = json!(warnings);
+    }
+    let body = json!({"error": err});
+    json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default()}], "isError": true, "structuredContent": body})
+}
+
+/// A successful JSON result: `v` (an object; other values under `result`) as text and as
+/// structured content, with warnings and notes added.
+pub fn json_result(v: Value, warnings: &[String]) -> Value {
+    let mut obj = match v {
+        Value::Object(m) => m,
+        other => {
+            let mut m = Map::new();
+            m.insert("result".into(), other);
+            m
+        }
+    };
+    if !warnings.is_empty() {
+        obj.insert("warnings".into(), json!(warnings));
+    }
+    let v = Value::Object(obj);
+    json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}], "isError": false, "structuredContent": v})
+}
+
+/// What a tool produced.
+pub enum Out {
+    Json(Value),
+    /// Images (base64 PNG) and the summary that goes with them.
+    Images(Vec<String>, Value),
+}
+
+fn exec(b: &mut dyn Backend, id: &str, params: Value) -> Result<Value, String> {
+    b.call("engine.execute", json!({"command": id, "params": params}))
+}
+
+/// Every command id (for matching a misspelt one).
+fn command_ids(b: &mut dyn Backend) -> Vec<String> {
+    match b.call("engine.commands", json!({})) {
+        Ok(Value::Array(v)) => v.iter().filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Run command `id`, matching a misspelt id (case, `_`/`-`) to the one it means.
+fn exec_forgiving(b: &mut dyn Backend, id: &str, params: Value, warnings: &mut Vec<String>) -> Result<Value, ToolError> {
+    match exec(b, id, params.clone()) {
+        Err(e) if e.starts_with("unknown command") => {
+            let ids = command_ids(b);
+            if let Some(m) = unique_match(id, ids.iter().map(String::as_str)).map(str::to_string) {
+                warnings.push(format!("command `{id}` read as `{m}`"));
+                return exec(b, &m, params).map_err(|e| contract::classify(&e, "execute", &json!({"command": m}), &ids));
+            }
+            Err(contract::classify(&e, "execute", &json!({"command": id}), &ids))
+        }
+        Err(e) => Err(contract::classify(&e, "execute", &json!({"command": id, "path": params.get("path")}), &[])),
+        Ok(v) => Ok(v),
+    }
+}
+
+/// `Some(true)` when the first letter of `text` is right-to-left, `Some(false)` left-to-right,
+/// `None` without letters.
+pub fn first_strong(text: &str) -> Option<bool> {
+    text.chars().any(|c| c.is_alphabetic() || c == '\u{200E}' || c == '\u{200F}').then(|| wordcraft_doc::bidi::first_strong_is_rtl(text))
+}
+
+/// The pages `spec` names in a document of `total` pages (1-based, in order, no repeats).
+fn page_list(spec: &str, total: usize) -> Result<Vec<usize>, ToolError> {
+    wordcraft_engine::print::parse_page_range(spec, total).map(|v| v.into_iter().map(|p| p + 1).collect()).map_err(|e| {
+        ToolError::new("out_of_range", format!("pages \"{spec}\": {e}"), format!("ask for pages within 1–{total}, e.g. \"1-{}\"", total.min(3)))
+    })
+}
+
+fn page_count(b: &mut dyn Backend) -> usize {
+    exec(b, "document.layout", json!({})).ok().and_then(|v| v.get("pages").and_then(Value::as_array).map(Vec::len)).unwrap_or(1).max(1)
+}
+
+/// Run one tool (by its resolved name) on normalised arguments.
+fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &mut Vec<String>) -> Result<Out, ToolError> {
+    let st = |k: &str| a.get(k).and_then(Value::as_str);
+    match name {
+        "render_page" => {
+            let scale = match (a.get("scale").and_then(Value::as_f64), a.get("dpi").and_then(Value::as_f64)) {
+                (Some(s), _) => s,
+                (None, Some(d)) => d / 72.0,
+                (None, None) => 96.0 / 72.0,
+            };
+            if !scale.is_finite() || !(0.1..=8.0).contains(&scale) {
+                return Err(ToolError::new(
+                    "bad_params",
+                    format!("resolution {:.0} dpi is outside 7–576 dpi", scale * 72.0),
+                    "ask for a dpi between 7 and 576 (96 is screen size)",
+                ));
+            }
+            let total = page_count(b);
+            let pages = match (st("pages"), a.get("page").and_then(Value::as_u64)) {
+                (Some(spec), _) => page_list(spec, total)?,
+                (None, Some(p)) => vec![p.max(1) as usize],
+                (None, None) => vec![1],
+            };
+            let from = a.get("continue_from").and_then(Value::as_u64).map(|n| n as usize);
+            let markup = a.get("markup").and_then(Value::as_bool);
+            let mut images = Vec::new();
+            let mut info = Vec::new();
+            let mut used = 0usize;
+            let mut next = None;
+            for &p in pages.iter().filter(|p| from.is_none_or(|f| **p >= f)) {
+                if p > total {
+                    return Err(ToolError::new(
+                        "out_of_range",
+                        format!("no page {p}: the document has {total}"),
+                        format!("ask for a page within 1–{total}"),
+                    )
+                    .with("pages", json!(total)));
+                }
+                let mut params = json!({"page": p, "scale": scale});
+                if let Some(m) = markup {
+                    params["markup"] = json!(m);
+                }
+                let v = b.call("ui.render", params).map_err(|e| contract::classify(&e, "render_page", a, &[]))?;
+                let png = v.get("png").and_then(Value::as_str).unwrap_or("").to_string();
+                if png.is_empty() {
+                    return Err(ToolError::new("failed", "the reply carried no picture", "retry, or render another page"));
+                }
+                if used + png.len() > limits.max_image_bytes {
+                    if images.is_empty() {
+                        let fit = (scale * ((limits.max_image_bytes as f64 / png.len() as f64).sqrt()) * 72.0 * 0.9).floor();
+                        return Err(ToolError::new(
+                            "too_large",
+                            format!(
+                                "page {p} at {:.0} dpi is {} bytes of PNG, over the {}-byte limit",
+                                scale * 72.0,
+                                png.len(),
+                                limits.max_image_bytes
+                            ),
+                            format!("ask for dpi {fit:.0} or lower"),
+                        )
+                        .with("max_dpi", json!(fit)));
+                    }
+                    next = Some(p);
+                    break;
+                }
+                used += png.len();
+                info.push(json!({"page": p, "width": v["width"], "height": v["height"]}));
+                images.push(png);
+            }
+            let mut summary = json!({"pages": info, "total_pages": total, "dpi": (scale * 72.0).round(), "markup": markup});
+            if let (Some(first), true) = (info.first(), info.len() == 1) {
+                summary["width"] = first["width"].clone();
+                summary["height"] = first["height"].clone();
+            }
+            if let Some(nx) = next {
+                summary["truncated"] = json!(true);
+                summary["continue_from"] = json!(nx);
+                summary["next_step"] = json!(format!("call render_page again with the same pages and continue_from: {nx}"));
+            }
+            Ok(Out::Images(images, summary))
+        }
+        "export_pdf" => {
+            let path = st("path").unwrap_or("");
+            let mut p = json!({"path": path, "markup": a.get("markup").and_then(Value::as_bool).unwrap_or(false)});
+            if let Some(spec) = st("pages") {
+                // Checked first, for an answer in the contract's terms.
+                page_list(spec, page_count(b))?;
+                p["pages"] = json!(spec);
+            }
+            exec(b, "file.printPdf", p).map(Out::Json).map_err(|e| contract::classify(&e, "export_pdf", a, &[]))
+        }
+        "close_document" => {
+            let mut out = json!({"closed": true});
+            if !a.get("discard").and_then(Value::as_bool).unwrap_or(false)
+                && let Some(snap) = b.snapshot().filter(|s| s.dirty)
+            {
+                let dir = crate::recover::recovery_dir(wordcraft_engine::file_access::current().as_deref().and_then(|r| r.write_root()), Some(&snap));
+                let path = crate::recover::autosave(&snap, &dir, "closed with unsaved changes").map_err(|e| {
+                    ToolError::new("failed", format!("could not keep the unsaved changes: {e}"), "save_document first, or close with discard: true")
+                })?;
+                crate::recover::clear_marker(&dir);
+                out["recovered"] = json!(path.to_string_lossy());
+                warnings.push(format!("the unsaved changes were kept in {} (open_document on it to continue)", path.display()));
+            }
+            exec(b, "file.new", json!({"template": "blank"})).map_err(|e| contract::classify(&e, "close_document", a, &[]))?;
+            Ok(Out::Json(out))
+        }
+        "execute" => {
+            let Some(c) = st("command") else {
+                return Err(ToolError::new("bad_params", "missing `command`", "pass {\"command\": \"<id>\", \"params\": {…}}"));
+            };
+            exec_forgiving(b, c, a.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})), warnings).map(Out::Json)
+        }
+        "batch" => {
+            let keep = a.get("keepGoing").and_then(Value::as_bool).unwrap_or(false);
+            let list = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
+            let total = list.len();
+            let mut out = Vec::new();
+            for (i, c) in list.into_iter().enumerate() {
+                crate::runtime::progress(i as u64, total as u64, "batch");
+                let id = c.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                match exec_forgiving(b, &id, c.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})), warnings) {
+                    Ok(v) => out.push(json!({"command": id, "ok": true, "result": v})),
+                    Err(e) => {
+                        out.push(json!({"command": id, "ok": false, "error": e.to_json()}));
+                        if !keep {
+                            return Err(ToolError::new(
+                                e.code,
+                                format!("command {} of {total} (`{id}`) failed: {}", i + 1, e.reason),
+                                format!("{}; the commands before it ran (see results); pass keepGoing: true to run the rest anyway", e.next_step),
+                            )
+                            .with("results", json!(out))
+                            .with("failed_at", json!(i)));
+                        }
+                    }
+                }
+            }
+            Ok(Out::Json(json!({"results": out, "ran": total})))
+        }
+        "type_text" if a.get("paragraphs").and_then(Value::as_bool).unwrap_or(false) => {
+            // Each line is a new paragraph whose direction comes from its first letter (an
+            // Arabic line is right to left, an English one left to right), not from the line
+            // before it.
+            let t = st("text").unwrap_or("");
+            let mut last = Value::Null;
+            for (i, line) in t.split('\n').enumerate() {
+                if i > 0 {
+                    last = exec(b, "text.newParagraph", json!({})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
+                    if let Some(rtl) = first_strong(line) {
+                        exec(b, if rtl { "para.rtl" } else { "para.ltr" }, json!({"value": true}))
+                            .map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
+                    }
+                }
+                if !line.is_empty() {
+                    last = exec(b, "text.insert", json!({"text": line, "raw": true})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
+                }
+            }
+            Ok(Out::Json(last))
+        }
+        "select_text" => {
+            let text = st("text").unwrap_or("");
+            let occ = a.get("occurrence").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+            match exec(b, "select.text", json!({"text": text, "occurrence": occ})) {
+                Ok(v) => Ok(Out::Json(v)),
+                Err(e) if e.contains("not found") => {
+                    let doc = exec(b, "document.text", json!({}))
+                        .ok()
+                        .and_then(|v| v.get("text").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_default();
+                    // The same text in other case: select that, and say so.
+                    if let Some(at) = contract::find_ci(&doc, text, occ) {
+                        let len = doc.get(at..).map(|r| r.char_indices().nth(text.chars().count()).map_or(r.len(), |(i, _)| i)).unwrap_or(0);
+                        let found = doc.get(at..at + len).unwrap_or(text).to_string();
+                        let k = doc.get(..at).map_or(0, |before| before.matches(found.as_str()).count()) + 1;
+                        if let Ok(v) = exec(b, "select.text", json!({"text": found, "occurrence": k})) {
+                            warnings.push(format!("`{text}` matched `{found}` ignoring case"));
+                            return Ok(Out::Json(v));
+                        }
+                    }
+                    let near = contract::closest_phrases(&doc, text, 5);
+                    let list: Vec<String> = near.iter().map(|(p, _)| p.clone()).collect();
+                    Err(ToolError::new(
+                        "not_found",
+                        format!("`{text}` is not in the document"),
+                        if list.is_empty() {
+                            "check the text with get_text and select something that is there".to_string()
+                        } else {
+                            format!("select one of the closest matches: {}", list.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", "))
+                        },
+                    )
+                    .with("closest", json!(list)))
+                }
+                Err(e) => Err(contract::classify(&e, "select_text", a, &[])),
+            }
+        }
+        "__sleep" if limits.test_hooks => {
+            let ms = a.get("ms").and_then(Value::as_u64).unwrap_or(1000).min(120_000);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(Out::Json(json!({"slept_ms": ms})))
+        }
+        "__panic" if limits.test_hooks => test_panic(),
+        n if crate::whiq_review::handles(n) => crate::whiq_review::run(b, n, a, limits, warnings),
+        _ => {
+            // The upstream tool, its result mapped into the contract's shape.
+            let r = tools::call_tool(b, name, a);
+            if r.is_error {
+                let text = r.content.iter().find_map(|c| c.get("text").and_then(Value::as_str)).unwrap_or("failed").to_string();
+                let ids = if text.starts_with("unknown command") { command_ids(b) } else { Vec::new() };
+                return Err(contract::classify(&text, name, a, &ids));
+            }
+            if let Some(img) = r.content.iter().find(|c| c["type"] == "image") {
+                let info = r
+                    .content
+                    .iter()
+                    .find_map(|c| c.get("text").and_then(Value::as_str))
+                    .and_then(|t| serde_json::from_str(t).ok())
+                    .unwrap_or(json!({}));
+                return Ok(Out::Images(vec![img["data"].as_str().unwrap_or("").to_string()], info));
+            }
+            Ok(Out::Json(result_json(&r)))
+        }
+    }
+}
+
+/// Call tool `name` with arguments `a` on `b`: the full contract pipeline. Returns the MCP
+/// `tools/call` result.
+pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) -> Value {
+    let hidden = limits.test_hooks && matches!(name, "__sleep" | "__panic");
+    let defs = tool_definitions();
+    let (name, mut warnings) = if hidden {
+        (name.to_string(), Vec::new())
+    } else {
+        match resolve_tool(name, &defs) {
+            Ok((n, w)) => (n, w.into_iter().collect::<Vec<_>>()),
+            Err(e) => return error_result(&e, &[]),
+        }
+    };
+    let schema = defs.as_array().and_then(|v| v.iter().find(|t| t["name"] == name.as_str())).map(|t| t["inputSchema"].clone()).unwrap_or(json!({}));
+    let (args, w) = if hidden {
+        (a.clone(), Vec::new())
+    } else {
+        match normalise_args(a, &schema) {
+            Ok(x) => x,
+            Err(e) => return error_result(&e, &warnings),
+        }
+    };
+    warnings.extend(w);
+    // Who is calling: their name on tracked changes and comments made by this call.
+    let caller = args.get("caller").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    let before = caller.as_ref().and_then(|_| b.author());
+    if let Some(c) = &caller
+        && let Err(e) = exec(b, "file.setAuthor", json!({"name": c}))
+    {
+        warnings.push(format!("caller `{c}` not used: {e}"));
+    }
+    let policy = if args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
+    let (out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
+    if let (Some(_), Some(prev)) = (&caller, before) {
+        let _ = exec(b, "file.setAuthor", json!({"name": prev}));
+    }
+    let kept_json: Vec<Value> = kept
+        .iter()
+        .map(|(dest, old)| {
+            warnings.push(format!("{} existed: it was kept as {} (pass overwrite: true to replace a file)", dest.display(), old.display()));
+            json!({"path": dest.to_string_lossy(), "kept_as": old.to_string_lossy()})
+        })
+        .collect();
+    let max = args.get("max_bytes").and_then(Value::as_u64).map_or(limits.max_result_bytes, |m| (m as usize).clamp(1024, 4 << 20));
+    let from = args.get("continue_from").and_then(Value::as_u64).unwrap_or(0) as usize;
+    match out {
+        Ok(Out::Json(v)) => {
+            let mut v = if name == "render_page" { v } else { trim(v, from, max) };
+            if !kept_json.is_empty() {
+                if !v.is_object() {
+                    v = json!({"result": v});
+                }
+                v["kept_previous"] = json!(kept_json);
+            }
+            json_result(v, &warnings)
+        }
+        Ok(Out::Images(images, mut summary)) => {
+            if !warnings.is_empty() {
+                summary["warnings"] = json!(warnings);
+            }
+            let mut content: Vec<Value> = images.into_iter().map(|d| json!({"type": "image", "data": d, "mimeType": "image/png"})).collect();
+            content.push(json!({"type": "text", "text": summary.to_string()}));
+            json!({"content": content, "isError": false, "structuredContent": summary})
+        }
+        Err(mut e) => {
+            if !kept_json.is_empty() {
+                e = e.with("kept_previous", json!(kept_json));
+            }
+            error_result(&e, &warnings)
+        }
+    }
+}
+
+/// Test hook, reachable only with `WORDCRAFT_MCP_TEST_HOOKS=1` (never in normal use): an
+/// unexpected failure outside any command, so `tests/mcp-contract` can prove the work is
+/// auto-saved and the server keeps answering. The one deliberate panic in shipped code.
+#[allow(clippy::panic)]
+fn test_panic() -> Result<Out, ToolError> {
+    std::panic::panic_any("__panic test hook")
+}

@@ -5,7 +5,6 @@ use std::io::{BufRead, Write};
 use serde_json::{Value, json};
 
 use crate::backend::Backend;
-use crate::tools::{call_tool, tool_definitions};
 
 /// The MCP revision we implement.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -28,10 +27,44 @@ execute format.bold → inspect_document to verify → render_page to look at th
 pub const DOC_URI: &str = "wordcraft://document";
 pub const COMMANDS_URI: &str = "wordcraft://commands";
 
+/// The `initialize` result (WHIQ: also answered by the runtime's main thread, which never waits
+/// for the document).
+pub fn initialize_result(params: &Value, describe: &str) -> Value {
+    let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
+    let version = if SUPPORTED_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSION };
+    json!({
+        "protocolVersion": version,
+        "capabilities": {"tools": {}, "resources": {}},
+        "serverInfo": {"name": "wordcraft", "title": "WordCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": "https://getartcraft.com/apps/wordcraft"},
+        "instructions": format!(
+            "{INSTRUCTIONS} {WHIQ_INSTRUCTIONS} Backend: {describe}. Community: https://discord.gg/artcraft · https://getartcraft.com/apps/wordcraft · https://github.com/storytold/wordcraft",
+        ),
+    })
+}
+
+/// WHIQ: how the contract shows to agents.
+const WHIQ_INSTRUCTIONS: &str = "Errors carry code, reason and next_step. A busy server answers code busy with retry_after_ms; a long call answers with a job_id (follow it with job_status; the result is kept). Big results come trimmed with truncated and continue_from (pass it back). server_status shows memory, the open document, jobs and recovered files. Saves never replace a file silently: the old one is kept as OLD_<name> unless overwrite: true. Pass caller to sign tracked changes and comments.";
+
+/// The `resources/list` result.
+pub fn resources_list() -> Value {
+    json!({"resources": [
+        {"uri": DOC_URI, "name": "document", "title": "Active document", "description": "Blocks, text, formatting, sections, parts and selection of the document (document.inspect)", "mimeType": "application/json"},
+        {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon location, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},
+    ]})
+}
+
 /// An MCP server bound to one backend.
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
+    /// WHIQ: limits of the contract (result size, images, memory, test hooks).
+    limits: crate::whiq::Limits,
+    /// WHIQ: what the runtime's main thread reads (the open document, recovered files, roots).
+    shared: crate::runtime::SharedState,
+    /// WHIQ: recovered work the agent hasn't been told about (eviction, or a previous process's
+    /// auto-save): the next call that needs the document answers `evicted` with it.
+    notice: Option<Value>,
+    started: std::time::Instant,
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -44,7 +77,40 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, initialized: false }
+        let shared = crate::runtime::SharedState::default();
+        if let Ok(mut g) = shared.lock() {
+            g.backend = backend.describe();
+        }
+        Self { backend, initialized: false, limits: Default::default(), shared, notice: None, started: std::time::Instant::now() }
+    }
+
+    /// WHIQ: the contract's limits.
+    pub fn with_limits(mut self, limits: crate::whiq::Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// WHIQ: share state with the runtime (and report documents an earlier process recovered in
+    /// the write root: the first call that needs the document answers `evicted` with them).
+    pub fn with_shared(mut self, shared: crate::runtime::SharedState) -> Self {
+        let dir = if let Ok(mut g) = shared.lock() {
+            g.backend = self.backend.describe();
+            g.author = self.backend.author();
+            g.write_root.clone()
+        } else {
+            None
+        };
+        self.shared = shared;
+        let dir = crate::recover::recovery_dir(dir.as_deref(), None);
+        let found = crate::recover::read_marker(&dir);
+        if !found.is_empty() {
+            if let Ok(mut g) = self.shared.lock() {
+                g.recovered.extend(found.iter().cloned());
+            }
+            self.notice = Some(json!({"reason": "an earlier server auto-saved the work", "recovered": found}));
+        }
+        self.publish(false);
+        self
     }
 
     pub fn backend(&mut self) -> &mut dyn Backend {
@@ -127,30 +193,15 @@ impl Server {
 
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
         match method {
-            "initialize" => {
-                let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
-                let version = if SUPPORTED_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSION };
-                Ok(json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {}, "resources": {}},
-                    "serverInfo": {"name": "wordcraft", "title": "WordCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": "https://getartcraft.com/apps/wordcraft"},
-                    "instructions": format!(
-                        "{INSTRUCTIONS} Backend: {}. Community: https://discord.gg/artcraft · https://getartcraft.com/apps/wordcraft · https://github.com/storytold/wordcraft",
-                        self.backend.describe()
-                    ),
-                }))
-            }
+            "initialize" => Ok(initialize_result(params, &self.backend.describe())),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_definitions()})),
+            "tools/list" => Ok(json!({"tools": crate::whiq::tool_definitions()})),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                Ok(call_tool(self.backend.as_mut(), name, &args).to_value())
+                Ok(self.call(name, &args))
             }
-            "resources/list" => Ok(json!({"resources": [
-                {"uri": DOC_URI, "name": "document", "title": "Active document", "description": "Blocks, text, formatting, sections, parts and selection of the document (document.inspect)", "mimeType": "application/json"},
-                {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon location, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},
-            ]})),
+            "resources/list" => Ok(resources_list()),
             "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
@@ -164,5 +215,130 @@ impl Server {
             }
             other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
         }
+    }
+}
+
+/// WHIQ: tools that may run while recovered work waits to be reopened (they don't need it).
+const WITHOUT_DOCUMENT: &[&str] =
+    &["open_document", "new_document", "import_markdown", "close_document", "server_status", "job_status", "list_commands", "parity"];
+
+impl Server {
+    /// A `tools/call` through the contract: recovered work reported first, the call, then the
+    /// open document published (for auto-saves) and memory checked.
+    fn call(&mut self, name: &str, args: &Value) -> Value {
+        let canonical = crate::whiq::resolve_tool(name, &crate::whiq::tool_definitions()).map(|(n, _)| n).unwrap_or_else(|_| name.to_string());
+        // Without the runtime (in-process use) the status tools are answered here.
+        match canonical.as_str() {
+            "server_status" => {
+                let jobs = Vec::new();
+                let st = match self.shared.lock() {
+                    Ok(g) => crate::runtime::status_json(&g, jobs, Value::Null, self.started, &self.limits),
+                    Err(_) => json!({}),
+                };
+                return crate::whiq::json_result(st, &[]);
+            }
+            "job_status" => {
+                let e = crate::contract::ToolError::new(
+                    "job_not_found",
+                    "no jobs in this session",
+                    "call the tool again; jobs exist only when the server runs on stdio (wordcraft-cli mcp)",
+                );
+                return crate::whiq::error_result(&e, &[]);
+            }
+            _ => {}
+        }
+        let mut notice_warning = None;
+        if let Some(n) = self.notice.take() {
+            let dir = crate::recover::recovery_dir(self.shared.lock().ok().and_then(|g| g.write_root.clone()).as_deref(), None);
+            let first =
+                n.pointer("/recovered/0/path").and_then(Value::as_str).or_else(|| n.get("recovered").and_then(Value::as_str)).map(str::to_string);
+            let source = n.get("source").and_then(Value::as_str).map(str::to_string);
+            if !WITHOUT_DOCUMENT.contains(&canonical.as_str()) {
+                crate::recover::clear_marker(&dir);
+                let next = match (&first, &source) {
+                    (Some(p), _) => format!("your work is auto-saved at {p}: call open_document {{\"path\": \"{p}\"}}, then carry on"),
+                    (None, Some(src)) => format!("the document was saved; reopen it with open_document {{\"path\": \"{src}\"}}"),
+                    (None, None) => "start again with new_document or open_document".to_string(),
+                };
+                let reason = n.get("reason").and_then(Value::as_str).unwrap_or("the document was closed").to_string();
+                let mut e = crate::contract::ToolError::new("evicted", format!("{reason}; the open document was closed"), next);
+                for (k, v) in n.as_object().into_iter().flatten() {
+                    e = e.with(k, v.clone());
+                }
+                return crate::whiq::error_result(&e, &[]);
+            }
+            crate::recover::clear_marker(&dir);
+            notice_warning = Some(match first {
+                Some(p) => format!("note: earlier work was auto-saved at {p} (open_document on it to continue it)"),
+                None => "note: the previous document was closed".to_string(),
+            });
+        }
+        let mut r = crate::whiq::call_tool(self.backend.as_mut(), name, args, &self.limits);
+        if let Some(w) = notice_warning {
+            add_warning(&mut r, &w);
+        }
+        if let Some(w) = self.publish(true) {
+            add_warning(&mut r, &w);
+        }
+        r
+    }
+
+    /// Publish the open document for auto-saves and `server_status`; evict it when memory is past
+    /// the limit (auto-saved first). Returns a note for the call's result when it was evicted.
+    fn publish(&mut self, may_evict: bool) -> Option<String> {
+        let snap = self.backend.snapshot()?;
+        let used = crate::recover::rss_bytes().unwrap_or_else(|| crate::recover::doc_bytes(&snap.doc));
+        // Only a document that holds something is evicted (a blank, untouched one frees nothing).
+        let holds = snap.dirty || snap.path.is_some();
+        let over = self.limits.max_memory_bytes.filter(|limit| may_evict && holds && used > *limit);
+        let author = self.backend.author();
+        let Some(limit) = over else {
+            if let Ok(mut g) = self.shared.lock() {
+                g.snapshot = Some(snap);
+                g.author = author;
+            }
+            return None;
+        };
+        let reason = format!("memory: {used} bytes in use, over the {limit}-byte limit");
+        let root = self.shared.lock().ok().and_then(|g| g.write_root.clone());
+        let recovered = if snap.dirty {
+            let dir = crate::recover::recovery_dir(root.as_deref(), Some(&snap));
+            crate::recover::autosave(&snap, &dir, &reason).ok()
+        } else {
+            None
+        };
+        let source = snap.path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let _ = self.backend.call("engine.execute", json!({"command": "file.new", "params": {"template": "blank"}}));
+        let mut notice = json!({"reason": format!("evicted to free memory ({reason})"), "source": source});
+        if let Some(p) = &recovered {
+            notice["recovered"] = json!(p.to_string_lossy());
+        }
+        if let Ok(mut g) = self.shared.lock() {
+            if let Some(p) = &recovered {
+                g.recovered.push(json!({"path": p.to_string_lossy(), "reason": reason}));
+            }
+            g.snapshot = self.backend.snapshot();
+        }
+        self.notice = Some(notice);
+        Some(match &recovered {
+            Some(p) => format!("this call finished, then the document was evicted to free memory: it is auto-saved at {}", p.display()),
+            None => "this call finished, then the document (saved, no unsaved changes) was closed to free memory".to_string(),
+        })
+    }
+}
+
+/// Add `w` to a tool result's warnings (structured content and its text).
+fn add_warning(r: &mut Value, w: &str) {
+    let Some(sc) = r.get_mut("structuredContent") else { return };
+    let target = if let Some(e) = sc.get_mut("error") { e } else { sc };
+    if let Some(o) = target.as_object_mut() {
+        let list = o.entry("warnings").or_insert_with(|| json!([]));
+        if let Some(a) = list.as_array_mut() {
+            a.push(json!(w));
+        }
+    }
+    let text = serde_json::to_string_pretty(&r["structuredContent"]).unwrap_or_default();
+    if let Some(c) = r.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.iter_mut().rev().find(|c| c["type"] == "text")) {
+        c["text"] = json!(text);
     }
 }

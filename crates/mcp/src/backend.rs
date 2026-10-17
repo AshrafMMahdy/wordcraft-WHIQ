@@ -9,13 +9,22 @@ use serde_json::{Value, json};
 
 /// Something that answers control-channel methods (`engine.execute`, `document.inspect`,
 /// `ui.pointer`, `ui.render`, …). See `wordcraft_ui_egui::control` for the full list.
-pub trait Backend {
+pub trait Backend: Send {
     /// Call one method. `Ok` carries the `result`, `Err` the error message.
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
     /// True when a real UI is attached (`ui.screenshot`, `ui.click`, dialogs… work).
     fn has_ui(&self) -> bool;
     /// Short human description ("headless", "connected to 127.0.0.1:7981").
     fn describe(&self) -> String;
+    /// WHIQ: the open document as it stands, for auto-saving it on eviction, panic or SIGTERM
+    /// (`None`: the backend can't give one, e.g. a running app keeps its own recovery).
+    fn snapshot(&mut self) -> Option<crate::recover::Snapshot> {
+        None
+    }
+    /// WHIQ: the author new tracked changes and comments get, when known.
+    fn author(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Looks up the control key for an address (`HOST:PORT`).

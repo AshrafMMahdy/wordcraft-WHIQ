@@ -6,8 +6,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod backend;
+pub mod contract;
+pub mod recover;
+pub mod runtime;
 pub mod server;
 pub mod tools;
+pub mod whiq;
+pub mod whiq_review;
 
 pub use backend::{Backend, Remote};
 pub use server::Server;
@@ -47,10 +52,19 @@ impl Headless {
             "ui.parity" => Ok(wordcraft_engine::catalog::parity(&self.session.registry)),
             "ui.render" | "render.page" => {
                 let page = params.get("page").and_then(Value::as_u64).unwrap_or(1).max(1) as usize - 1;
-                let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 4.0) as f32;
-                let l = self.session.layout();
+                let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 8.0) as f32;
+                // WHIQ: `markup` picks the printed page with or without Print Markup (as a PDF
+                // export does); without it, the page as the editing view lays it out.
+                let (l, opts) = match params.get("markup").and_then(Value::as_bool) {
+                    Some(markup) => {
+                        let mut o = wordcraft_render::RenderOptions::default();
+                        o.display.dim_header = false;
+                        (self.session.export_layout_with(markup), o)
+                    }
+                    None => (self.session.layout(), Default::default()),
+                };
                 let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page + 1))?;
-                let img = wordcraft_render::render_page(&self.session.doc, pg, scale, &Default::default());
+                let img = wordcraft_render::render_page(&self.session.doc, pg, scale, &opts);
                 let png = img.to_png();
                 Ok(
                     json!({"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": img.width, "height": img.height, "pages": l.pages.len()}),
@@ -78,6 +92,21 @@ impl Backend for Headless {
     }
     fn describe(&self) -> String {
         "headless session (no window)".into()
+    }
+    fn snapshot(&mut self) -> Option<recover::Snapshot> {
+        let s = &self.session;
+        Some(recover::Snapshot {
+            doc: s.doc.clone(),
+            path: s.path.clone(),
+            file_name: s.file_name.clone(),
+            dirty: s.dirty,
+            paragraphs: s.doc.paragraph_count(),
+            words: s.doc.word_count(),
+            rev: (s.document_id(), s.rev()),
+        })
+    }
+    fn author(&self) -> Option<String> {
+        Some(self.session.author.clone())
     }
 }
 

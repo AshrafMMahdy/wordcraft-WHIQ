@@ -75,6 +75,8 @@ impl Temporary {
     fn commit(mut self, destination: &Path) -> io::Result<()> {
         // Close before replacement, including on Windows.
         drop(self.file.take());
+        // WHIQ: automation keeps the file it would replace as `OLD_<name>` first.
+        crate::file_access::keep_old(destination)?;
         fs::rename(&self.path, destination)?;
         self.committed = true;
         Ok(())
@@ -165,6 +167,27 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"Exported bytes.");
         assert_eq!(fs::read(&alias).unwrap(), b"Original bytes.");
         assert_eq!(fs::read_dir(&d.0).unwrap().count(), 2);
+    }
+
+    /// WHIQ: under `KeepOld` the file a save replaces is kept as `OLD_<name>`, then `OLD_2_<name>`;
+    /// a new file keeps nothing; `Replace` replaces.
+    #[test]
+    fn keep_old_keeps_the_replaced_file_beside_the_new_one() {
+        use crate::file_access::{Overwrite, with_overwrite};
+        let d = Scratch::new();
+        let path = d.target();
+        let ((), kept) = with_overwrite(Overwrite::KeepOld, || write(&path, b"first").unwrap());
+        assert!(kept.is_empty());
+        let ((), kept) = with_overwrite(Overwrite::KeepOld, || write(&path, b"second").unwrap());
+        assert_eq!(kept, vec![(path.clone(), d.0.join("OLD_original.docx"))]);
+        let ((), kept) = with_overwrite(Overwrite::KeepOld, || write(&path, b"third").unwrap());
+        assert_eq!(kept[0].1, d.0.join("OLD_2_original.docx"));
+        assert_eq!(fs::read(&path).unwrap(), b"third");
+        assert_eq!(fs::read(d.0.join("OLD_original.docx")).unwrap(), b"first");
+        assert_eq!(fs::read(d.0.join("OLD_2_original.docx")).unwrap(), b"second");
+        let ((), kept) = with_overwrite(Overwrite::Replace, || write(&path, b"fourth").unwrap());
+        assert!(kept.is_empty());
+        assert_eq!(fs::read_dir(&d.0).unwrap().count(), 3);
     }
 
     #[cfg(unix)]

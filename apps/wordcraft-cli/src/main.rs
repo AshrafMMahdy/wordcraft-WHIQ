@@ -32,13 +32,21 @@ USAGE:
   wordcraft-cli commands [--json]             list every command
   wordcraft-cli parity [--markdown]           feature-catalog parity
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
+                    [--job-after-ms N] [--max-result-bytes N] [--max-memory-mb N]
                                               MCP server on stdio (headless, or bridged to the app).
                                               --automation-read-root / --automation-write-root confine
                                               the files the agent's commands read (open, insert text
                                               or picture, mail-merge data, templates…) and write (save,
                                               export, merge output…) to DIR, links followed; a root left
                                               out grants none of its access. They apply to the headless
-                                              server and are an error with --connect.
+                                              server and are an error with --connect. Relative
+                                              paths are inside the write root. A call running past
+                                              --job-after-ms (default 15000) becomes a job
+                                              (job_status); results over --max-result-bytes
+                                              (default 100000) are trimmed with continue_from; past
+                                              --max-memory-mb the document is auto-saved and closed.
+                                              SIGTERM / SIGINT auto-save unsaved work to
+                                              <name>.recovered-<stamp>.docx in the write root.
   wordcraft-cli zotero <command> <file> [--cmd 'id={json}' …] [--save OUT] [--trace] [--port P]
                                               run a Zotero command on a document (Zotero must be
                                               running): addEditCitation, addEditBibliography,
@@ -237,7 +245,14 @@ const RUN_OPTIONS: &[OptionSpec] = &[
 ];
 const COMMANDS_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--json", takes_value: false }];
 const PARITY_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markdown", takes_value: false }];
-const MCP_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--connect", takes_value: true }, OptionSpec { name: "--author", takes_value: true }];
+const MCP_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--connect", takes_value: true },
+    OptionSpec { name: "--author", takes_value: true },
+    // WHIQ: the "no dead stops" contract's limits.
+    OptionSpec { name: "--job-after-ms", takes_value: true },
+    OptionSpec { name: "--max-result-bytes", takes_value: true },
+    OptionSpec { name: "--max-memory-mb", takes_value: true },
+];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
     OptionSpec { name: "--save", takes_value: true },
@@ -471,10 +486,39 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                     Box::new(headless)
                 }
             };
-            let mut server = wordcraft_mcp::Server::new(backend);
-            let stdin = std::io::stdin();
+            // WHIQ: the contract's runtime (busy, jobs, auto-save on SIGTERM / eviction / panic).
+            let number = |flag: &str| -> Result<Option<u64>, String> {
+                arg_value(&rest, flag)
+                    .map(|v| v.trim().parse::<u64>().map_err(|_| format!("mcp: {flag} needs a whole number, got `{v}`")))
+                    .transpose()
+            };
+            let mut options = wordcraft_mcp::runtime::Options::default();
+            if let Some(ms) = number("--job-after-ms")? {
+                options.job_after = std::time::Duration::from_millis(ms.clamp(10, 600_000));
+            }
+            let mut limits = wordcraft_mcp::whiq::Limits::default();
+            if let Some(b) = number("--max-result-bytes")? {
+                limits.max_result_bytes = (b as usize).clamp(1024, 64 << 20);
+            }
+            limits.max_memory_bytes = number("--max-memory-mb")?.map(|mb| mb.saturating_mul(1024 * 1024));
+            limits.test_hooks = std::env::var("WORDCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1");
+            let shared = wordcraft_mcp::runtime::SharedState::default();
+            if let Ok(mut g) = shared.lock() {
+                g.backend = backend.describe();
+            }
+            if let (Ok(mut g), Some(r)) = (shared.lock(), wordcraft_engine::file_access::current()) {
+                g.read_root = r.read_root().map(std::path::Path::to_path_buf);
+                g.write_root = r.write_root().map(std::path::Path::to_path_buf);
+            }
+            // Relative paths are resolved inside the write root.
+            if let Some(w) = shared.lock().ok().and_then(|g| g.write_root.clone()) {
+                std::env::set_current_dir(&w).map_err(|e| format!("mcp: cannot enter the write root {}: {e}", w.display()))?;
+            }
+            let (worker_shared, worker_limits) = (shared.clone(), limits.clone());
+            let make = move || wordcraft_mcp::Server::new(backend).with_limits(worker_limits).with_shared(worker_shared);
+            let stdin = std::io::BufReader::new(std::io::stdin());
             // A client that closes our stdout has hung up: `serve` returns BrokenPipe and we end cleanly.
-            Ok(server.serve(stdin.lock(), std::io::stdout())?)
+            Ok(wordcraft_mcp::runtime::serve(make, shared, options, limits, stdin, std::io::stdout())?)
         }
         "zotero" => {
             validate_options("zotero", &rest, ZOTERO_OPTIONS)?;
