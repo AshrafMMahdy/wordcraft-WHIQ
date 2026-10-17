@@ -200,7 +200,8 @@ fn hyperlink_runs_and_wrappers() {
     let p = paras(&d);
     // The content control around "C" is kept (zero-width markers in the text).
     assert_eq!(p[0].plain_text(), "siteXABC\u{F04A}\u{2011}\u{AD}\n\u{C}\u{E} e&T");
-    assert!(matches!(p[0].objects.first(), Some(InlineObject::ControlStart { .. })));
+    // WHIQ: the smart tag's and custom XML's tags are kept (opaque objects) before it.
+    assert!(matches!(p[0].objects.iter().find(|o| !matches!(o, InlineObject::Opaque { .. })), Some(InlineObject::ControlStart { .. })));
     assert_eq!(p[0].props_of_char(0).link.as_deref(), Some("https://example.org/"));
     assert_eq!(p[0].props_of_char(0).style.as_deref(), Some("Hyperlink"));
     assert_eq!(p[0].props_of_char(4).link.as_deref(), Some("https://example.org/#frag"));

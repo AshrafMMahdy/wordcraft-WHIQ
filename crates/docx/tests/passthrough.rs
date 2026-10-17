@@ -150,8 +150,8 @@ fn unmodelled_parts_are_carried_with_relationships_and_content_types() {
 
 #[test]
 fn parts_the_writer_owns_or_the_body_refers_to_are_not_carried() {
-    // A second styles part, and an unknown part the body refers to by id: neither is carried
-    // (the first would contradict the written styles, the second's element isn't kept).
+    // A second styles part, and an unknown part the body refers to by id: the first isn't carried
+    // (it would contradict the written styles).
     let bytes = package(
         r#"<w:p><w:r><w:t>Body</w:t></w:r><w:customThing r:id="rId8"/></w:p>"#,
         &[("rId7", &format!("{REL}/styles"), "other-styles.xml"), ("rId8", "urn:example:referenced", "referenced.xml")],
@@ -162,8 +162,20 @@ fn parts_the_writer_owns_or_the_body_refers_to_are_not_carried() {
         ],
     );
     let files = save(&wordcraft_docx::read(&bytes).unwrap());
-    assert!(!files.contains_key("word/other-styles.xml") && !files.contains_key("word/referenced.xml"), "{:?}", files.keys());
+    assert!(!files.contains_key("word/other-styles.xml"), "{:?}", files.keys());
     assert_eq!(text(&files, "word/_rels/document.xml.rels").matches("/styles\"").count(), 1);
+    // WHIQ: the unknown element is kept now (an opaque pass-through node), so its part goes with
+    // it, related from the body under a fresh id that the element names.
+    assert!(files.contains_key("word/referenced.xml"), "{:?}", files.keys());
+    let rels = text(&files, "word/_rels/document.xml.rels");
+    let body = text(&files, "word/document.xml");
+    let id = rels
+        .split("<Relationship ")
+        .find(|r| r.contains("urn:example:referenced"))
+        .and_then(|r| r.split("Id=\"").nth(1))
+        .and_then(|r| r.split('"').next())
+        .unwrap();
+    assert!(body.contains(&format!("<w:customThing r:id=\"{id}\"")), "{body}");
 }
 
 fn comments_package(with_ids: bool) -> Vec<u8> {

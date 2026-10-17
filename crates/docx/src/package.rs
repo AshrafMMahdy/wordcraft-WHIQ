@@ -209,6 +209,11 @@ impl Package {
         Package { files }
     }
 
+    /// WHIQ: every part name (for the round-trip diff, [`crate::roundtrip`]).
+    pub fn part_names(&self) -> std::collections::BTreeSet<String> {
+        self.files.keys().cloned().collect()
+    }
+
     /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         let n = name.trim_start_matches('/');

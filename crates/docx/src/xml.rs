@@ -92,6 +92,55 @@ fn prefix_for(uri: &[u8], extra: &[(&'static str, &str)]) -> &'static str {
     "?"
 }
 
+/// WHIQ: the URIs of namespaces no reader here knows, by the hash naming them (see
+/// [`unknown_prefix`]). Bounded; shared by the whole process.
+fn unknown_namespaces() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// WHIQ: a namespace no reader here knows, named `?hhhhhhhh` (a hash of its URI) instead of `?`,
+/// so markup in it can be written back (see [`El::to_xml_ext`]). Past the bound, on a hash
+/// collision or for an unusable URI it stays `?` (dropped on write, as before).
+fn unknown_prefix(uri: &[u8]) -> String {
+    const MAX_KNOWN: usize = 4096;
+    let Ok(uri) = std::str::from_utf8(uri) else { return "?".into() };
+    if uri.is_empty() || uri.len() > 1024 || uri.contains(['"', '<', '&']) {
+        return "?".into();
+    }
+    let h = format!("{:08x}", fnv1a(uri.as_bytes()));
+    let Ok(mut seen) = unknown_namespaces().lock() else { return "?".into() };
+    match seen.get(&h) {
+        Some(u) if u == uri => format!("?{h}"),
+        Some(_) => "?".into(),
+        None if seen.len() < MAX_KNOWN => {
+            seen.insert(h.clone(), uri.to_string());
+            format!("?{h}")
+        }
+        None => "?".into(),
+    }
+}
+
+/// The URI of an unknown namespace named `?hhhhhhhh` by [`unknown_prefix`] (`hash` without the `?`).
+pub fn unknown_uri(hash: &str) -> Option<String> {
+    unknown_namespaces().lock().ok()?.get(hash).cloned()
+}
+
+/// The prefix [`El::to_xml_ext`] writes for an unknown namespace's `?hhhhhhhh`.
+pub fn written_prefix(name_prefix: &str) -> Option<String> {
+    let h = name_prefix.strip_prefix('?')?;
+    (h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("x{h}"))
+}
+
+fn fnv1a(b: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for x in b {
+        h ^= u32::from(*x);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 /// Compatibility feature namespaces whose elements are not otherwise handled by this tree.
 /// Keep the reader's existing feature set when canonicalizing `mc:Choice/@Requires` aliases.
 fn requirement_prefix(uri: &[u8]) -> &'static str {
@@ -107,6 +156,15 @@ fn requirement_prefix(uri: &[u8]) -> &'static str {
         b"http://schemas.microsoft.com/office/word/2018/wordml/cex" => "w16cex",
         b"http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash" => "w16sdtdh",
         _ => "?",
+    }
+}
+
+/// [`requirement_prefix`], naming an unknown namespace by its hash (WHIQ) so the requirement
+/// can be written back.
+fn requirement_name(uri: &[u8]) -> String {
+    match requirement_prefix(uri) {
+        "?" => unknown_prefix(uri),
+        p => p.to_string(),
     }
 }
 
@@ -203,13 +261,13 @@ impl El {
     /// attributes in unknown namespaces are dropped.
     pub fn to_xml(&self) -> String {
         fn go(e: &El, s: &mut String, depth: usize) {
-            if depth > MAX_DEPTH || e.name.starts_with("?:") {
+            if depth > MAX_DEPTH || e.name.starts_with('?') {
                 return;
             }
             s.push('<');
             s.push_str(&e.name);
             for (k, v) in &e.attrs {
-                if k.starts_with("?:") {
+                if k.starts_with('?') {
                     continue;
                 }
                 s.push(' ');
@@ -235,6 +293,76 @@ impl El {
         }
         let mut s = String::new();
         go(self, &mut s, 0);
+        s
+    }
+    /// WHIQ: [`El::to_xml`] that keeps markup in namespaces no reader here knows (named
+    /// `?hhhhhhhh` by the parser): it is written with the prefix `xhhhhhhhh`, declared on this
+    /// element, so the element stands alone. `mc:Choice/@Requires` naming such a namespace is
+    /// written the same way. A name in a namespace the parser couldn't name (`?`) is still left out.
+    pub fn to_xml_ext(&self) -> String {
+        fn name_of(n: &str, used: &mut std::collections::BTreeSet<String>) -> Option<String> {
+            if !n.starts_with('?') {
+                return Some(n.to_string());
+            }
+            let (p, local) = n.split_once(':')?;
+            let w = written_prefix(p)?;
+            used.insert(p.trim_start_matches('?').to_string());
+            Some(format!("{w}:{local}"))
+        }
+        fn go(e: &El, s: &mut String, used: &mut std::collections::BTreeSet<String>, depth: usize) {
+            if depth > MAX_DEPTH {
+                return;
+            }
+            let Some(name) = name_of(&e.name, used) else { return };
+            s.push('<');
+            s.push_str(&name);
+            for (k, v) in &e.attrs {
+                let Some(k2) = name_of(k, used) else { continue };
+                let v = if e.name == "mc:Choice" && k == "Requires" {
+                    v.split_whitespace()
+                        .map(|t| match written_prefix(t) {
+                            Some(w) => {
+                                used.insert(t.trim_start_matches('?').to_string());
+                                w
+                            }
+                            None => t.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    v.clone()
+                };
+                s.push(' ');
+                s.push_str(&k2);
+                s.push_str("=\"");
+                s.push_str(&esc(&v));
+                s.push('"');
+            }
+            if e.kids.is_empty() {
+                s.push_str("/>");
+                return;
+            }
+            s.push('>');
+            for n in &e.kids {
+                match n {
+                    Node::Text(t) => s.push_str(&esc(t)),
+                    Node::El(c) => go(c, s, used, depth + 1),
+                }
+            }
+            s.push_str("</");
+            s.push_str(&name);
+            s.push('>');
+        }
+        let mut s = String::new();
+        let mut used = std::collections::BTreeSet::new();
+        go(self, &mut s, &mut used, 0);
+        if used.is_empty() {
+            return s;
+        }
+        // Declare the unknown namespaces on the outermost element.
+        let decls: String = used.iter().filter_map(|h| unknown_uri(h).map(|u| format!(" xmlns:x{h}=\"{}\"", esc(&u)))).collect();
+        let at = s.find([' ', '/', '>']).unwrap_or(s.len());
+        s.insert_str(at, &decls);
         s
     }
     /// Local part of the name.
@@ -285,7 +413,10 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
         buf.clear();
         let (res, ev) = r.read_resolved_event_into(&mut buf).map_err(|e| DocxError::Xml(e.to_string()))?;
         let el_prefix = match &res {
-            ResolveResult::Bound(ns) => Some(prefix_for(ns.as_ref(), extra)),
+            ResolveResult::Bound(ns) => Some(match prefix_for(ns.as_ref(), extra) {
+                "?" => std::borrow::Cow::Owned(unknown_prefix(ns.as_ref())),
+                p => std::borrow::Cow::Borrowed(p),
+            }),
             _ => None,
         };
         match ev {
@@ -310,7 +441,10 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
                     let (ares, alocal) = r.resolver_mut().resolve_attribute(key);
                     let alocal = String::from_utf8_lossy(alocal.as_ref()).into_owned();
                     let aname = match ares {
-                        ResolveResult::Bound(ns) => format!("{}:{alocal}", prefix_for(ns.as_ref(), extra)),
+                        ResolveResult::Bound(ns) => match prefix_for(ns.as_ref(), extra) {
+                            "?" => format!("{}:{alocal}", unknown_prefix(ns.as_ref())),
+                            p => format!("{p}:{alocal}"),
+                        },
                         _ => alocal,
                     };
                     let val = match a.normalized_value(XmlVersion::Explicit1_0) {
@@ -329,8 +463,8 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
                                 .map(|prefix| {
                                     let qualified = format!("{prefix}:requirement");
                                     match r.resolver_mut().resolve_attribute(QName(qualified.as_bytes())).0 {
-                                        ResolveResult::Bound(ns) => requirement_prefix(ns.as_ref()),
-                                        _ => "?",
+                                        ResolveResult::Bound(ns) => requirement_name(ns.as_ref()),
+                                        _ => "?".to_string(),
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -545,7 +679,10 @@ mod tests {
         let x = br#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:pen="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"><mc:Choice Requires="pen"/><mc:Choice xmlns:pen="urn:future" Requires="pen"/><mc:Choice Requires="undeclared"/></mc:AlternateContent>"#;
         let e = parse(x).unwrap();
         let values: Vec<_> = e.children("mc:Choice").map(|c| c.attr("Requires")).collect();
-        assert_eq!(values, [Some("wpi"), Some("?"), Some("?")]);
+        // WHIQ: a namespace no reader knows is named by its hash (`?hhhhhhhh`) so it can be written back.
+        assert_eq!(values[0], Some("wpi"));
+        assert!(values[1].is_some_and(|v| v.starts_with('?') && v.len() == 9), "{values:?}");
+        assert_eq!(values[2], Some("?"));
     }
 
     #[test]

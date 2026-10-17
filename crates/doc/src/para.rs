@@ -550,11 +550,21 @@ pub enum InlineObject {
         props: Box<CharProps>,
     },
     /// Something we don't model, kept for round-trip (raw XML of the source format).
+    ///
+    /// WHIQ formats besides `docx` (markup written where the object sits, among the runs):
+    /// `docx-block` (a block-level element: written before the paragraph when the object leads it,
+    /// else after it), `docx-open` / `docx-close` (the start and end tags of an inline wrapper such
+    /// as `w:customXml`, `w:bdo` or `w:dir`), `docx-block-open` / `docx-block-close` (a wrapper around
+    /// whole paragraphs). Unmatched wrapper tags are left out when writing.
     Opaque {
         format: String,
         xml: String,
         #[serde(default)]
         text: String,
+        /// WHIQ: the relationships `xml` uses (by the ids in it), whose parts are kept in
+        /// `Document::passthrough`, as for [`crate::graphic::Embedded`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<crate::graphic::EmbeddedRef>,
     },
 }
 
@@ -737,7 +747,7 @@ impl InlineObject {
     /// the column. Kept as the run element itself.
     pub fn note_separator(continuation: bool) -> InlineObject {
         let el = if continuation { "w:continuationSeparator" } else { "w:separator" };
-        InlineObject::Opaque { format: "docx".into(), xml: format!("<w:r><{el}/></w:r>"), text: String::new() }
+        InlineObject::Opaque { format: "docx".into(), xml: format!("<w:r><{el}/></w:r>"), text: String::new(), refs: Vec::new() }
     }
     /// For a [`InlineObject::note_separator`]: whether it is the continuation separator.
     pub fn as_note_separator(&self) -> Option<bool> {

@@ -38,3 +38,31 @@ Limits worth knowing: `OLD_` keeping, auto-save and memory eviction apply to the
 (`--connect` drives the desktop app, which has its own saving and recovery). On Windows a
 supervisor that kills the process outright (TerminateProcess) can't be caught; Ctrl+C, Ctrl+Break
 and closing the console are.
+
+## 2. Lossless round trip of a customer's document
+
+Before: unknown elements in `word/document.xml`, headers, footers, notes and comments were
+dropped on open (`_ => {}` in the readers), wrappers without a model (`w:customXml`,
+`w:smartTag`, `w:bdo`, `w:dir`) were unwrapped, unmodelled run, paragraph and section properties
+(`w14:ligatures`, `w:divId`, `w:cnfStyle`, `w:paperSrc`, `w:printerSettings`…) were lost, only one
+branch of an `mc:AlternateContent` was kept (a shape lost its VML fallback, a 3-D model became its
+picture), and parts referenced only from such markup were dropped with it.
+
+| Change | Where | Tested by |
+|---|---|---|
+| Namespaces no reader knows are named by a hash of their URI (`?hhhhhhhh:`) instead of collapsing to `?:`, so their markup can be written back; `El::to_xml_ext` writes them with the prefix `xhhhhhhhh` declared on the element, and `mc:Choice/@Requires` likewise. The writer hoists those declarations to each part's root and lists the prefixes in its `mc:Ignorable` (Word skips what it doesn't know). | `crates/docx/src/xml.rs`, `write/passthrough.rs` (`hoist_namespaces`) | unit tests in `xml.rs`, `write/passthrough.rs` |
+| Opaque pass-through nodes, in order (`InlineObject::Opaque` gains `refs`, its relationships): an unknown block-level element becomes a `docx-block` object written before the next paragraph (or after the story's last); unknown elements among runs and inside runs become `docx` objects; wrappers keep their start/end tags (`docx-open`/`docx-close`, `docx-block-open`/`docx-block-close`), written balanced (a tag whose partner was edited away is left out; wrappers never cross a content control or hyperlink). Parts their relationships reach are carried (`keep_part_tree`), with relationships renumbered on write. | `crates/docx/src/read/passthrough.rs`, `read/story.rs`, `write/passthrough.rs`, `write/story.rs`, `crates/doc/src/para.rs` | `crates/docx/tests/corpus_roundtrip.rs` |
+| Unmodelled properties kept as markup: `CharProps::ext_xml` (run properties, also in styles), `ParaProps::ext_xml` (written last in `w:pPr`, where CT_PPrBase puts `w:divId`/`w:cnfStyle`), `SectionProps::ext` (with relationships: `w:printerSettings`), written at their schema positions (`w:paperSrc` after `w:pgMar`, `w:noEndnote` after `w:vAlign`, `w:rtlGutter` after `w:bidi`, the rest last). | `crates/doc/src/props.rs`, `section.rs`, `crates/docx/src/read/props.rs`, `write/props.rs`, `write/story.rs` | `corpus_roundtrip.rs`; `every_char_prop_round_trips`, `every_para_prop_round_trips` (`crates/docx/tests/roundtrip.rs`, extended) |
+| `mc:AlternateContent` at run level: the object read from the chosen branch is fingerprinted; the whole `AlternateContent` (every branch, with its parts) is kept under that fingerprint, and an object still unchanged at save time (text box text included) is written back with every branch (fresh drawing ids, relationships renumbered). An edited object is written from the model. | `read/story.rs`, `read/passthrough.rs` (`keep_alternate`), `write/passthrough.rs` (`fingerprint`, `kept_alternate`) | `corpus_roundtrip.rs` (`w14-future-markup.docx`, `model-3d.docx`) |
+| The round-trip diff tool: part lists (a part saved under another name with identical bytes counts as renamed), every part's relationships (by type and target), binary parts byte for byte, and the story parts as a namespace-expanded normalised tree (rsids, `w14:paraId`/`textId`, proofing marks and empty property containers left out): an element inventory (anything fewer after the save is a loss; a field counts the same as `w:fldSimple` or `w:fldChar`), the paragraph texts, and the first differing line. `wordcraft-cli roundtrip-check FILE [--save OUT]` runs it on any file (exit 1 when something is lost); the MCP tool `roundtrip_check` does too. | `crates/docx/src/roundtrip.rs`, `apps/wordcraft-cli/src/main.rs`, `crates/mcp/src/whiq.rs` | `corpus_roundtrip.rs` (`the_diff_tool_reports_dropped_parts_relationships_and_elements`), unit tests |
+| The corpus: ten hand-written packages (from ECMA-376 and [MS-DOCX], no file produced by Word): tracked insertions/deletions/formatting/paragraph marks with a move and a comment; SmartArt (data, layout, quick style, colours, drawing); a chart with its workbook; custom XML (block, inline, data-bound content control, custom XML part); `w14` run effects and ligatures, a `w14` check box, a `wps` shape with its VML fallback, `w:bdo`/`w:dir`, proofing marks and markup in an ignorable future namespace (block, inline, in a run); an OLE object with its preview; a 3-D model with its picture fallback; header/footer with fields and future markup, footnotes with `w14` run properties; a macro project (`.docm`); `w:altChunk` with its part, `w:divId`, `w:cnfStyle`, custom XML in a table cell, `w:paperSrc`/`w:rtlGutter`/`w:printerSettings`. Open + save of each keeps every part and relationship and drops no element, saving twice is stable, and through MCP (open_document, save_document, and after an edit elsewhere) the same holds. Written to `target/whiq-corpus/` (`$WHIQ_CORPUS_DIR`) with the saved copies, to open in Word. | `crates/docx/tests/corpus/mod.rs` | `corpus_roundtrip.rs`; `every_corpus_document_survives_open_and_save_through_mcp` (contract suite) |
+
+Behaviour changes upstream tests pinned (updated, marked WHIQ): the smart tag's and custom XML's
+tags now precede a content control's start marker (`fixtures.rs::hyperlink_runs_and_wrappers`);
+an unknown element that refers to a part keeps the part (`passthrough.rs::parts_the_writer_owns_or_the_body_refers_to_are_not_carried`).
+
+Not covered: `w:customXml` directly around a table (it is unwrapped, as before; Word 2010 and
+later strip custom XML markup themselves); unknown *attributes* on modelled elements (e.g.
+`w16du:dateUtc` on `w:ins`) are regenerated, not kept; a block-level `mc:AlternateContent` keeps
+its chosen branch only; objects inside an unknown element are not editable (they ride along as
+markup).

@@ -217,7 +217,9 @@ impl Reader<'_> {
                     }
                 }
                 "w:sdt" => self.read_block_sdt(sc, e, rels, out, depth),
-                "w:customXml" | "w:smartTag" | "w:ins" | "w:moveTo" => self.read_blocks(sc, e, rels, out, depth + 1),
+                // WHIQ: the wrapper's tags are kept around its paragraphs.
+                "w:customXml" | "w:smartTag" => self.read_block_wrapper(sc, e, rels, out, depth),
+                "w:ins" | "w:moveTo" => self.read_blocks(sc, e, rels, out, depth + 1),
                 "mc:AlternateContent" => {
                     if let Some(c) = children_of_choice(e) {
                         self.read_blocks(sc, c, rels, out, depth + 1);
@@ -229,9 +231,35 @@ impl Reader<'_> {
                     }
                 }
                 "w:moveFromRangeStart" | "w:moveFromRangeEnd" | "w:moveToRangeStart" | "w:moveToRangeEnd" => self.move_range(e),
+                // WHIQ: anything else is kept as it is, before the next paragraph.
+                name if !super::passthrough::skip_block(name) => {
+                    if let Some(o) = self.opaque(e, rels, "docx-block", false) {
+                        sc.pending.push(o);
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// WHIQ: a wrapper around whole paragraphs (`w:customXml`, `w:smartTag`): its content's
+    /// blocks, with its start tag kept at the start of the first paragraph and its end tag at the
+    /// end of the last. Content that starts or ends with a table is unwrapped instead.
+    fn read_block_wrapper(&mut self, sc: &mut StoryCtx, e: &El, rels: &Rels, out: &mut Blocks, depth: usize) {
+        let mut inner = Blocks::new();
+        self.read_blocks(sc, e, rels, &mut inner, depth + 1);
+        let paras = matches!(inner.first().map(|b| &**b), Some(Block::Para(_))) && matches!(inner.last().map(|b| &**b), Some(Block::Para(_)));
+        if paras && let Some((open, close)) = self.wrapper_objects(e, true) {
+            if let Some(Block::Para(p)) = inner.first_mut().map(Arc::make_mut) {
+                let props = p.props_of_char(0).clone();
+                let _ = p.insert_object(0, open, &props);
+            }
+            if let Some(Block::Para(p)) = inner.last_mut().map(Arc::make_mut) {
+                let (at, props) = (p.len(), p.runs.last().map(|r| r.props.clone()).unwrap_or_else(|| p.mark.clone()));
+                let _ = p.insert_object(at, close, &props);
+            }
+        }
+        out.extend(inner);
     }
 
     /// A block-level content control: its content's blocks, between a start marker at the start
@@ -418,6 +446,8 @@ impl Reader<'_> {
 
     pub fn read_section(&mut self, s: &El, rels: &Rels) -> wordcraft_doc::SectionProps {
         let (mut sp, refs) = sectpr(s);
+        // WHIQ: what isn't modelled rides along.
+        sp.ext = self.section_ext(s, rels);
         // §17.13.5.32: the section's properties before a tracked change (no header references).
         if let Some(ch) = s.child("w:sectPrChange") {
             let old = ch.child("w:sectPr").map(|o| sectpr(o).0).unwrap_or_default();
@@ -509,7 +539,19 @@ impl Reader<'_> {
                 let end_props = pb.runs.last().map(|r| r.props.clone()).unwrap_or(props);
                 pb.push_obj(InlineObject::ControlEnd, &end_props);
             }
-            "w:smartTag" | "w:customXml" | "w:dir" | "w:bdo" => self.read_inline_children(sc, pb, k, rels, ctx, depth + 1),
+            // WHIQ: the wrapper's tags are kept around its content.
+            "w:smartTag" | "w:customXml" | "w:dir" | "w:bdo" => {
+                let wrap = self.wrapper_objects(k, false);
+                if let Some((open, _)) = &wrap {
+                    let props = self.run_props_none(ctx);
+                    pb.push_obj(open.clone(), &props);
+                }
+                self.read_inline_children(sc, pb, k, rels, ctx, depth + 1);
+                if let Some((_, close)) = wrap {
+                    let props = pb.runs.last().map(|r| r.props.clone()).unwrap_or_else(|| self.run_props_none(ctx));
+                    pb.push_obj(close, &props);
+                }
+            }
             "m:oMath" => {
                 let mut props = self.run_props_none(ctx);
                 let mut math = super::math::read_omath(k, Default::default());
@@ -544,6 +586,13 @@ impl Reader<'_> {
             "w:br" | "w:cr" => {
                 let props = self.run_props_none(ctx);
                 self.read_run_child(sc, pb, k, &props, rels, &mut None, depth + 1);
+            }
+            // WHIQ: anything else among the runs is kept as it is.
+            name if !super::passthrough::skip_inline(name) => {
+                if let Some(o) = self.opaque(k, rels, "docx", false) {
+                    let props = self.run_props_none(ctx);
+                    pb.push_obj(o, &props);
+                }
             }
             _ => {}
         }
@@ -718,9 +767,23 @@ impl Reader<'_> {
                 if let Some(o) = self.read_ink_alternate(sc, k, rels).or_else(|| self.read_chartex_alternate(sc, k, rels)) {
                     self.emit_obj(sc, pb, o, props);
                 } else if let Some(c) = children_of_choice(k) {
+                    let (t0, k0) = (pb.text.len(), pb.objects.len());
                     for x in c.els() {
                         self.read_run_child(sc, pb, x, props, rels, note, depth + 1);
                     }
+                    // WHIQ: one object came of it: keep the whole AlternateContent for it.
+                    if pb.objects.len() == k0 + 1
+                        && pb.text.len() == t0 + wordcraft_doc::para::OBJ.len_utf8()
+                        && let Some(o) = pb.objects.last().cloned()
+                    {
+                        self.keep_alternate(k, rels, &o);
+                    }
+                }
+            }
+            // WHIQ: any other run content is kept as it is, in a run of its own.
+            name if !super::passthrough::skip_run_child(name) => {
+                if let Some(o) = self.opaque(k, rels, "docx", true) {
+                    pb.push_obj(o, props);
                 }
             }
             _ => {}
@@ -1067,7 +1130,7 @@ impl Reader<'_> {
             .find(|c| c.child("w:drawing").and_then(|d| d.find("a:graphicData")).and_then(|g| g.attr("uri")) == Some(CHARTEX_URI))?;
         // A requirement in a namespace we can't name couldn't be written back.
         let requires = choice.attr("Requires").unwrap_or("");
-        if requires.split_whitespace().next().is_none() || requires.split_whitespace().any(|p| p == "?") {
+        if requires.split_whitespace().next().is_none() || requires.split_whitespace().any(|p| p.starts_with('?')) {
             return None;
         }
         let fallback = ac.child("mc:Fallback")?;

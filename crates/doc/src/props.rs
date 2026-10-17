@@ -384,6 +384,10 @@ pub struct CharProps {
     /// Tracked formatting change (`w:rPrChange`): the formatting before it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fmt_change: Option<Box<PropChange<CharProps>>>,
+    /// WHIQ: run properties read from a file that WordCraft doesn't model (`w14:ligatures`,
+    /// `w:eastAsianLayout`, `w:webHidden`…), kept as their markup so saving writes them back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext_xml: Option<String>,
 }
 
 /// A tracked formatting change (ECMA-376 §17.13.5: `w:rPrChange`, `w:pPrChange`,
@@ -442,7 +446,7 @@ impl CharProps {
     pub fn minus(mut self, base: &CharProps) -> CharProps {
         drop_same_fields!(self, base; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
             shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
-            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del);
+            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, ext_xml);
         self
     }
 
@@ -453,7 +457,7 @@ impl CharProps {
     pub fn overlay(&mut self, patch: &CharProps) {
         overlay_fields!(self, patch; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
             shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
-            cs, font_cs, font_ea, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, fmt_change);
+            cs, font_cs, font_ea, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, fmt_change, ext_xml);
         if let Some(p) = &patch.text_effects {
             self.text_effects.get_or_insert_with(Default::default).overlay(p);
         }
@@ -827,6 +831,10 @@ pub struct ParaProps {
     /// `w:snapToGrid`: lines snap to the section's document grid. Unset = on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snap_to_grid: Option<bool>,
+    /// WHIQ: paragraph properties read from a file that WordCraft doesn't model (`w:divId`,
+    /// `w:cnfStyle`, `w:textAlignment`…), kept as their markup so saving writes them back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext_xml: Option<String>,
 }
 
 impl ParaProps {
@@ -834,7 +842,7 @@ impl ParaProps {
         overlay_fields!(self, patch; style, align, indent_left, indent_right, indent_first, indent_left_chars, indent_right_chars, indent_first_chars, space_before, space_after, space_before_auto, space_after_auto, line_spacing,
             contextual_spacing, mirror_indents, keep_next, keep_lines, page_break_before, widow_control, outline_level, numbering, tabs, shading, borders,
             suppress_hyphens, suppress_line_numbers, bidi, drop_cap, frame, kinsoku, word_wrap, overflow_punct, top_line_punct, auto_space_de, auto_space_dn,
-            snap_to_grid);
+            snap_to_grid, ext_xml);
     }
     pub fn overlaid(mut self, patch: &ParaProps) -> ParaProps {
         self.overlay(patch);

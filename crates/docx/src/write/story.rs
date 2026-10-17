@@ -33,12 +33,16 @@ impl Writer<'_> {
             return;
         }
         let plan = super::sdt::plan(bl);
+        // WHIQ: wrappers kept from a file close within this story (and within a content control).
+        let saved_wrap_base = std::mem::replace(&mut self.block_wrap_base, self.block_wraps.len());
+        let mut sdt_marks: Vec<usize> = Vec::new();
         // A TOC inside a content control already has one (read from a file).
         let toc = if top { toc_span(bl).filter(|(start, _)| !plan.covers(*start)) } else { None };
         // Whether the heading's TOC field was written and still needs its end.
         let mut toc_field_open = false;
         for (i, b) in bl.iter().enumerate() {
             for c in plan.opens.get(i).into_iter().flatten() {
+                sdt_marks.push(self.block_wraps.len());
                 super::sdt::open(w, c);
             }
             if let Some((start, end)) = toc {
@@ -67,9 +71,14 @@ impl Writer<'_> {
                 }
             }
             for _ in 0..plan.closes.get(i).copied().unwrap_or(0) {
+                let mark = sdt_marks.pop().unwrap_or(self.block_wrap_base);
+                self.close_block_wraps(w, mark);
                 super::sdt::close(w);
             }
         }
+        let base = self.block_wrap_base;
+        self.close_block_wraps(w, base);
+        self.block_wrap_base = saved_wrap_base;
         if depth == 0 {
             self.move_ranges(w, &[]);
         }
@@ -151,6 +160,8 @@ impl Writer<'_> {
     }
 
     fn para_inner(&mut self, w: &mut W, p: &Paragraph, rels: &mut PartRels, top: bool, depth: usize, framed: bool) {
+        // WHIQ: block-level markup kept from a file that leads this paragraph.
+        self.opaque_before(w, p, rels);
         let para_id = self.take_para_id(p);
         match &para_id {
             Some(id) => w.open("w:p", &[("w14:paraId", id), ("w14:textId", "77777777")]),
@@ -239,11 +250,14 @@ impl Writer<'_> {
         let mark_moves = self.moves_of(&p.mark);
         self.move_ranges(w, &mark_moves);
         w.close("w:p");
+        // WHIQ: the rest of the block-level markup kept with this paragraph, and wrapper ends.
+        self.opaque_after(w, p, rels);
     }
 
     fn para_content(&mut self, w: &mut W, p: &Paragraph, rels: &mut PartRels, depth: usize) {
         // Taken first: a text box in this paragraph writes paragraphs of its own.
         let inline = std::mem::take(&mut self.inline_controls);
+        let saved_wrap_base = std::mem::replace(&mut self.inline_wrap_base, self.inline_wraps.len());
         // Split into pieces with their props.
         let mut pieces: Vec<(Piece, &CharProps)> = Vec::new();
         let mut k = 0usize;
@@ -297,6 +311,8 @@ impl Writer<'_> {
                     if open_link.take().is_some() {
                         w.close("w:hyperlink");
                     }
+                    // WHIQ: kept wrappers never cross a content control boundary.
+                    self.close_inline_wraps(w);
                     match o {
                         InlineObject::ControlStart { control } => super::sdt::open(w, control),
                         _ => super::sdt::close(w),
@@ -304,6 +320,22 @@ impl Writer<'_> {
                 }
                 i += 1;
                 continue;
+            }
+            // WHIQ: kept markup written around the paragraph is skipped here; a kept wrapper's
+            // tags close any hyperlink first (a hyperlink never crosses one).
+            if let Piece::Obj(o, _) = piece {
+                if super::passthrough::is_block_object(o) {
+                    i += 1;
+                    continue;
+                }
+                if matches!(o, InlineObject::Opaque { format, .. } if format == super::passthrough::OPEN || format == super::passthrough::CLOSE) {
+                    if open_link.take().is_some() {
+                        w.close("w:hyperlink");
+                    }
+                    self.opaque_inline(w, o, rels);
+                    i += 1;
+                    continue;
+                }
             }
             // Hyperlink grouping.
             if props.link != open_link {
@@ -361,6 +393,8 @@ impl Writer<'_> {
         if open_link.is_some() {
             w.close("w:hyperlink");
         }
+        self.close_inline_wraps(w);
+        self.inline_wrap_base = saved_wrap_base;
     }
 
     fn rev_kind(&self, idx: Option<u32>) -> Option<RevisionKind> {
@@ -445,6 +479,19 @@ impl Writer<'_> {
     }
 
     fn object(&mut self, w: &mut W, o: &InlineObject, props: &CharProps, rels: &mut PartRels, depth: usize) {
+        // WHIQ: an object read from an `mc:AlternateContent` and not edited since is written back
+        // with every branch of it (a VML fallback, a 3-D model's picture…).
+        if self.has_kept_alternates
+            && let Some(x) = self.kept_alternate(o, rels)
+        {
+            self.rev_open(w, props);
+            w.open("w:r", &[]);
+            self.rpr(w, props);
+            w.raw(&x);
+            w.close("w:r");
+            self.rev_close(w, props);
+            return;
+        }
         match o {
             // Written by `para_content` (inline) or `blocks` (around paragraphs).
             InlineObject::ControlStart { .. } | InlineObject::ControlEnd => {}
@@ -780,7 +827,9 @@ impl Writer<'_> {
                 w.close("w:r");
                 self.rev_close(w, props);
             }
-            InlineObject::Opaque { format, xml, text } => {
+            // WHIQ: kept markup with relationships (and wrapper tags written out of place).
+            InlineObject::Opaque { .. } if self.opaque_inline(w, o, rels) => {}
+            InlineObject::Opaque { format, xml, text, .. } => {
                 if format == "docx" && crate::xml::parse(xml.as_bytes()).is_ok() {
                     w.raw(xml);
                 } else if !text.is_empty() {
@@ -1298,13 +1347,15 @@ impl Writer<'_> {
                 }
             }
         }
-        sectpr_body(w, s);
+        // WHIQ: kept section properties, their relationships renumbered for this part.
+        let ext = s.ext.as_deref().and_then(|e| self.embedded_tree(e, rels, None));
+        sectpr_body(w, s, ext.as_ref());
         // The properties before a tracked change come last (§17.13.5.32).
         if let Some(ch) = &s.fmt_change {
             let a = self.change_attrs(ch.rev);
             open_change(w, "w:sectPrChange", &a);
             w.open("w:sectPr", &[]);
-            sectpr_body(w, &ch.old);
+            sectpr_body(w, &ch.old, None);
             w.close("w:sectPr");
             w.close("w:sectPrChange");
         }
@@ -1313,7 +1364,13 @@ impl Writer<'_> {
 }
 
 /// `w:sectPr` content after the header and footer references.
-fn sectpr_body(w: &mut W, s: &SectionProps) {
+fn sectpr_body(w: &mut W, s: &SectionProps, ext: Option<&crate::xml::El>) {
+    // WHIQ: kept properties go where CT_SectPr puts them.
+    let kept = |w: &mut W, names: &[&str]| {
+        for k in ext.iter().flat_map(|e| e.els()).filter(|k| names.contains(&k.name.as_str())) {
+            w.raw(&k.to_xml_ext());
+        }
+    };
     {
         // The section's own note options come before `w:type` (ECMA-376 §17.6.17).
         for (tag, pr) in [("w:footnotePr", &s.footnote_pr), ("w:endnotePr", &s.endnote_pr)] {
@@ -1349,6 +1406,7 @@ fn sectpr_body(w: &mut W, s: &SectionProps) {
                 ("w:gutter", &twips(s.gutter.max(0.0))),
             ],
         );
+        kept(w, &["w:paperSrc"]);
         if let Some(b) = &s.page_borders {
             borders(w, "w:pgBorders", b, None, &[("w:offsetFrom", "text")]);
         }
@@ -1405,6 +1463,7 @@ fn sectpr_body(w: &mut W, s: &SectionProps) {
             wordcraft_doc::section::PageVAlign::Justify => w.val("w:vAlign", "both"),
             wordcraft_doc::section::PageVAlign::Bottom => w.val("w:vAlign", "bottom"),
         }
+        kept(w, &["w:noEndnote"]);
         if s.title_page {
             w.empty("w:titlePg", &[]);
         }
@@ -1414,6 +1473,7 @@ fn sectpr_body(w: &mut W, s: &SectionProps) {
         if s.rtl {
             w.empty("w:bidi", &[]);
         }
+        kept(w, &["w:rtlGutter"]);
         if let Some(g) = &s.doc_grid {
             let mut a = vec![("w:linePitch", twips(g.line_pitch()))];
             if g.kind != wordcraft_doc::section::DocGridType::Default {
@@ -1425,6 +1485,10 @@ fn sectpr_body(w: &mut W, s: &SectionProps) {
             }
             let refs: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
             w.empty("w:docGrid", &refs);
+        }
+        // Everything else kept comes last (`w:printerSettings`, extensions).
+        for k in ext.iter().flat_map(|e| e.els()).filter(|k| !matches!(k.name.as_str(), "w:paperSrc" | "w:noEndnote" | "w:rtlGutter")) {
+            w.raw(&k.to_xml_ext());
         }
     }
 }

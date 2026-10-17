@@ -6,6 +6,7 @@ mod drawing_color;
 mod embed;
 mod freeform;
 pub(crate) mod math;
+mod passthrough;
 mod props;
 mod sdt;
 mod shape_style;
@@ -105,6 +106,8 @@ pub(crate) struct Reader<'p> {
     /// Linked text boxes as read: (`wps:txbx/@id` or `wps:linkedTxbx/@id`, `seq` (0 for the box
     /// holding the text), text box part). See [`link_text_boxes`].
     pub txbx_links: Vec<(u32, u32, u32)>,
+    /// WHIQ: bytes of unknown markup kept so far (see `passthrough`), bounded.
+    opaque_bytes: usize,
 }
 
 /// The package path that internal relationship `id` points at, if it has type `kind` (an `rt`
@@ -168,6 +171,7 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
         content_types: None,
         embedded: EmbeddedManifest::default(),
         txbx_links: Vec::new(),
+        opaque_bytes: 0,
     };
     r.pc.major_font = r.doc.settings.major_font.clone();
     r.pc.minor_font = r.doc.settings.minor_font.clone();

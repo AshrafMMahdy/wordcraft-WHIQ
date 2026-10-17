@@ -751,6 +751,11 @@ pub struct SectionProps {
     pub footnote_pr: NoteProps,
     #[serde(skip_serializing_if = "NoteProps::is_empty")]
     pub endnote_pr: NoteProps,
+    /// WHIQ: section properties read from a file that WordCraft doesn't model (`w:paperSrc`,
+    /// `w:noEndnote`, `w:rtlGutter`, `w:printerSettings`, extensions), as a `w:sectPr` holding
+    /// them, with the relationships they use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<std::sync::Arc<crate::graphic::Embedded>>,
 }
 
 impl Default for SectionProps {
@@ -786,6 +791,7 @@ impl Default for SectionProps {
             doc_grid: None,
             footnote_pr: NoteProps::default(),
             endnote_pr: NoteProps::default(),
+            ext: None,
         }
     }
 }

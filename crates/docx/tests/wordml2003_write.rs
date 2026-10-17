@@ -146,7 +146,7 @@ fn control_characters_and_unsupported_content_do_not_break_the_file() {
     let mut p = Paragraph::with_text("a\u{1}b\u{FFFE}c <&> \"q\"", CharProps { size: Some(f32::NAN), ..Default::default() });
     p.insert_object(
         0,
-        InlineObject::Opaque { format: "docx".into(), xml: "<w:r><w:t>raw</w:t></w:r>".into(), text: "raw".into() },
+        InlineObject::Opaque { format: "docx".into(), xml: "<w:r><w:t>raw</w:t></w:r>".into(), text: "raw".into(), refs: Vec::new() },
         &CharProps::default(),
     )
     .unwrap();

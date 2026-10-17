@@ -5191,10 +5191,12 @@ dependencies = [
  "serde_json",
  "sys-locale",
  "wordcraft-doc",
+ "wordcraft-docx",
  "wordcraft-engine",
  "wordcraft-mcp",
  "wordcraft-render",
  "wordcraft-zotero",
+ "zip",
 ]
 
 [[package]]
@@ -5345,6 +5347,7 @@ dependencies = [
  "serde_json",
  "wordcraft-control-key",
  "wordcraft-doc",
+ "wordcraft-docx",
  "wordcraft-engine",
  "wordcraft-render",
 ]

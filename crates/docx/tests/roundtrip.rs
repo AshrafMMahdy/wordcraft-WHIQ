@@ -114,6 +114,8 @@ fn every_char_prop_round_trips() {
         ins: None,
         del: None,
         fmt_change: None,
+        // WHIQ: unmodelled run properties ride along as markup.
+        ext_xml: Some("<w:webHidden/>".into()),
     };
     let auto =
         CharProps { color: Some(TextColor::Auto), highlight: Some(Highlight::None), vert_align: Some(VertAlign::Subscript), ..Default::default() };
@@ -188,6 +190,8 @@ fn every_para_prop_round_trips() {
         num_change: None,
         fmt_change: None,
         snap_to_grid: Some(false),
+        // WHIQ: unmodelled paragraph properties ride along as markup.
+        ext_xml: Some(r#"<w:divId w:val="7"/>"#.into()),
     };
     let variants = [
         ParaProps { line_spacing: Some(LineSpacing::AtLeast(14.0)), indent_first: Some(24.0), align: Some(Align::Center), ..Default::default() },
@@ -1721,12 +1725,16 @@ fn hostile_model_values_still_write() {
     p.props.line_spacing = Some(LineSpacing::Multiple(f32::NAN));
     p.insert_object(
         0,
-        InlineObject::Opaque { format: "docx".into(), xml: "<w:r><w:t>raw</w:t></w:r>".into(), text: "raw".into() },
+        InlineObject::Opaque { format: "docx".into(), xml: "<w:r><w:t>raw</w:t></w:r>".into(), text: "raw".into(), refs: Vec::new() },
         &CharProps::default(),
     )
     .unwrap();
-    p.insert_object(0, InlineObject::Opaque { format: "docx".into(), xml: "<broken".into(), text: "fallback".into() }, &CharProps::default())
-        .unwrap();
+    p.insert_object(
+        0,
+        InlineObject::Opaque { format: "docx".into(), xml: "<broken".into(), text: "fallback".into(), refs: Vec::new() },
+        &CharProps::default(),
+    )
+    .unwrap();
     p.insert_object(
         0,
         InlineObject::Image {

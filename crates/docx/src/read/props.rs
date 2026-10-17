@@ -238,6 +238,8 @@ impl PropCtx {
                 _ => {}
             }
         }
+        // WHIQ: what isn't modelled rides along as markup.
+        c.ext_xml = super::passthrough::rpr_ext(e);
         c
     }
 
@@ -348,6 +350,8 @@ impl PropCtx {
                 _ => {}
             }
         }
+        // WHIQ: what isn't modelled rides along as markup.
+        p.ext_xml = super::passthrough::ppr_ext(e);
         (p, mark)
     }
 }

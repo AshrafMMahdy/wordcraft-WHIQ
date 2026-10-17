@@ -52,6 +52,10 @@ USAGE:
                                               running): addEditCitation, addEditBibliography,
                                               addNote, refresh, removeCodes, setDocPrefs
                                               (--cmd runs first, e.g. --cmd caret.docEnd)
+  wordcraft-cli roundtrip-check <file.docx> [--save OUT]
+                                              open and save a Word file in memory and report (JSON)
+                                              whether anything was dropped: parts, relationships,
+                                              elements of its stories, paragraph text (exit 1 when so)
   wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
 
@@ -62,7 +66,7 @@ same output on every machine.
 ";
 
 /// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
-const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero"];
+const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero", "roundtrip-check"];
 
 fn wants_help(cmd: &str, rest: &[String]) -> bool {
     SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
@@ -80,7 +84,8 @@ fn open(path: &Path) -> Result<Session, String> {
 
 /// The commands that open a file, and which of their arguments not starting with `--` it is (as
 /// `pos` counts). `run` opens the value of `--file`.
-const OPENS_FILE: &[(&str, usize)] = &[("convert", 0), ("info", 0), ("text", 0), ("inspect", 0), ("render", 0), ("zotero", 1)];
+const OPENS_FILE: &[(&str, usize)] =
+    &[("convert", 0), ("info", 0), ("text", 0), ("inspect", 0), ("render", 0), ("zotero", 1), ("roundtrip-check", 0)];
 
 /// The arguments as text. Only the file the command opens may have a name that isn't valid Unicode,
 /// such as a Latin-1 one (#1440): it comes back as the path to open, and lossy among the arguments.
@@ -244,6 +249,7 @@ const RUN_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--author", takes_value: true },
 ];
 const COMMANDS_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--json", takes_value: false }];
+const ROUNDTRIP_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--save", takes_value: true }];
 const PARITY_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markdown", takes_value: false }];
 const MCP_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--connect", takes_value: true },
@@ -558,6 +564,19 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                 eprintln!("wrote {o}");
             }
             Ok(())
+        }
+        // WHIQ: the round-trip diff tool on any file.
+        "roundtrip-check" => {
+            validate_options("roundtrip-check", &rest, ROUNDTRIP_OPTIONS)?;
+            let input = pos(0)?;
+            let bytes = std::fs::read(file.as_deref().unwrap_or(Path::new(&input))).map_err(|e| format!("{input}: {e}"))?;
+            let (report, saved) = wordcraft_docx::roundtrip::check(&bytes, &input).map_err(|e| format!("{input}: {e}"))?;
+            if let Some(out) = arg_value(&rest, "--save") {
+                std::fs::write(&out, &saved).map_err(|e| format!("{out}: {e}"))?;
+            }
+            let json = report.to_json();
+            write_stdout(|o| writeln!(o, "{json}"))?;
+            if report.lossless() { Ok(()) } else { Err(Failure::Error(format!("{input}: the round trip dropped something (see \"problems\")"))) }
         }
         "--version" | "-V" => write_stdout(|o| writeln!(o, "wordcraft-cli {}", env!("CARGO_PKG_VERSION"))),
         "" | "help" | "--help" | "-h" => write_stdout(|o| write!(o, "{USAGE}")),

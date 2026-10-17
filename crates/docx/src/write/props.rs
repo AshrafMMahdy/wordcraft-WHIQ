@@ -114,7 +114,14 @@ pub fn rpr_inner(w: &mut W, c: &CharProps) {
     if let Some(fx) = &c.text_effects {
         super::wordart::rpr_effects(w, fx);
     }
+    // WHIQ: run properties kept from a file that WordCraft doesn't model.
+    if let Some(x) = c.ext_xml.as_deref().filter(|x| crate::xml::parse(format!("<w:rPr {}>{x}</w:rPr>", W_DECL).as_bytes()).is_ok()) {
+        w.raw(x);
+    }
 }
+
+/// WHIQ: the WordprocessingML namespace declaration, for checking kept property markup parses.
+const W_DECL: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
 
 /// Does `c` produce any `w:rPr` content (besides a tracked change)?
 pub fn has_rpr(c: &CharProps) -> bool {
@@ -363,6 +370,11 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&Cha
     }
     if let Some(l) = p.outline_level {
         w.val("w:outlineLvl", &n(l.min(9) as i64));
+    }
+    // WHIQ: paragraph properties kept from a file that WordCraft doesn't model (they come last
+    // in CT_PPrBase: `w:divId`, `w:cnfStyle`).
+    if let Some(x) = p.ext_xml.as_deref().filter(|x| crate::xml::parse(format!("<w:pPr {}>{x}</w:pPr>", W_DECL).as_bytes()).is_ok()) {
+        w.raw(x);
     }
 }
 

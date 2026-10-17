@@ -137,6 +137,13 @@ fn own_tools() -> Vec<Value> {
             &["path"],
         ),
         def(
+            "roundtrip_check",
+            "Round-trip check",
+            "Open and save a Word file in memory (without touching the open document or the file) and report whether anything would be dropped: parts, relationships, elements of the body, headers, footers, notes and comments, paragraph text. Use it on a customer's file before editing it.",
+            json!({"path": s("The .docx, .docm, .dotx or .dotm file")}),
+            &["path"],
+        ),
+        def(
             "close_document",
             "Close document",
             "Close the open document and start a blank one. Unsaved changes are never discarded: they are auto-saved to a recovered file first (named in the response) unless discard: true.",
@@ -397,6 +404,24 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                 p["pages"] = json!(spec);
             }
             exec(b, "file.printPdf", p).map(Out::Json).map_err(|e| contract::classify(&e, "export_pdf", a, &[]))
+        }
+        "roundtrip_check" => {
+            let path = st("path").unwrap_or("");
+            let bytes = wordcraft_engine::io::read_file(path).map_err(|e| contract::classify(&e, "roundtrip_check", a, &[]))?;
+            let (report, _) = wordcraft_docx::roundtrip::check(&bytes, path).map_err(|e| {
+                ToolError::new(
+                    "failed",
+                    format!("{path}: {e}"),
+                    "roundtrip_check reads Word packages (.docx, .docm, .dotx, .dotm); convert other files with open_document and save_document",
+                )
+            })?;
+            let mut v: Value = serde_json::from_str(&report.to_json()).unwrap_or(json!({}));
+            v["renamed_parts"] = json!(report.renamed_parts);
+            if !report.lossless() {
+                v["next_step"] =
+                    json!("the parts listed under problems would change on save: tell the owner before editing, or keep the original file");
+            }
+            Ok(Out::Json(v))
         }
         "close_document" => {
             let mut out = json!({"closed": true});

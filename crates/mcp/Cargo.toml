@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
+wordcraft-docx = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-control-key = { workspace = true }
 serde_json = { workspace = true }

@@ -4,6 +4,7 @@ mod embed;
 mod settings_merge;
 pub(crate) use settings_merge::has_unowned as settings_has_unowned;
 mod math;
+pub(crate) mod passthrough;
 mod props;
 mod sdt;
 mod story;
@@ -118,6 +119,15 @@ pub(crate) struct Writer<'d> {
     /// Linked text boxes: part id → (`wps:txbx`/`wps:linkedTxbx` id, seq; 0 for the box holding
     /// the text).
     txbx_links: HashMap<u32, (u32, u32)>,
+    /// WHIQ: end tags of the wrappers kept from a file that are open around paragraphs, and how
+    /// many belong to enclosing stories (see `passthrough`).
+    block_wraps: Vec<String>,
+    block_wrap_base: usize,
+    /// WHIQ: end tags of the inline wrappers open in the paragraph being written.
+    inline_wraps: Vec<String>,
+    inline_wrap_base: usize,
+    /// WHIQ: the document keeps original `mc:AlternateContent` markup for some objects.
+    has_kept_alternates: bool,
 }
 
 const CT_WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
@@ -179,6 +189,11 @@ pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String,
             .enumerate()
             .flat_map(|(n, c)| c.iter().enumerate().map(move |(seq, id)| (*id, (n as u32 + 1, seq as u32))))
             .collect(),
+        block_wraps: Vec::new(),
+        block_wrap_base: 0,
+        inline_wraps: Vec::new(),
+        inline_wrap_base: 0,
+        has_kept_alternates: doc.passthrough.keys().any(|k| k.starts_with(passthrough::ALT_PREFIX)),
     };
     wr.assign_media();
     wr.embeds.reserve_media(wr.media_files.values());
@@ -519,6 +534,12 @@ pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String,
         );
     }
     entries.insert(0, ("_rels/.rels".into(), root.xml()));
+    // WHIQ: namespaces of kept markup no reader here knows go on each part's root, ignorable.
+    for (name, bytes) in entries.iter_mut() {
+        if name.ends_with(".xml") {
+            passthrough::hoist_namespaces(bytes);
+        }
+    }
 
     // Content types.
     let mut w = W::new();
@@ -613,7 +634,7 @@ impl Writer<'_> {
         }
     }
 
-    fn next_docpr(&mut self) -> String {
+    pub(super) fn next_docpr(&mut self) -> String {
         self.docpr = self.docpr.saturating_add(1);
         self.docpr.to_string()
     }

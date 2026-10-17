@@ -14,6 +14,7 @@ mod flat;
 mod fonts;
 mod package;
 mod read;
+pub mod roundtrip;
 mod smart_art;
 mod units;
 mod wordml2003;

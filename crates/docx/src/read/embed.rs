@@ -207,7 +207,7 @@ impl Reader<'_> {
 
 /// The relationship ids `e` uses (attributes in the relationships namespace, and VML's
 /// `o:relid`), in document order. `None` past [`MAX_IDS`].
-fn rel_ids(e: &El, out: &mut Vec<String>, depth: usize) -> Option<()> {
+pub(super) fn rel_ids(e: &El, out: &mut Vec<String>, depth: usize) -> Option<()> {
     if depth > MAX_DEPTH {
         return Some(());
     }

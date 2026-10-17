@@ -10,6 +10,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod client;
+#[path = "../../crates/docx/tests/corpus/mod.rs"]
+mod corpus;
 
 use std::time::{Duration, Instant};
 
@@ -358,16 +360,36 @@ fn arabic_paragraphs_are_right_to_left_and_exported_with_embedded_fonts() {
     assert!(subset, "fonts are embedded as subsets");
 }
 
-/// The round trip through MCP: a corpus document opened and saved keeps every part.
+/// The round trip through MCP: every corpus document (hand-written packages with tracked changes,
+/// moves, SmartArt, a chart, custom XML, `w14` and future markup, OLE, a 3-D model, headers,
+/// footers, notes, macros…) passes `roundtrip_check`, and opened and saved through the server
+/// keeps every part, relationship and story element.
 #[test]
-fn open_and_save_keeps_unknown_parts() {
-    let d = Dir::new("roundtrip");
+fn every_corpus_document_survives_open_and_save_through_mcp() {
+    let d = Dir::new("corpus");
     let mut m = Mcp::start(&d.0, &[]);
-    m.ok("type_text", json!({"text": "Plain"}));
-    m.ok("save_document", json!({"path": "plain.docx"}));
-    m.ok("open_document", json!({"path": "plain.docx"}));
-    m.ok("save_document", json!({"path": "plain2.docx"}));
-    assert!(d.path("plain2.docx").is_file());
+    for (name, bytes) in corpus::corpus() {
+        std::fs::write(d.path(name), &bytes).unwrap();
+        let rc = m.ok("roundtrip_check", json!({"path": name}));
+        assert_eq!(rc["lossless"], true, "{name}: {rc}");
+        m.ok("open_document", json!({"path": name}));
+        let saved = format!("saved-{name}");
+        m.ok("save_document", json!({"path": saved}));
+        let after = std::fs::read(d.path(&saved)).unwrap();
+        let report = wordcraft_docx::roundtrip::compare(&bytes, &after).unwrap();
+        assert!(report.lossless(), "{name}: {:?}", report.summary());
+        // An edit elsewhere in the document keeps the unknown markup too.
+        m.ok("execute", json!({"command": "caret.docEnd"}));
+        m.ok("type_text", json!({"text": " (edited)"}));
+        let edited = format!("edited-{name}");
+        m.ok("save_document", json!({"path": edited}));
+        let after = std::fs::read(d.path(&edited)).unwrap();
+        let report = wordcraft_docx::roundtrip::compare(&bytes, &after).unwrap();
+        let losses: Vec<String> = report.summary().into_iter().filter(|l| !l.contains("paragraph") || !l.contains("(edited)")).collect();
+        assert!(losses.is_empty(), "{name} after an edit: {losses:?}");
+    }
+    let e = m.err("roundtrip_check", json!({"path": "missing.docx"}), "not_found");
+    assert!(!e["next_step"].as_str().unwrap().is_empty());
 }
 
 /// Hostile input never takes the server down.
