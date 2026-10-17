@@ -2628,3 +2628,10 @@
 # Reading Mode column widths (#1040)
 	Narrow	Keskeny
 	Medium	Közepes
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Szerkesztés horgony szerint
+	Change Report	Változások jelentése
+	Accept or Reject Changes	Változások elfogadása vagy elvetése
+	Find Anchor	Horgony keresése
+	Import Markdown	Markdown importálása
+	Apply Theme	Téma alkalmazása

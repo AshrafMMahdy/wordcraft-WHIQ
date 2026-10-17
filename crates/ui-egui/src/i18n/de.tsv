@@ -2232,3 +2232,10 @@
 # Reading Mode column widths (#1040)
 	Narrow	Schmal
 	Medium	Mittel
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Bearbeiten nach Anker
+	Change Report	Änderungsbericht
+	Accept or Reject Changes	Änderungen annehmen oder ablehnen
+	Find Anchor	Anker suchen
+	Import Markdown	Markdown importieren
+	Apply Theme	Design anwenden

@@ -2624,3 +2624,10 @@ preview	Title	Ukázka
 # Reading Mode column widths (#1040)
 	Narrow	Úzká
 	Medium	Střední
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Úpravy podle ukotvení
+	Change Report	Přehled změn
+	Accept or Reject Changes	Přijmout nebo odmítnout změny
+	Find Anchor	Najít ukotvení
+	Import Markdown	Importovat Markdown
+	Apply Theme	Použít motiv

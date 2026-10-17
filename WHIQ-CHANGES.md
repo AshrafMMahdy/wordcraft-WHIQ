@@ -90,3 +90,20 @@ markup).
 | MCP `render_page`: `page` or a range (`pages: "1-3,5"`, `"4-"`), `dpi` (7–576, default 96; or `scale` px/pt), `markup` (true: Print Markup with tracked changes marked up and comment balloons; false, the default: the printed page). One image per page plus a summary (`pages`, sizes, `total_pages`); a range over 16 MB of PNG continues with `continue_from`; a single page too big answers `too_large` with the largest DPI that fits; pages outside the document answer `out_of_range`. MCP `export_pdf`: `pages` range and `markup` (the engine's print-to-PDF), fonts embedded as subsets. Headless rendering takes `markup` (printed layout) or, without it, the editing layout as before. | `crates/mcp/src/whiq.rs`, `crates/mcp/src/lib.rs` | `pages_render_to_png_and_pdf_by_range_with_and_without_markup` (contract suite: PNG sizes by DPI, ranges, markup changes the image and the PDF, PDF page counts, errors) |
 | Command line: `wordcraft-cli render FILE OUT.png --pages 2-4 [--dpi D] [--markup]` writes `OUT-2.png`…; `wordcraft-cli convert IN OUT.pdf --pages 2-4 [--markup]`. | `apps/wordcraft-cli/src/main.rs` | same test |
 | Comparing two documents over MCP: `compare_documents` (part 3). | | |
+
+## Interface labels
+
+The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
+Changes, Find Anchor, Import Markdown, Apply Theme) are translated in every catalog in
+`crates/ui-egui/src/i18n/*.tsv` (machine-quality; native review welcome).
+
+## Test status (Linux sandbox, no GPU)
+
+`cargo test --no-fail-fast` on the whiq branch: every test passes except three that depend on the
+machine, not on this fork:
+
+- `wordcraft-layout tests_complex::myanmar_prevowel_is_drawn_before_its_consonant` and
+  `wordcraft-pdf tests::right_to_left_text_extracts_in_logical_order` fail the same way on upstream
+  `eae2421` here (the system's fallback font is GNU Unifont);
+- `wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it` needs a wgpu
+  adapter ("No adapter found").

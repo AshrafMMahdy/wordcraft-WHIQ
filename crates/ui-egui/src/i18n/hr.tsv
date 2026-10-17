@@ -2632,3 +2632,10 @@ preview	Title	Naslov
 	Bottom Right Cell	Donja desna ćelija
 	Inside Horizontal Border	Unutarnji vodoravni obrub
 	Inside Vertical Border	Unutarnji okomiti obrub
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Uređivanje prema sidru
+	Change Report	Izvješće o promjenama
+	Accept or Reject Changes	Prihvaćanje ili odbijanje promjena
+	Find Anchor	Pronađi sidro
+	Import Markdown	Uvoz Markdowna
+	Apply Theme	Primijeni temu

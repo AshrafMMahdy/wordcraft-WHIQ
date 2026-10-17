@@ -2672,3 +2672,10 @@ template	Letter	Thư
 # Reading Mode column widths (#1040)
 	Narrow	Hẹp
 	Medium	Trung bình
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Chỉnh sửa theo neo
+	Change Report	Báo cáo thay đổi
+	Accept or Reject Changes	Chấp nhận hoặc từ chối thay đổi
+	Find Anchor	Tìm neo
+	Import Markdown	Nhập Markdown
+	Apply Theme	Áp dụng chủ đề

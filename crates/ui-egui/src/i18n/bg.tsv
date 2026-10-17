@@ -2621,3 +2621,10 @@
 # Reading Mode column widths (#1040)
 	Narrow	Тясна
 	Medium	Средна
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Редактиране по опорен текст
+	Change Report	Отчет за промените
+	Accept or Reject Changes	Приемане или отхвърляне на промени
+	Find Anchor	Търсене на опорен текст
+	Import Markdown	Импортиране на Markdown
+	Apply Theme	Прилагане на тема

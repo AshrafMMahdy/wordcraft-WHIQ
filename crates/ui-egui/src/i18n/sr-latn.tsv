@@ -2243,3 +2243,10 @@
 # Reading Mode column widths (#1040)
 	Narrow	Uska
 	Medium	Srednja
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Uređivanje prema sidru
+	Change Report	Izveštaj o promenama
+	Accept or Reject Changes	Prihvatanje ili odbacivanje promena
+	Find Anchor	Pronađi sidro
+	Import Markdown	Uvoz Markdown-a
+	Apply Theme	Primeni temu

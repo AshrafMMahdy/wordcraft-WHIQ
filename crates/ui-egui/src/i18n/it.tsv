@@ -2641,3 +2641,10 @@ preview	Title	Esempio
 # Reading Mode column widths (#1040)
 	Narrow	Stretta
 	Medium	Media
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Modifica per ancoraggio
+	Change Report	Rapporto modifiche
+	Accept or Reject Changes	Accetta o rifiuta modifiche
+	Find Anchor	Trova ancoraggio
+	Import Markdown	Importa Markdown
+	Apply Theme	Applica tema

@@ -2647,3 +2647,10 @@ preview	Title	Titel
 	Bottom Right Cell	Nedre högra cellen
 	Inside Horizontal Border	Inre vågrät kantlinje
 	Inside Vertical Border	Inre lodrät kantlinje
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	Redigera efter ankare
+	Change Report	Ändringsrapport
+	Accept or Reject Changes	Godkänn eller avvisa ändringar
+	Find Anchor	Sök ankare
+	Import Markdown	Importera Markdown
+	Apply Theme	Använd tema

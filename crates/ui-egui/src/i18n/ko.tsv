@@ -2488,3 +2488,10 @@ preview	Title	제목
 	Bottom Right Cell	오른쪽 아래 셀
 	Inside Horizontal Border	안쪽 가로 테두리
 	Inside Vertical Border	안쪽 세로 테두리
+# WHIQ: agent commands (review by anchor, change report, Markdown import, themes)
+	Edit by Anchor	앵커로 편집
+	Change Report	변경 내용 보고서
+	Accept or Reject Changes	변경 내용 적용 또는 거부
+	Find Anchor	앵커 찾기
+	Import Markdown	Markdown 가져오기
+	Apply Theme	테마 적용
