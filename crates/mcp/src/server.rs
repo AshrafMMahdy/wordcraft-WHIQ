@@ -249,6 +249,13 @@ impl Server {
                 );
                 return crate::whiq::error_result(&e, &[]);
             }
+            // Calls run one at a time here: when this one is read, nothing else runs.
+            "cancel" => {
+                return crate::whiq::json_result(
+                    json!({"cancelled": false, "reason": "no call is running", "next_step": "nothing to stop: carry on"}),
+                    &[],
+                );
+            }
             _ => {}
         }
         let mut notice_warning = None;

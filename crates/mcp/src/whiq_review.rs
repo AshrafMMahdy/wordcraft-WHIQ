@@ -110,7 +110,9 @@ pub fn run(b: &mut dyn Backend, name: &str, a: &Value, _limits: &Limits, _warnin
                     p[to] = v.clone();
                 }
             }
-            exec(b, "review.edit", p).map(Out::Json).map_err(|e| edit_error(&e))
+            exec(b, "review.edit", p)
+                .map(Out::Json)
+                .map_err(|e| if e.starts_with("cancelled: ") { contract::classify(&e, name, a, &[]) } else { edit_error(&e) })
         }
         "list_changes" => {
             let mut p = json!({});

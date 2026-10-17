@@ -54,7 +54,8 @@ fn ann(name: &str) -> Ann {
     match name {
         "list_commands" | "get_text" | "inspect_document" | "render_page" | "parity" | "screenshot" | "ui_inspect" | "server_status"
         | "job_status" | "list_changes" | "find_anchor" | "roundtrip_check" => READ,
-        "select_text" => STATE,
+        // Stopping a call leaves the document as it was before it: asking twice is asking once.
+        "select_text" | "cancel" => STATE,
         // Opening or starting a document replaces the open one (auto-saved first when it has
         // unsaved changes): the same arguments give the same result.
         "new_document" | "open_document" | "import_markdown" | "close_document" => REPLACES,
@@ -114,6 +115,13 @@ fn own_tools() -> Vec<Value> {
             "Progress of a job (a call that took long or ran with background: true) and, once done, its result. Results stay available after the client times out.",
             json!({"job_id": s("The job_id a call returned")}),
             &["job_id"],
+        ),
+        def(
+            "cancel",
+            "Cancel",
+            "Stop the running call (or job `job_id`) at its next safe point. A stopped command leaves the document as it was before it (a review edit batch, a Markdown import, a PDF export: nothing changed, no file written); a stopped batch, page range or multi-paragraph type_text keeps the steps done before (each one whole) and says how far it got. The stopped call answers with code `cancelled` (the job's result, for a job). Answered even while the call runs.",
+            json!({"job_id": s("The job to stop (default: the running call)")}),
+            &[],
         ),
         def(
             "render_page",
@@ -373,7 +381,18 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let mut info = Vec::new();
             let mut used = 0usize;
             let mut next = None;
-            for &p in pages.iter().filter(|p| from.is_none_or(|f| **p >= f)) {
+            let todo: Vec<usize> = pages.iter().copied().filter(|p| from.is_none_or(|f| *p >= f)).collect();
+            for (k, &p) in todo.iter().enumerate() {
+                // A safe point between pages: what is rendered so far stays out of the answer.
+                progress(k as u64, todo.len() as u64, "rendering pages");
+                if wordcraft_engine::whiq_progress::cancel_requested() {
+                    return Err(ToolError::new(
+                        "cancelled",
+                        format!("cancelled before page {p} ({k} of {} rendered)", todo.len()),
+                        format!("call render_page again with continue_from: {p} to go on"),
+                    )
+                    .with("continue_from", json!(p)));
+                }
                 if p > total {
                     return Err(ToolError::new(
                         "out_of_range",
@@ -454,7 +473,9 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             .map_err(|e| contract::classify(&e, "apply_theme", a, &[])),
         "roundtrip_check" => {
             let path = st("path").unwrap_or("");
+            progress(0, 2, "round trip: reading");
             let bytes = wordcraft_engine::io::read_file(path).map_err(|e| contract::classify(&e, "roundtrip_check", a, &[]))?;
+            progress(1, 2, "round trip: saving and comparing");
             let (report, _) = wordcraft_docx::roundtrip::check(&bytes, path).map_err(|e| {
                 ToolError::new(
                     "failed",
@@ -498,8 +519,18 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let total = list.len();
             let mut out = Vec::new();
             for (i, c) in list.into_iter().enumerate() {
-                crate::runtime::progress(i as u64, total as u64, "batch");
+                progress(i as u64, total as u64, "batch commands");
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                // A safe point between commands: those before it ran, each whole.
+                if wordcraft_engine::whiq_progress::cancel_requested() {
+                    return Err(ToolError::new(
+                        "cancelled",
+                        format!("cancelled before command {} of {total} (`{id}`)", i + 1),
+                        "the commands before it ran (see results); send the rest as a new batch to go on, or undo them with execute edit.undo",
+                    )
+                    .with("results", json!(out))
+                    .with("stopped_at", json!(i)));
+                }
                 match exec_forgiving(b, &id, c.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})), warnings) {
                     Ok(v) => out.push(json!({"command": id, "ok": true, "result": v})),
                     Err(e) => {
@@ -524,7 +555,18 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             // before it.
             let t = st("text").unwrap_or("");
             let mut last = Value::Null;
+            let lines = t.split('\n').count();
             for (i, line) in t.split('\n').enumerate() {
+                progress(i as u64, lines as u64, "typing paragraphs");
+                // A safe point between paragraphs: those before it are typed, each whole.
+                if wordcraft_engine::whiq_progress::cancel_requested() {
+                    return Err(ToolError::new(
+                        "cancelled",
+                        format!("cancelled before paragraph {} of {lines}", i + 1),
+                        "the paragraphs before it are typed; send the rest of the text to go on",
+                    )
+                    .with("typed_paragraphs", json!(i)));
+                }
                 if i > 0 {
                     last = exec(b, "text.newParagraph", json!({})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
                     if let Some(rtl) = first_strong(line) {
@@ -603,6 +645,12 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
     }
 }
 
+/// The running call is at step `done` of `total` of `phase` (for `job_status`, `server_status`
+/// and progress notifications).
+fn progress(done: u64, total: u64, phase: &str) {
+    wordcraft_engine::whiq_progress::report(done, total, phase);
+}
+
 /// Call tool `name` with arguments `a` on `b`: the full contract pipeline. Returns the MCP
 /// `tools/call` result.
 pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) -> Value {
@@ -635,6 +683,10 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
         warnings.push(format!("caller `{c}` not used: {e}"));
     }
     let policy = if args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
+    // Every call reports at least what it is doing (tools with steps count them).
+    if wordcraft_engine::whiq_progress::current().is_none() {
+        wordcraft_engine::whiq_progress::phase(&name);
+    }
     let (out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
     if let (Some(_), Some(prev)) = (&caller, before) {
         let _ = exec(b, "file.setAuthor", json!({"name": prev}));

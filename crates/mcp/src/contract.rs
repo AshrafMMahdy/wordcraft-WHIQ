@@ -253,6 +253,14 @@ fn coerce(v: &Value, ty: &str) -> Value {
 /// next step); `commands` lists command ids, for an unknown one.
 pub fn classify(msg: &str, tool: &str, args: &Value, commands: &[String]) -> ToolError {
     let lower = msg.to_ascii_lowercase();
+    // Stopped by `cancel` at a safe point (the command was undone).
+    if let Some(what) = msg.strip_prefix("cancelled: ") {
+        return ToolError::new(
+            "cancelled",
+            format!("cancelled: {what}"),
+            format!("the document is as it was before `{tool}`: call it again to do it"),
+        );
+    }
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     if let Some(id) = msg.strip_prefix("unknown command `").and_then(|r| r.split('`').next()) {
         let near = closest(id, commands.iter().map(String::as_str), 5);

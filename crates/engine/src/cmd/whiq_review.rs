@@ -338,6 +338,12 @@ fn edit(s: &mut Session, v: &Value) -> CmdResult {
     let mut owned: Vec<(usize, [u32; 2], Option<u32>)> = Vec::new();
     let mut failed = 0usize;
     for (i, op) in ops.iter().enumerate() {
+        // A safe point: a cancel stops here, and the session puts the document back.
+        crate::whiq_progress::report(i as u64, ops.len() as u64, "review edit operations");
+        if let Err(e) = crate::whiq_progress::check(&format!("stopped before operation {} of {}; nothing was changed", i + 1, ops.len())) {
+            s.doc.settings.track_changes = was_tracking;
+            return Err(e);
+        }
         match apply(s, op, i, fuzzy, min_score) {
             Ok((mut r, revs, comment)) => {
                 if let Some(o) = r.as_object_mut() {

@@ -623,9 +623,13 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
         code.chr.font = code.chr.font.clone().or(Some("Consolas".into()));
     }
     let rtl = auto_direction(&mut doc);
+    // A safe point before the open document is replaced.
+    crate::whiq_progress::report(1, 3, "markdown: document built");
+    crate::whiq_progress::check("stopped before the Markdown document replaced the open one; nothing was changed")?;
     s.set_document(doc);
     s.path = None;
     s.dirty = true;
+    crate::whiq_progress::report(2, 3, "markdown: headers, footers and contents");
     // Header and footer.
     let footer = get("footer").unwrap_or_else(|| "Page {page} of {pages}".into());
     let header = get("header").unwrap_or_default();

@@ -19,6 +19,8 @@ pub mod ribbon;
 pub mod sample;
 mod session;
 pub mod speech;
+/// WHIQ: progress and cancellation of the running command (for the MCP runtime).
+pub mod whiq_progress;
 
 use std::collections::HashMap;
 

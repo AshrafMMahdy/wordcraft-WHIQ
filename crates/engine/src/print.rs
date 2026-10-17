@@ -142,6 +142,9 @@ impl Session {
         // Print Markup (File › Print) decides whether tracked changes and comments print.
         let markup = crate::cmd::file::export_options(self, v);
         let lay = self.export_layout_with(markup.markup);
+        // WHIQ: the next phase, and a safe point.
+        crate::whiq_progress::report(1, 3, "pdf: drawing the pages");
+        crate::whiq_progress::check("stopped before the PDF was made; no file was written")?;
         let plan = plan(v, lay.pages.len(), self.current_pages(&lay))?;
         let opts = wordcraft_pdf::PdfOptions {
             pages: Some(plan.pages.clone()),
@@ -160,7 +163,12 @@ impl Session {
 pub(crate) fn print_pdf_to_file(s: &mut Session, v: &Value) -> Result<Value, CmdError> {
     let path = p::req_str(v, "path")?;
     let path = if path.to_ascii_lowercase().ends_with(".pdf") { path.to_string() } else { format!("{path}.pdf") };
+    // WHIQ: progress by phase, and safe points before each (no file is written once cancelled).
+    crate::whiq_progress::report(0, 3, "pdf: laying out pages");
+    crate::whiq_progress::check("stopped before the PDF was made; no file was written")?;
     let (bytes, plan) = s.print_pdf(v)?;
+    crate::whiq_progress::report(2, 3, "pdf: writing the file");
+    crate::whiq_progress::check("stopped before the PDF was written; no file was written")?;
     // Through `io`, so an agent confined to an automation write root (#769) can't print elsewhere.
     #[cfg(not(target_arch = "wasm32"))]
     crate::io::write_file(&path, &bytes).map_err(CmdError::Failed)?;

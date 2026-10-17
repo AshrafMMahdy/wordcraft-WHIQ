@@ -130,6 +130,72 @@ fn sigterm_auto_saves_and_the_next_call_names_the_file() {
     assert!(!d.path(".wordcraft-recovered.json").exists());
 }
 
+/// Wait (bounded) for job `jid` to finish: its result.
+fn job_result(m: &mut Mcp, jid: &str) -> Value {
+    wait_for(&format!("job {jid}"), || {
+        let r = m.call("job_status", json!({"job_id": jid}));
+        let sc = &r["structuredContent"];
+        (sc["status"] != "running").then(|| r.clone())
+    })
+}
+
+// §5 Every long call reports progress (job_status, server_status, notifications/progress when
+// asked for), and `cancel` stops it at its next safe point with the document consistent.
+#[test]
+fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
+    let d = Dir::new("cancel");
+    let mut m = Mcp::start(&d.0, &[]);
+    // Nothing running: nothing to stop.
+    assert_eq!(m.ok("cancel", json!({}))["cancelled"], false);
+    // Progress notifications for a call that asks for them, as it runs.
+    let id = m.send("tools/call", json!({"name": "__sleep", "arguments": {"ms": 2500}, "_meta": {"progressToken": "tok-1"}}));
+    let r = m.reply(id);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let notes: Vec<&Value> = m.notifications.iter().filter(|n| n["params"]["progressToken"] == "tok-1").collect();
+    assert!(notes.len() >= 2, "{:?}", m.notifications);
+    let values: Vec<f64> = notes.iter().map(|n| n["params"]["progress"].as_f64().unwrap()).collect();
+    assert!(values.windows(2).all(|w| w[1] > w[0]), "progress only grows: {values:?}");
+    assert!(notes[0]["params"]["message"].as_str().unwrap().contains("__sleep"), "{:?}", notes[0]);
+
+    // A long multi-paragraph type_text as a job: progress counts paragraphs; cancel stops it
+    // between paragraphs, those typed stay whole.
+    let lines: Vec<String> = (0..40_000).map(|i| format!("Line {i}")).collect();
+    let id = m.send(
+        "tools/call",
+        json!({"name": "type_text", "arguments": {"text": lines.join("\n"), "paragraphs": true, "background": true}, "_meta": {"progressToken": 7}}),
+    );
+    let started = m.reply(id);
+    let jid = started["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    let c = m.ok("cancel", json!({"job_id": jid}));
+    assert_eq!(c["cancelling"], true, "{c}");
+    let done = job_result(&mut m, &jid);
+    let e = &done["structuredContent"]["error"];
+    assert_eq!(e["code"], "cancelled", "{done}");
+    let typed = e["typed_paragraphs"].as_u64().unwrap() as usize;
+    assert!(typed < 40_000, "{e}");
+    let text = text_of(&mut m);
+    let expected: Vec<&str> = lines.iter().take(typed).map(String::as_str).collect();
+    assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), typed, "{e}");
+    assert!(text.starts_with(&expected.join("\n").chars().take(200).collect::<String>()), "the paragraphs before it are whole");
+    // A finished job can't be cancelled.
+    let again = m.ok("cancel", json!({"job_id": jid}));
+    assert_eq!(again["status"], "done", "{again}");
+
+    // A review edit batch stopped part way changes nothing (all or nothing).
+    m.ok("new_document", json!({}));
+    m.ok("type_text", json!({"text": "alpha beta gamma delta"}));
+    let ops: Vec<Value> = (0..4000).map(|i| json!({"op": "comment", "anchor": "gamma", "text": format!("note {i}")})).collect();
+    let id = m.send("tools/call", json!({"name": "review_edit", "arguments": {"ops": ops, "background": true}}));
+    let jid = m.reply(id)["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    m.ok("cancel", json!({}));
+    let done = job_result(&mut m, &jid);
+    assert_eq!(done["structuredContent"]["error"]["code"], "cancelled", "{done}");
+    assert_eq!(text_of(&mut m), "alpha beta gamma delta");
+    assert_eq!(m.ok("list_changes", json!({}))["comments"].as_array().map_or(0, Vec::len), 0, "nothing of the batch stayed");
+    // An unknown job.
+    m.err("cancel", json!({"job_id": "job-99"}), "job_not_found");
+}
+
 /// Wait (bounded) until `f` finds something.
 fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     let until = Instant::now() + Duration::from_secs(30);

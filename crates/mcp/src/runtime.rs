@@ -6,7 +6,10 @@
 //! - a call still running after `job_after_ms` (or sent with `background: true`) becomes a job:
 //!   its answer is a `job_id` at once, `job_status` reports progress and keeps the result (it
 //!   survives the client timing out);
-//! - `server_status` and `job_status` are answered by the main thread at any time;
+//! - `server_status`, `job_status` and `cancel` are answered by the main thread at any time;
+//! - every running call reports progress (its phase, steps when it counts them, elapsed time) in
+//!   `job_status` and `server_status`, and as `notifications/progress` when the request carries a
+//!   `progressToken`; `cancel` stops it at its next safe point (`wordcraft_engine::whiq_progress`);
 //! - on SIGTERM / SIGINT / SIGHUP (or Ctrl+C, closing the console on Windows), on the client
 //!   going away with unsaved changes, and on a panic, the open document is auto-saved to a
 //!   recovered file ([`crate::recover`]);
@@ -46,17 +49,44 @@ pub struct Shared {
 
 pub type SharedState = Arc<Mutex<Shared>>;
 
-static PROGRESS: Mutex<Option<(u64, u64, &'static str)>> = Mutex::new(None);
-
-/// Report progress of the running call (`done` of `total` steps of `phase`), for `job_status`.
-pub fn progress(done: u64, total: u64, phase: &'static str) {
-    if let Ok(mut p) = PROGRESS.lock() {
-        *p = Some((done, total, phase));
+/// The running call's progress: its phase, the steps done of how many (when it counts them), and
+/// how long it has run.
+fn progress_json(f: &Inflight) -> Value {
+    let p = wordcraft_engine::whiq_progress::current().unwrap_or_default();
+    let phase = if p.phase.is_empty() { f.tool.clone() } else { p.phase };
+    let mut v = json!({"phase": phase, "elapsed_ms": f.started.elapsed().as_millis() as u64});
+    if p.total > 0 {
+        v["done"] = json!(p.done);
+        v["total"] = json!(p.total);
     }
+    v
 }
 
-fn current_progress() -> Option<Value> {
-    PROGRESS.lock().ok().and_then(|p| p.map(|(d, t, ph)| json!({"done": d, "total": t, "phase": ph})))
+/// A `notifications/progress` for the running call when it carries a progress token and there is
+/// news (a step done, or a second gone by): its progress only ever grows.
+fn progress_notification(f: &mut Inflight) -> Option<Value> {
+    let token = f.token.clone()?;
+    let p = wordcraft_engine::whiq_progress::current().unwrap_or_default();
+    let now = Instant::now();
+    let counted = p.total > 0 && (p.done as f64) > f.sent;
+    let beat = f.sent_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
+    if !counted && !beat {
+        return None;
+    }
+    let value = if counted { p.done as f64 } else { f.sent + 0.001 };
+    f.sent = value;
+    f.sent_at = Some(now);
+    let phase = if p.phase.is_empty() { f.tool.clone() } else { p.phase };
+    let elapsed = f.started.elapsed().as_secs();
+    let mut params = json!({"progressToken": token, "progress": value, "message": if p.total > 0 {
+        format!("{phase}: {} of {} ({elapsed} s)", p.done, p.total)
+    } else {
+        format!("{phase} ({elapsed} s)")
+    }});
+    if p.total > 0 {
+        params["total"] = json!(p.total);
+    }
+    Some(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}))
 }
 
 /// Runtime settings (`wordcraft-cli mcp` flags).
@@ -190,6 +220,18 @@ struct Inflight {
     started: Instant,
     deadline: Option<Instant>,
     job: Option<String>,
+    /// The request's `progressToken`, and the progress last notified (and when).
+    token: Option<Value>,
+    sent: f64,
+    sent_at: Option<Instant>,
+    /// A cancel was asked for.
+    cancelling: bool,
+}
+
+impl Inflight {
+    fn new(id: Value, tool: String, deadline: Option<Instant>, token: Option<Value>) -> Inflight {
+        Inflight { id, tool, started: Instant::now(), deadline, job: None, token, sent: 0.0, sent_at: None, cancelling: false }
+    }
 }
 
 struct Job {
@@ -288,6 +330,7 @@ fn main_tool(name: &str) -> Option<&'static str> {
     match crate::contract::norm(name).as_str() {
         "status" => Some("server_status"),
         "job" => Some("job_status"),
+        "cancel" | "stop" | "abort" | "canceljob" | "cancelcall" => Some("cancel"),
         _ => unique_match(name, ["server_status", "job_status"]),
     }
 }
@@ -327,6 +370,8 @@ pub fn serve(
         let tx = tx.clone();
         let shared = shared.clone();
         std::thread::Builder::new().name("mcp-worker".into()).spawn(move || {
+            // `cancel` stops what this thread runs.
+            wordcraft_engine::whiq_progress::watch_this_thread();
             let mut server = make();
             for msg in work_rx {
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(msg.clone())));
@@ -380,7 +425,8 @@ pub fn serve(
     let mut eof_at = None;
     let busy_json = |inflight: &Option<Inflight>| -> Value {
         match inflight {
-            Some(f) => json!({"tool": f.tool, "elapsed_ms": f.started.elapsed().as_millis() as u64, "job_id": f.job}),
+            Some(f) => json!({"tool": f.tool, "elapsed_ms": f.started.elapsed().as_millis() as u64, "job_id": f.job,
+                "progress": progress_json(f), "cancelling": f.cancelling}),
             None => Value::Null,
         }
     };
@@ -395,7 +441,8 @@ pub fn serve(
     loop {
         let wait =
             inflight.as_ref().and_then(|f| f.deadline).map(|d| d.saturating_duration_since(Instant::now())).unwrap_or(Duration::from_millis(500));
-        let ev = match rx.recv_timeout(wait.max(Duration::from_millis(5))) {
+        // At least twice a second: progress notifications and checkpoints are due on the clock.
+        let ev = match rx.recv_timeout(wait.clamp(Duration::from_millis(5), Duration::from_millis(500))) {
             Ok(ev) => Some(ev),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -403,6 +450,10 @@ pub fn serve(
         // Unsaved work is checkpointed every few edits or seconds (in the background).
         if !matches!(ev, Some(Event::Signal | Event::Eof)) {
             checkpoints.tick(&shared, &options);
+        }
+        // The running call's progress, to a client that asked for it.
+        if let Some(n) = inflight.as_mut().and_then(progress_notification) {
+            write_line(&mut output, &n)?;
         }
         match ev {
             Some(Event::Line(line)) => {
@@ -458,6 +509,7 @@ pub fn serve(
                     let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
                     if let Some(t) = main_tool(&name) {
                         let result = match t {
+                            "cancel" => cancel(&args, &mut inflight, &jobs),
                             "server_status" => {
                                 let g = shared.lock().map_err(|_| std::io::Error::other("state poisoned"))?;
                                 crate::whiq::json_result(
@@ -482,10 +534,9 @@ pub fn serve(
                     }
                     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
                     let now = Instant::now();
-                    let mut f = Inflight { id: id.clone(), tool: name.clone(), started: now, deadline: Some(now + options.job_after), job: None };
-                    if let Ok(mut p) = PROGRESS.lock() {
-                        *p = None;
-                    }
+                    let token = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| t.is_string() || t.is_number());
+                    let mut f = Inflight::new(id.clone(), name.clone(), Some(now + options.job_after), token);
+                    wordcraft_engine::whiq_progress::reset();
                     if background {
                         let jid = format!("job-{next_job}");
                         next_job += 1;
@@ -503,8 +554,9 @@ pub fn serve(
                     write_line(&mut output, &rpc_error(id, -32000, &e))?;
                     continue;
                 }
+                wordcraft_engine::whiq_progress::reset();
                 let _ = work_tx.send(msg);
-                inflight = Some(Inflight { id, tool: method, started: Instant::now(), deadline: None, job: None });
+                inflight = Some(Inflight::new(id, method, None, None));
             }
             Some(Event::Done { notify: true, .. }) => {}
             Some(Event::Done { reply, notify: false }) => {
@@ -569,6 +621,52 @@ pub fn serve(
     }
 }
 
+/// `cancel`: ask the running call (or job `job_id`) to stop at its next safe point.
+fn cancel(args: &Value, inflight: &mut Option<Inflight>, jobs: &BTreeMap<String, Job>) -> Value {
+    let want = args.get("job_id").map(|v| match v {
+        Value::String(s) => s.trim().to_ascii_lowercase(),
+        other => other.to_string(),
+    });
+    if let Some(w) = &want {
+        let key = if w.starts_with("job-") { w.clone() } else { format!("job-{w}") };
+        let Some(j) = jobs.get(&key) else {
+            let known: Vec<&String> = jobs.keys().collect();
+            let e = ToolError::new(
+                "job_not_found",
+                format!("no job `{w}`"),
+                "server_status lists the jobs; cancel without job_id stops the running call",
+            )
+            .with("jobs", json!(known));
+            return crate::whiq::error_result(&e, &[]);
+        };
+        if j.finished.is_some() {
+            return crate::whiq::json_result(
+                json!({"cancelled": false, "job_id": key, "status": "done", "reason": "the job had finished", "next_step": format!("job_status {{\"job_id\": \"{key}\"}} gives its result")}),
+                &[],
+            );
+        }
+        if inflight.as_ref().and_then(|f| f.job.as_deref()) != Some(key.as_str()) {
+            let e = ToolError::new("job_not_found", format!("job `{key}` isn't running"), "server_status shows the running call");
+            return crate::whiq::error_result(&e, &[]);
+        }
+    }
+    let Some(f) = inflight.as_mut() else {
+        return crate::whiq::json_result(json!({"cancelled": false, "reason": "no call is running", "next_step": "nothing to stop: carry on"}), &[]);
+    };
+    f.cancelling = true;
+    wordcraft_engine::whiq_progress::cancel();
+    let next = match &f.job {
+        Some(j) => format!(
+            "call job_status {{\"job_id\": \"{j}\"}}: once stopped, its result has code cancelled (a call that finishes first keeps its result)"
+        ),
+        None => "the call answers with code cancelled when it stops (a call that finishes first keeps its result)".to_string(),
+    };
+    crate::whiq::json_result(
+        json!({"cancelling": true, "tool": f.tool, "job_id": f.job, "progress": progress_json(f), "next_step": next, "retry_after_ms": 500}),
+        &[],
+    )
+}
+
 fn job_started(jid: &str, tool: &str) -> Value {
     crate::whiq::json_result(
         json!({
@@ -624,11 +722,12 @@ fn job_status(args: &Value, jobs: &mut BTreeMap<String, Job>, inflight: &Option<
             r
         }
         None => {
-            let running = inflight.as_ref().and_then(|f| f.job.as_deref()) == Some(key.as_str());
+            let running = inflight.as_ref().filter(|f| f.job.as_deref() == Some(key.as_str()));
             crate::whiq::json_result(
                 json!({
                     "job_id": key, "status": "running", "tool": j.tool, "elapsed_ms": elapsed,
-                    "progress": if running { current_progress().unwrap_or(json!({"phase": "running"})) } else { Value::Null },
+                    "progress": running.map_or(Value::Null, progress_json),
+                    "cancelling": running.is_some_and(|f| f.cancelling),
                     "retry_after_ms": 1000,
                     "next_step": "call job_status again after retry_after_ms",
                 }),

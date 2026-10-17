@@ -56,6 +56,8 @@ pub struct Mcp {
     next: u64,
     /// Replies read while waiting for another one.
     early: std::collections::BTreeMap<u64, Value>,
+    /// Notifications the server sent (progress), in order.
+    pub notifications: Vec<Value>,
 }
 
 pub const WAIT: Duration = Duration::from_secs(60);
@@ -92,7 +94,7 @@ impl Mcp {
                 }
             }
         });
-        let mut m = Mcp { child, stdin, lines: rx, next: 1, early: Default::default() };
+        let mut m = Mcp { child, stdin, lines: rx, next: 1, early: Default::default(), notifications: Vec::new() };
         let init = m.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "whiq-contract-test", "version": "1"}}),
@@ -139,6 +141,7 @@ impl Mcp {
                 Some(got) => {
                     self.early.insert(got, v);
                 }
+                None if v.get("method").is_some() => self.notifications.push(v),
                 None => panic!("a reply without an id: {v}"),
             }
         }
