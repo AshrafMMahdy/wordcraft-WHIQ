@@ -47,6 +47,7 @@ pub mod templates;
 pub mod text;
 pub mod tools;
 pub mod view;
+pub mod whiq_review;
 pub mod wordart;
 
 use serde_json::{Value, json};
@@ -80,6 +81,8 @@ pub fn registry() -> Registry {
     v.extend(table_resize::specs());
     v.extend(table_mouse::specs());
     v.extend(review::specs());
+    // WHIQ: review by anchor text, change report, accept/reject by change, author or kind.
+    v.extend(whiq_review::specs());
     v.extend(file::specs());
     v.extend(options::specs());
     v.extend(design::specs());

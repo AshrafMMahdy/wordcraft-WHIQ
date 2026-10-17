@@ -409,12 +409,12 @@ fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, ac
 
 /// A tracked change, for navigation and the Reviewing Pane: its range, kind (`insert`,
 /// `delete`, `format`), revision, and for a formatting change the properties it set.
-struct Change {
-    a: Pos,
-    b: Pos,
-    kind: &'static str,
-    rev: Option<u32>,
-    props: Vec<Value>,
+pub(crate) struct Change {
+    pub(crate) a: Pos,
+    pub(crate) b: Pos,
+    pub(crate) kind: &'static str,
+    pub(crate) rev: Option<u32>,
+    pub(crate) props: Vec<Value>,
 }
 
 impl Change {
@@ -488,7 +488,7 @@ fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
     sel_result(s)
 }
 
-fn resolve_sel(s: &mut Session, accept: bool) -> CmdResult {
+pub(crate) fn resolve_sel(s: &mut Session, accept: bool) -> CmdResult {
     let (a, b) = s.sel.ordered();
     // A caret right before a tracked paragraph mark (and no tracked text around it): that mark.
     let mut caret_mark = None;
@@ -578,7 +578,7 @@ fn resolve_sel(s: &mut Session, accept: bool) -> CmdResult {
     sel_result(s)
 }
 
-fn changes(s: &Session) -> Vec<Change> {
+pub(crate) fn changes(s: &Session) -> Vec<Change> {
     let mut out: Vec<Change> = Vec::new();
     let mk = |path: &wordcraft_doc::Path, off| Pos { story: StoryRef::Body, path: path.clone(), off };
     for path in s.doc.para_paths(StoryRef::Body) {

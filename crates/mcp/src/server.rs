@@ -105,7 +105,11 @@ impl Server {
         let found = crate::recover::read_marker(&dir);
         if !found.is_empty() {
             if let Ok(mut g) = self.shared.lock() {
-                g.recovered.extend(found.iter().cloned());
+                for f in &found {
+                    if !g.recovered.contains(f) {
+                        g.recovered.push(f.clone());
+                    }
+                }
             }
             self.notice = Some(json!({"reason": "an earlier server auto-saved the work", "recovered": found}));
         }

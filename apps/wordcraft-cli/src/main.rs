@@ -516,6 +516,11 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                 g.read_root = r.read_root().map(std::path::Path::to_path_buf);
                 g.write_root = r.write_root().map(std::path::Path::to_path_buf);
             }
+            // Work an earlier server auto-saved here, for server_status from the first request on.
+            if let Ok(mut g) = shared.lock() {
+                let dir = wordcraft_mcp::recover::recovery_dir(g.write_root.as_deref(), None);
+                g.recovered = wordcraft_mcp::recover::read_marker(&dir);
+            }
             // Relative paths are resolved inside the write root.
             if let Some(w) = shared.lock().ok().and_then(|g| g.write_root.clone()) {
                 std::env::set_current_dir(&w).map_err(|e| format!("mcp: cannot enter the write root {}: {e}", w.display()))?;

@@ -47,21 +47,22 @@ struct Ann {
 
 const READ: Ann = Ann { read_only: true, destructive: false, idempotent: true };
 const STATE: Ann = Ann { read_only: false, destructive: false, idempotent: true };
-const ADDS: Ann = Ann { read_only: false, destructive: false, idempotent: false };
 const CHANGES: Ann = Ann { read_only: false, destructive: true, idempotent: false };
 const REPLACES: Ann = Ann { read_only: false, destructive: true, idempotent: true };
 
 fn ann(name: &str) -> Ann {
     match name {
         "list_commands" | "get_text" | "inspect_document" | "render_page" | "parity" | "screenshot" | "ui_inspect" | "server_status"
-        | "job_status" | "list_changes" | "compare_documents" => READ,
+        | "job_status" | "list_changes" | "find_anchor" | "roundtrip_check" => READ,
         "select_text" => STATE,
         // Opening or starting a document replaces the open one (auto-saved first when it has
         // unsaved changes): the same arguments give the same result.
         "new_document" | "open_document" | "import_markdown" | "close_document" => REPLACES,
         // Writing files: never silently over another one, but `overwrite: true` can.
         "save_document" | "export_pdf" => CHANGES,
-        "review_comment" => ADDS,
+        // Review edits are tracked (reversible), but a batch can delete text and paragraphs;
+        // accepting or rejecting a change is final; a comparison rewrites the open document.
+        "review_edit" | "accept_changes" | "reject_changes" | "compare_documents" => CHANGES,
         // Anything else edits the document and can delete or replace content.
         _ => CHANGES,
     }

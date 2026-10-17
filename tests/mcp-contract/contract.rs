@@ -316,7 +316,7 @@ fn annotations_say_what_each_tool_does() {
         let ro = a["readOnlyHint"] == true;
         if reads.contains(&name) {
             assert!(ro && a["destructiveHint"] == false, "{name} reads only: {a}");
-        } else if ["list_changes", "compare_documents"].contains(&name) {
+        } else if ["list_changes", "find_anchor", "roundtrip_check"].contains(&name) {
             assert!(ro, "{name} reads only");
         } else {
             assert!(!ro, "{name} changes something and must not claim readOnlyHint: {a}");
@@ -324,7 +324,19 @@ fn annotations_say_what_each_tool_does() {
         assert!(t["inputSchema"]["properties"]["caller"].is_object(), "{name} takes caller");
     }
     let by = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
-    for n in ["save_document", "execute", "batch", "export_pdf", "type_text", "new_document", "open_document"] {
+    for n in [
+        "save_document",
+        "execute",
+        "batch",
+        "export_pdf",
+        "type_text",
+        "new_document",
+        "open_document",
+        "review_edit",
+        "accept_changes",
+        "reject_changes",
+        "compare_documents",
+    ] {
         assert_eq!(by(n)["destructiveHint"], true, "{n}");
     }
     assert_eq!(by("select_text")["destructiveHint"], false);
@@ -409,4 +421,65 @@ fn garbage_lines_get_answers_and_the_server_stays_up() {
     m.ok("type_text", json!({"text": "still here"}));
     assert_eq!(text_of(&mut m), "still here");
     let _: Value = m.ok("server_status", json!({}));
+}
+
+// Review tooling: a batch of anchored, tracked edits by the caller; a change report with
+// locations; accept/reject per change and per author.
+#[test]
+fn review_edits_by_anchor_are_tracked_reported_and_resolvable() {
+    let d = Dir::new("review");
+    let mut m = Mcp::start(&d.0, &["--author", "Drafting Agent"]);
+    m.ok(
+        "type_text",
+        json!({"text": "Payment is due within thirty days.\nThe supplier may terminate on notice.\nGoverning law: England.", "paragraphs": true}),
+    );
+    m.ok("save_document", json!({"path": "contract.docx"}));
+    let r = m.ok(
+        "review_edit",
+        json!({"caller": "Legal Reviewer", "ops": [
+            {"op": "replace", "anchor": "thirty days", "with": "forty-five days"},
+            {"op": "insert_paragraph", "anchor": "terminate on notice", "position": "after", "text": "Notice must be given in writing."},
+            {"op": "comment", "anchor": "Governing law", "text": "Confirm with the client."},
+            {"op": "delete", "anchor": "The suplier may"},
+        ]}),
+    );
+    assert_eq!(r["applied"], 4, "{r}");
+    let changes = r["changes"].as_array().unwrap();
+    assert_eq!(changes[3]["match"]["kind"], "fuzzy", "a fuzzy anchor is reported as such: {}", changes[3]);
+    for c in changes {
+        assert_eq!(c["status"], "applied");
+        assert!(c["location"]["path"].is_array(), "every change has a location: {c}");
+    }
+    let replace_ids = changes[0]["changeIds"].as_array().unwrap().clone();
+    assert_eq!(replace_ids.len(), 2, "a deletion and an insertion");
+    // The report: every change by the caller, with location and context; the comment too.
+    let rep = m.ok("list_changes", json!({}));
+    assert!(rep["changes"].as_array().unwrap().iter().all(|c| c["author"] == "Legal Reviewer"), "{rep}");
+    assert!(rep["changes"].as_array().unwrap().iter().all(|c| c["location"]["start"]["path"].is_array() && c["context"].is_string()));
+    assert_eq!(rep["comments"][0]["author"], "Legal Reviewer");
+    // A second reviewer's edit, then accept one change, reject by author.
+    m.ok("review_edit", json!({"caller": "Second Reviewer", "ops": [{"op": "replace", "anchor": "England", "with": "England and Wales"}]}));
+    let r = m.ok("accept_changes", json!({"ids": replace_ids}));
+    assert_eq!(r["resolved"].as_array().unwrap().len(), 2, "{r}");
+    let r = m.ok("reject_changes", json!({"author": "second reviewer"}));
+    assert!(!r["resolved"].as_array().unwrap().is_empty(), "{r}");
+    let text = m.ok("get_text", json!({}))["text"].as_str().unwrap().to_string();
+    assert!(text.contains("forty-five days") && text.contains("Governing law: England.") && !text.contains("Wales"), "{text}");
+    // A batch with an anchor that isn't there changes nothing and says what is close.
+    let before = m.ok("get_text", json!({}))["text"].clone();
+    let e = m.err("review_edit", json!({"ops": [{"op": "replace", "anchor": "forty-five", "with": "sixty"}, {"op": "replace", "anchor": "zebra crossing rules", "with": "x"}]}), "not_found");
+    assert_eq!(e["failed_at"], 1, "{e}");
+    assert_eq!(m.ok("get_text", json!({}))["text"], before, "all or nothing");
+    let f = m.ok("find_anchor", json!({"anchor": "GOVERNING LAW"}));
+    assert_eq!(f["matches"][0]["kind"], "case");
+    // Saved, the changes are in the file with the reviewer's name.
+    m.ok("save_document", json!({"path": "reviewed.docx"}));
+    let bytes = std::fs::read(d.path("reviewed.docx")).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+    assert!(xml.contains("w:author=\"Legal Reviewer\"") && xml.contains("<w:ins ") && xml.contains("<w:del "), "tracked in the file");
+    // Comparing with the original lists the differences.
+    let cmp = m.ok("compare_documents", json!({"original": "contract.docx", "revised": "reviewed.docx", "author": "Comparer"}));
+    assert!(!cmp["changes"].as_array().unwrap().is_empty(), "{cmp}");
 }
