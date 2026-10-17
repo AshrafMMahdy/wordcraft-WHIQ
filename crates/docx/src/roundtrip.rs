@@ -241,6 +241,12 @@ pub fn lines(n: &Node) -> Vec<String> {
 /// contents are compared: child elements by name, text by paragraph).
 const CONTAINERS: &[&str] = &["w:r", "w:t", "w:rPr", "w:pPr", "w:instrText"];
 
+/// A run's properties (`w:r/w:rPr`): compared per character ([`run_format_losses`]), since a
+/// save may merge runs that look the same.
+fn is_run_props(parent: &Node, n: &Node) -> bool {
+    parent.name == "w:r" && n.name == "w:rPr"
+}
+
 fn inventory(n: &Node, out: &mut BTreeMap<String, usize>) {
     // A field is one field whichever way it's written: `w:fldSimple`, or `w:fldChar` begin …
     // separate … end around `w:instrText`.
@@ -254,8 +260,107 @@ fn inventory(n: &Node, out: &mut BTreeMap<String, usize>) {
         *out.entry(k).or_default() += 1;
     }
     for k in &n.kids {
-        inventory(k, out);
+        if !is_run_props(n, k) {
+            inventory(k, out);
+        }
     }
+}
+
+/// Every attribute, as `element@attribute`, with how often it occurs. A field's attributes count
+/// the same however it is written (its instruction is compared as text elsewhere).
+fn attr_inventory(n: &Node, out: &mut BTreeMap<String, usize>) {
+    let field = n.name == "w:fldSimple" || (n.name == "w:fldChar" && n.attrs.get("w:fldCharType").map(String::as_str) == Some("begin"));
+    for k in n.attrs.keys() {
+        let key = match k.as_str() {
+            "w:instr" | "w:fldCharType" if field => continue,
+            _ if field => format!("(field)@{k}"),
+            _ => format!("{}@{k}", n.name),
+        };
+        *out.entry(key).or_default() += 1;
+    }
+    for k in &n.kids {
+        if !is_run_props(n, k) {
+            attr_inventory(k, out);
+        }
+    }
+}
+
+/// Per paragraph, each character's run properties: the set of `element@attribute=value` (and
+/// bare `element`) of its run's `w:rPr`.
+fn char_formats(n: &Node) -> Vec<Vec<BTreeSet<String>>> {
+    fn props(rpr: &Node, prefix: &str, out: &mut BTreeSet<String>, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        for k in &rpr.kids {
+            let name = format!("{prefix}{}", k.name);
+            out.insert(name.clone());
+            for (a, v) in &k.attrs {
+                // Revision ids are renumbered on save; an rgb value beside a theme colour is
+                // that colour's cache (readers recompute it from the theme).
+                let cache = (matches!(a.as_str(), "w:val" | "w:color") && k.attrs.contains_key("w:themeColor"))
+                    || (a == "w:fill" && k.attrs.contains_key("w:themeFill"));
+                if a != "w:id" && !cache {
+                    out.insert(format!("{name}@{a}={v}"));
+                }
+            }
+            props(k, &format!("{name}/"), out, depth + 1);
+        }
+    }
+    fn chars(n: &Node, cur: &BTreeSet<String>, out: &mut Vec<BTreeSet<String>>) {
+        match n.name.as_str() {
+            "w:t" | "w:delText" => out.extend(n.text.chars().map(|_| cur.clone())),
+            "w:tab" | "w:br" | "w:cr" => out.push(cur.clone()),
+            "w:p" | "w:txbxContent" => {}
+            "w:r" => {
+                let mut set = BTreeSet::new();
+                if let Some(rpr) = n.kids.iter().find(|k| k.name == "w:rPr") {
+                    props(rpr, "", &mut set, 0);
+                }
+                for k in n.kids.iter().filter(|k| k.name != "w:rPr") {
+                    chars(k, &set, out);
+                }
+            }
+            _ => {
+                for k in &n.kids {
+                    chars(k, cur, out);
+                }
+            }
+        }
+    }
+    fn go(n: &Node, out: &mut Vec<Vec<BTreeSet<String>>>) {
+        if n.name == "w:p" {
+            let mut v = Vec::new();
+            for k in &n.kids {
+                chars(k, &BTreeSet::new(), &mut v);
+            }
+            out.push(v);
+        }
+        for k in &n.kids {
+            go(k, out);
+        }
+    }
+    let mut out = Vec::new();
+    go(n, &mut out);
+    out
+}
+
+/// Run properties a character had before the save and not after (paragraphs whose text is
+/// unchanged): (property, characters).
+fn run_format_losses(a: &Node, b: &Node) -> Vec<(String, usize)> {
+    let (fa, fb) = (char_formats(a), char_formats(b));
+    let mut lost: BTreeMap<String, usize> = BTreeMap::new();
+    for (pa, pb) in fa.iter().zip(&fb) {
+        if pa.len() != pb.len() {
+            continue;
+        }
+        for (ca, cb) in pa.iter().zip(pb) {
+            for p in ca.difference(cb) {
+                *lost.entry(p.clone()).or_default() += 1;
+            }
+        }
+    }
+    lost.into_iter().collect()
 }
 
 /// The text of each paragraph (`w:p`), in document order (nested paragraphs, as in text boxes
@@ -297,6 +402,12 @@ pub struct StoryDiff {
     pub part: String,
     /// Element names with fewer occurrences after the save: (name, before, after).
     pub losses: Vec<(String, usize, usize)>,
+    /// Attributes (`element@attribute`) with fewer occurrences after the save: (name, before,
+    /// after).
+    pub attr_losses: Vec<(String, usize, usize)>,
+    /// Run properties (`element`, `element@attribute=value`) some characters lost: (property,
+    /// characters).
+    pub format_losses: Vec<(String, usize)>,
     /// Paragraph texts that differ: (index, before, after).
     pub text_changes: Vec<(usize, String, String)>,
     /// The normalised trees are identical.
@@ -325,7 +436,7 @@ impl Report {
         self.missing_parts.is_empty()
             && self.changed_binary_parts.is_empty()
             && self.missing_rels.is_empty()
-            && self.stories.iter().all(|s| s.losses.is_empty() && s.text_changes.is_empty())
+            && self.stories.iter().all(|s| s.losses.is_empty() && s.attr_losses.is_empty() && s.format_losses.is_empty() && s.text_changes.is_empty())
     }
 
     /// One line per problem (empty when [`Report::lossless`]), then one line per rewritten story.
@@ -336,6 +447,8 @@ impl Report {
         out.extend(self.missing_rels.iter().map(|(s, t, x)| format!("missing relationship {s} -> {x} ({t})")));
         for s in &self.stories {
             out.extend(s.losses.iter().map(|(n, a, b)| format!("{}: lost {n} ({a} -> {b})", s.part)));
+            out.extend(s.attr_losses.iter().map(|(n, a, b)| format!("{}: lost attribute {n} ({a} -> {b})", s.part)));
+            out.extend(s.format_losses.iter().map(|(p, n)| format!("{}: lost run property {p} on {n} characters", s.part)));
             out.extend(s.text_changes.iter().map(|(i, a, b)| format!("{}: paragraph {i} text {a:?} -> {b:?}", s.part)));
         }
         out
@@ -430,6 +543,25 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Report, DocxError> {
     rep.added_parts.retain(|x| !renames.values().any(|v| v == x));
     rep.renamed_parts = renames.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let rename = |t: &str| renames.get(t).cloned().unwrap_or_else(|| t.to_string());
+    // Headers and footers are paired by the section and slot that use them (a save may number
+    // them differently).
+    let (ha, hb) = (header_footer_slots(&a), header_footer_slots(&b));
+    let mut paired: BTreeMap<String, String> = BTreeMap::new();
+    for (slot, pa) in &ha {
+        if let Some(pb) = hb.get(slot) {
+            paired.entry(pa.clone()).or_insert_with(|| pb.clone());
+        }
+    }
+    for (pa, pb) in &paired {
+        if pa == pb {
+            continue;
+        }
+        if let (Some(x), Some(y)) = (a.get(pa).and_then(parse_expanded), b.get(pb).and_then(parse_expanded)) {
+            rep.stories.push(story_diff(&format!("{pa} (saved as {pb})"), &x, &y));
+        }
+        rep.missing_parts.retain(|m| m != pa);
+        rep.added_parts.retain(|m| m != pb);
+    }
     for part in an.intersection(&bn) {
         let (x, y) = (a.get(part).unwrap_or_default(), b.get(part).unwrap_or_default());
         if !part.ends_with(".rels") {
@@ -441,6 +573,11 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Report, DocxError> {
             }
         }
         if is_story(part) {
+            // A header or footer saved under another name was compared above.
+            let same = paired.get(part).is_some_and(|p| p == part);
+            if !same && (paired.contains_key(part) || paired.values().any(|p| p == part)) {
+                continue;
+            }
             let (Some(ta), Some(tb)) = (parse_expanded(x), parse_expanded(y)) else { continue };
             rep.stories.push(story_diff(part, &ta, &tb));
         } else if !regenerated(part) && !part.ends_with(".xml") && x != y {
@@ -456,6 +593,42 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Report, DocxError> {
     Ok(rep)
 }
 
+/// The header and footer parts the main document's sections use: (section, `header`/`footer`,
+/// type) → part name.
+fn header_footer_slots(pkg: &Package) -> BTreeMap<(usize, String, String), String> {
+    let mut out = BTreeMap::new();
+    let main = "word/document.xml";
+    let Some(doc) = pkg.get(main).and_then(parse_expanded) else { return out };
+    let rels = pkg.rels(main);
+    let mut sections = Vec::new();
+    fn find<'a>(n: &'a Node, out: &mut Vec<&'a Node>, depth: usize) {
+        if depth > 64 {
+            return;
+        }
+        if n.name == "w:sectPr" {
+            out.push(n);
+            return;
+        }
+        for k in &n.kids {
+            find(k, out, depth + 1);
+        }
+    }
+    find(&doc, &mut sections, 0);
+    for (i, s) in sections.iter().enumerate() {
+        for k in &s.kids {
+            let kind = match k.name.as_str() {
+                "w:headerReference" => "header",
+                "w:footerReference" => "footer",
+                _ => continue,
+            };
+            let ty = k.attrs.get("w:type").cloned().unwrap_or_else(|| "default".into());
+            let Some(target) = k.attrs.get("r:id").and_then(|id| rels.by_id(id)).map(|r| r.target.clone()) else { continue };
+            out.insert((i, kind.to_string(), ty), target);
+        }
+    }
+    out
+}
+
 fn story_diff(part: &str, a: &Node, b: &Node) -> StoryDiff {
     let (na, nb) = (normalise(a), normalise(b));
     let (mut ia, mut ib) = (BTreeMap::new(), BTreeMap::new());
@@ -465,6 +638,16 @@ fn story_diff(part: &str, a: &Node, b: &Node) -> StoryDiff {
         .iter()
         .filter_map(|(k, n)| {
             let m = ib.get(k).copied().unwrap_or(0);
+            (m < *n).then(|| (k.clone(), *n, m))
+        })
+        .collect();
+    let (mut aa, mut ab) = (BTreeMap::new(), BTreeMap::new());
+    attr_inventory(&na, &mut aa);
+    attr_inventory(&nb, &mut ab);
+    let attr_losses = aa
+        .iter()
+        .filter_map(|(k, n)| {
+            let m = ab.get(k).copied().unwrap_or(0);
             (m < *n).then(|| (k.clone(), *n, m))
         })
         .collect();
@@ -480,7 +663,8 @@ fn story_diff(part: &str, a: &Node, b: &Node) -> StoryDiff {
     let first_difference = (0..la.len().max(lb.len()))
         .find(|i| la.get(*i) != lb.get(*i))
         .map(|i| (i, la.get(i).cloned().unwrap_or_default(), lb.get(i).cloned().unwrap_or_default()));
-    StoryDiff { part: part.to_string(), losses, text_changes, identical: first_difference.is_none(), first_difference }
+    let format_losses = run_format_losses(&na, &nb);
+    StoryDiff { part: part.to_string(), losses, attr_losses, format_losses, text_changes, identical: first_difference.is_none(), first_difference }
 }
 
 #[cfg(test)]

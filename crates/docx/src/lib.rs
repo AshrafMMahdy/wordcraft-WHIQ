@@ -12,6 +12,7 @@ mod crypt;
 mod custom;
 mod flat;
 mod fonts;
+mod keep;
 mod package;
 mod read;
 pub mod roundtrip;

@@ -61,11 +61,10 @@ Behaviour changes upstream tests pinned (updated, marked WHIQ): the smart tag's 
 tags now precede a content control's start marker (`fixtures.rs::hyperlink_runs_and_wrappers`);
 an unknown element that refers to a part keeps the part (`passthrough.rs::parts_the_writer_owns_or_the_body_refers_to_are_not_carried`).
 
-Not covered: `w:customXml` directly around a table (it is unwrapped, as before; Word 2010 and
-later strip custom XML markup themselves); unknown *attributes* on modelled elements (e.g.
-`w16du:dateUtc` on `w:ins`) are regenerated, not kept; a block-level `mc:AlternateContent` keeps
-its chosen branch only; objects inside an unknown element are not editable (they ride along as
-markup).
+Round 2 (below, "Lossless, fully") keeps what this part still dropped: block-level
+`mc:AlternateContent` keeps both branches, `w:customXml` around tables, rows and cells, unknown
+attributes on modelled elements. Objects inside an unknown element are still not editable (they
+ride along as markup).
 
 ## 3. Review tooling (parity with the platform's edit_docx)
 
@@ -90,6 +89,31 @@ markup).
 | MCP `render_page`: `page` or a range (`pages: "1-3,5"`, `"4-"`), `dpi` (7–576, default 96; or `scale` px/pt), `markup` (true: Print Markup with tracked changes marked up and comment balloons; false, the default: the printed page). One image per page plus a summary (`pages`, sizes, `total_pages`); a range over 16 MB of PNG continues with `continue_from`; a single page too big answers `too_large` with the largest DPI that fits; pages outside the document answer `out_of_range`. MCP `export_pdf`: `pages` range and `markup` (the engine's print-to-PDF), fonts embedded as subsets. Headless rendering takes `markup` (printed layout) or, without it, the editing layout as before. | `crates/mcp/src/whiq.rs`, `crates/mcp/src/lib.rs` | `pages_render_to_png_and_pdf_by_range_with_and_without_markup` (contract suite: PNG sizes by DPI, ranges, markup changes the image and the PDF, PDF page counts, errors) |
 | Command line: `wordcraft-cli render FILE OUT.png --pages 2-4 [--dpi D] [--markup]` writes `OUT-2.png`…; `wordcraft-cli convert IN OUT.pdf --pages 2-4 [--markup]`. | `apps/wordcraft-cli/src/main.rs` | same test |
 | Comparing two documents over MCP: `compare_documents` (part 3). | | |
+
+## Round 2, 1. Lossless, fully: alternate content, custom XML around tables, unknown attributes
+
+| Change | Where | Tested by |
+|---|---|---|
+| A block-level `mc:AlternateContent` keeps **both** branches. The branch the reader understands (a `Choice` whose requirements it knows, else the `Fallback`) is read and shown; markers (`docx-alt-open` / `docx-alt-close`) around its blocks hold the whole element with that branch's content replaced by a slot, and a fingerprint of the blocks. Saving writes the element back with the shown branch written from the model, the other branches as they were (relationships renumbered), while the blocks are unchanged; edited, the blocks are written alone (the other branch would show the old text). A branch with nothing the model reads keeps the whole element as unknown block markup. Markup waiting before the element (an unknown block element, a bookmark) stays before it. | `crates/docx/src/read/story.rs` (`read_block_alternate`, `wrap_blocks`, `put_before`), `write/passthrough.rs` (`decide_alternates`, `blocks_fingerprint`, `open_marker` / `close_marker`), `write/story.rs` (`blocks`) | `corpus_roundtrip.rs`: `block-alternate-content.docx` (a `fut2` choice with an unknown element, paragraphs and a table, and a `w14` choice table), `kept_markup_gives_way_to_edits` |
+| `w:customXml` around a table, around paragraphs and a table, nested around a table, around a row and around a cell: kept in place. Tables, rows and cells gain `wraps` (`OpaqueWrap`: kept start and end tags, and how many content controls each encloses, so wrappers and controls nest as they did); splitting a table moves the ends to its second part. | `crates/doc/src/table.rs` (`OpaqueWrap`, `WrapTag`), `read/story.rs` (`collect`, `wrap_blocks`), `write/story.rs` (`table`), `write/passthrough.rs` (`open_around`, `close_around`), `crates/engine/src/cmd/table.rs` (split) | `custom-xml-tables.docx` |
+| Attributes the model has no field for, on elements it reads: kept and written back. The reader asks the writer what it would write for the properties it read (a run's `w:rPr`, a paragraph's `w:pPr`, `w:tblPr`, `w:trPr`/`w:tblPrEx`, `w:tcPr`, `w:sectPr`) and keeps, per element path, the attributes it leaves out or writes another way with what it does write (the signature); on save an element written exactly as its signature (unedited) gets the file's attributes back: theme colours and fonts (`w:themeColor`, `w:themeShade`, `w:asciiTheme`…), `w:lang w:eastAsia`, `w:rFonts w:hint`, `w:pgSz w:code`, `w14:shadow w14:algn`, attributes in unknown namespaces. An edited element is written from the model alone, so a kept attribute never contradicts an edit (no stale `w:themeColor` on a recoloured run). The elements holding them keep theirs too: `w:p`, `w:r`, `w:hyperlink` (`w:tooltip`…), `w:tbl`, `w:tr`, `w:tc`, `w:sectPr`. Revisions keep `w16du:dateUtc` (per author and date) on `w:ins`, `w:del`, `w:moveFrom`/`To`, `w:rPrChange`, `w:pPrChange` and the rest. The main part's root keeps `mc:PreserveAttributes` / `PreserveElements` / `ProcessContent`. | `crates/docx/src/keep.rs` (new), `read/props.rs`, `read/story.rs`, `read/mod.rs`, `write/props.rs`, `write/story.rs`, `write/mod.rs`; `ext_attrs` on `CharProps`, `ParaProps`, `TableProps`, `RowProps`, `CellProps`, `SectionProps` | `unknown-attributes.docx`, `kept_markup_gives_way_to_edits`, unit tests in `keep.rs` |
+| Unknown table, row and cell properties (`w:cnfStyle`, `w:tblCellSpacing`, a row's `w:jc`…): kept as markup (`ext_xml` on `TableProps`, `RowProps`, `CellProps`), written where CT_TblPr / CT_TcPr put them. | `read/passthrough.rs` (`table_ext`), `write/props.rs`, `keep.rs` (`insert_ordered`) | real Word files (below) |
+| Drawings: the original `w:drawing` (its text boxes' content left out) is kept under the object's fingerprint; saving the object unchanged gives the written drawing the attributes and elements of the original the writer leaves out (`wp14:anchorId`, `wp14:editId`, `a:graphicFrameLocks`, extension lists, a picture's hyperlink with its relationship), never beside something the writer says another way. A drawing with alternate content inside it (a picture with a fallback picture) is kept whole and written back while unchanged. A drawing or OLE object the reader can't show, and a VML horizontal rule, are kept as markup. | `read/passthrough.rs` (`keep_drawing`), `write/passthrough.rs` (`merge_kept_drawing`, `merge_kept`), `read/story.rs` | `unknown-attributes.docx`, real Word files |
+| The diff tool: attributes are compared too (an inventory of `element@attribute`); run properties are compared per character (a save may merge runs that look the same; an rgb beside a theme colour is its cache); headers and footers are paired by the section and slot using them (a save may number them differently); a field's attributes count the same however the field is written. | `crates/docx/src/roundtrip.rs` | `corpus_roundtrip.rs` |
+
+**Real Word files.** The repository must not carry files produced by Word (AGENTS.md), so
+`real_word_files_keep_what_the_fork_keeps` (`crates/docx/tests/corpus_roundtrip.rs`) runs on every
+`.docx`/`.docm` in `$WHIQ_REAL_DOCX_DIR` when it is set: open + save must lose nothing in the
+classes this fork keeps (markup and attributes in extension or unknown namespaces, alternate
+content, custom XML), and every other difference is printed. Run here on the 114 Word-produced test
+documents of Apache POI (`test-data/document`, Apache-2.0, fetched into the scratchpad, not
+committed): it passes. No real Word file has a block-level `mc:AlternateContent` or `w:customXml`
+(Word has not written custom XML markup since 2010, and writes alternate content inside runs and
+drawings, not between paragraphs), so those two cases are covered by the hand-written corpus only.
+What the model still does not carry in those files (printed by the test; unchanged by this fork):
+positional tabs (`w:ptab`, written as tabs), a text-wrapping break's `w:clear`, symbol characters
+(`w:sym`, written as text), bookmarks on table columns (`w:colFirst`/`w:colLast`), some VML shapes,
+`docProps/custom.xml`, and a mail-merge data source relationship in `settings.xml`.
 
 ## Interface labels
 

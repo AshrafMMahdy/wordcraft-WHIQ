@@ -41,9 +41,28 @@ impl Writer<'_> {
         // Whether the heading's TOC field was written and still needs its end.
         let mut toc_field_open = false;
         for (i, b) in bl.iter().enumerate() {
-            for c in plan.opens.get(i).into_iter().flatten() {
+            // WHIQ: kept wrappers and alternate contents opening here, nested with the content
+            // controls as read; the rest are written with the paragraph (or the table, below).
+            self.decide_alternates(bl, i, rels);
+            let lead = super::passthrough::lead_markers(b);
+            let mut li = 0;
+            for (k, c) in plan.opens.get(i).into_iter().flatten().enumerate() {
+                while let Some(m) = lead.get(li).filter(|m| m.controls_before <= k) {
+                    self.open_marker(w, m, rels);
+                    self.lead_done.extend(m.at);
+                    li += 1;
+                }
                 sdt_marks.push(self.block_wraps.len());
                 super::sdt::open(w, c);
+            }
+            if matches!(**b, Block::Table(_)) {
+                for m in lead.get(li..).unwrap_or(&[]) {
+                    self.open_marker(w, m, rels);
+                }
+            }
+            let trail = super::passthrough::trail_markers(b);
+            if matches!(**b, Block::Para(_)) {
+                self.trail_later = trail.iter().filter(|m| m.controls_before > 0).filter_map(|m| m.at).collect();
             }
             if let Some((start, end)) = toc {
                 if i == start {
@@ -70,11 +89,29 @@ impl Writer<'_> {
                     w.raw("</w:sdtContent></w:sdt>");
                 }
             }
-            for _ in 0..plan.closes.get(i).copied().unwrap_or(0) {
+            // WHIQ: kept ends after the content controls ending before them (the paragraph wrote
+            // those with none before them).
+            let table = matches!(**b, Block::Table(_));
+            let mut ti = 0;
+            for k in 0..plan.closes.get(i).copied().unwrap_or(0) {
+                while let Some(m) = trail.get(ti).filter(|m| m.controls_before <= k as usize) {
+                    if table || m.controls_before > 0 {
+                        self.close_marker(w, m.format, m.xml);
+                    }
+                    ti += 1;
+                }
                 let mark = sdt_marks.pop().unwrap_or(self.block_wrap_base);
                 self.close_block_wraps(w, mark);
                 super::sdt::close(w);
             }
+            for m in trail.get(ti..).unwrap_or(&[]) {
+                if table || m.controls_before > 0 {
+                    self.close_marker(w, m.format, m.xml);
+                }
+            }
+            self.lead_done.clear();
+            self.trail_later.clear();
+            self.alt_here.clear();
         }
         let base = self.block_wrap_base;
         self.close_block_wraps(w, base);
@@ -167,6 +204,8 @@ impl Writer<'_> {
             Some(id) => w.open("w:p", &[("w14:paraId", id), ("w14:textId", "77777777")]),
             None => w.open("w:p", &[]),
         }
+        // WHIQ: the paragraph's attributes kept from the file (`keep.rs`).
+        crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(p.props.ext_attrs.as_deref(), "^p"));
         let mut pp = p.props.clone();
         if !framed {
             pp.drop_cap = None;
@@ -196,6 +235,7 @@ impl Writer<'_> {
                     } else {
                         w.empty(tag, &[("w:id", &id), ("w:author", &author), ("w:date", &date)]);
                     }
+                    crate::keep::extend_last_tag(&mut w.s, self.rev_extra(idx));
                 }
                 rpr_inner(w, &p.mark);
                 if let Some(ch) = p.mark.fmt_change.as_deref() {
@@ -350,6 +390,8 @@ impl Writer<'_> {
                         let id = rels.add(rt::HYPERLINK, l, true);
                         w.open("w:hyperlink", &[("r:id", &id), ("w:history", "1")]);
                     }
+                    // WHIQ: the hyperlink's attributes kept from the file (`keep.rs`).
+                    crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(props.ext_attrs.as_deref(), "^h"));
                     open_link = Some(l.to_string());
                 }
             }
@@ -424,18 +466,37 @@ impl Writer<'_> {
         (self.next_rev_id.to_string(), author, date)
     }
 
-    /// `w:id`, `w:author` and `w:date` of a tracked change by revision `idx`.
+    /// `w:id`, `w:author` and `w:date` of a tracked change by revision `idx` (WHIQ: and its kept
+    /// attributes, under an empty name: `open_change` adds them).
     fn change_attrs(&mut self, idx: u32) -> ChangeAttrs {
         let (id, author, date) = self.rev_attrs(idx);
         let mut a = vec![("w:id", id), ("w:author", author)];
         if !date.is_empty() {
             a.push(("w:date", date));
         }
+        if let Some(x) = self.rev_extra(idx) {
+            a.push(("", x.to_string()));
+        }
         a
+    }
+
+    /// WHIQ: the attributes kept for revision `idx`'s author and date (`w16du:dateUtc`…), unless
+    /// dates are removed.
+    fn rev_extra(&self, idx: u32) -> Option<&str> {
+        if self.doc.settings.remove_date_time {
+            return None;
+        }
+        let r = self.doc.revisions.get(idx as usize)?;
+        self.revision_attrs.get(&(r.author.clone(), r.date.clone())).map(String::as_str)
     }
 
     /// A run's `w:rPr`, with its tracked formatting change last (§17.13.5.31).
     fn rpr(&mut self, w: &mut W, c: &CharProps) {
+        // WHIQ: the run's attributes kept from the file (`keep.rs`), on the `w:r` just opened.
+        if w.s.ends_with("<w:r>") {
+            let at = w.s.len() - "<w:r>".len();
+            crate::keep::extend_tag(&mut w.s, at, crate::keep::tag_extra(c.ext_attrs.as_deref(), "^r"));
+        }
         let Some(ch) = c.fmt_change.as_deref() else { return rpr(w, c) };
         w.open("w:rPr", &[]);
         rpr_inner(w, c);
@@ -465,6 +526,7 @@ impl Writer<'_> {
             } else {
                 w.open(tag, &[("w:id", &id), ("w:author", &author), ("w:date", &date)]);
             }
+            crate::keep::extend_last_tag(&mut w.s, self.rev_extra(idx));
         }
     }
 
@@ -479,6 +541,13 @@ impl Writer<'_> {
     }
 
     fn object(&mut self, w: &mut W, o: &InlineObject, props: &CharProps, rels: &mut PartRels, depth: usize) {
+        let start = w.s.len();
+        self.object_written(w, o, props, rels, depth);
+        // WHIQ: what the writer left out of a drawing kept from the file comes back.
+        self.merge_kept_drawing(&mut w.s, start, o, rels);
+    }
+
+    fn object_written(&mut self, w: &mut W, o: &InlineObject, props: &CharProps, rels: &mut PartRels, depth: usize) {
         // WHIQ: an object read from an `mc:AlternateContent` and not edited since is written back
         // with every branch of it (a VML fallback, a 3-D model's picture…).
         if self.has_kept_alternates
@@ -1259,6 +1328,8 @@ impl Writer<'_> {
             return;
         }
         w.open("w:tbl", &[]);
+        // WHIQ: the table's attributes kept from the file (`keep.rs`).
+        crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(t.props.ext_attrs.as_deref(), "^t"));
         let chg = t.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
         tblpr(w, &t.props, chg.as_ref());
         w.open("w:tblGrid", &[]);
@@ -1268,47 +1339,32 @@ impl Writer<'_> {
             w.empty("w:gridCol", &[("w:w", &twips(gw.max(0.0)))]);
         }
         w.close("w:tblGrid");
-        // Controls around rows and cells (repeating sections): opens and closes balanced
-        // whatever editing left, the ones still open closed at the end.
-        let mut open_rows = 0u32;
+        // Controls around rows and cells (repeating sections), and (WHIQ) wrappers kept from the
+        // file: opens and closes balanced whatever editing left, the ones still open closed at
+        // the end.
+        let mut around_rows = super::passthrough::Around::new();
         for r in rows {
-            for c in &r.controls.open {
-                super::sdt::open(w, c);
-                open_rows += 1;
-            }
+            super::passthrough::open_around(w, &r.controls.open, &r.wraps.open, &mut around_rows);
             w.open("w:tr", &[]);
+            crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(r.props.ext_attrs.as_deref(), "^w"));
             let chg = r.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
             trpr(w, &r.props, chg.as_ref());
-            let mut open_cells = 0u32;
+            let mut around_cells = super::passthrough::Around::new();
             for c in &r.cells {
-                for ctl in &c.controls.open {
-                    super::sdt::open(w, ctl);
-                    open_cells += 1;
-                }
+                super::passthrough::open_around(w, &c.controls.open, &c.wraps.open, &mut around_cells);
                 w.open("w:tc", &[]);
+                crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(c.props.ext_attrs.as_deref(), "^c"));
                 let chg = c.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
                 tcpr(w, &c.props, chg.as_ref());
                 self.blocks(w, &c.blocks, rels, false, depth + 1);
                 w.close("w:tc");
-                let n = c.controls.close.min(open_cells);
-                for _ in 0..n {
-                    super::sdt::close(w);
-                }
-                open_cells -= n;
+                super::passthrough::close_around(w, c.controls.close, &c.wraps.close, &mut around_cells);
             }
-            for _ in 0..open_cells {
-                super::sdt::close(w);
-            }
+            super::passthrough::close_all(w, &mut around_cells);
             w.close("w:tr");
-            let n = r.controls.close.min(open_rows);
-            for _ in 0..n {
-                super::sdt::close(w);
-            }
-            open_rows -= n;
+            super::passthrough::close_around(w, r.controls.close, &r.wraps.close, &mut around_rows);
         }
-        for _ in 0..open_rows {
-            super::sdt::close(w);
-        }
+        super::passthrough::close_all(w, &mut around_rows);
         w.close("w:tbl");
     }
 
@@ -1338,6 +1394,9 @@ impl Writer<'_> {
 
     pub fn sectpr(&mut self, w: &mut W, s: &SectionProps, rels: &mut PartRels) {
         w.open("w:sectPr", &[]);
+        // WHIQ: attributes kept from the file (`keep.rs`): the section's, then its children's.
+        crate::keep::extend_last_tag(&mut w.s, crate::keep::tag_extra(s.ext_attrs.as_deref(), "^s"));
+        let kept_from = w.s.len();
         let headers = self.watermark_headers(s);
         for (set, footer) in [(&headers, false), (&s.footers, true)] {
             for (kind, id) in [("default", set.default), ("first", set.first), ("even", set.even)] {
@@ -1350,6 +1409,7 @@ impl Writer<'_> {
         // WHIQ: kept section properties, their relationships renumbered for this part.
         let ext = s.ext.as_deref().and_then(|e| self.embedded_tree(e, rels, None));
         sectpr_body(w, s, ext.as_ref());
+        crate::keep::restore(&mut w.s, kept_from, s.ext_attrs.as_deref());
         // The properties before a tracked change come last (§17.13.5.32).
         if let Some(ch) = &s.fmt_change {
             let a = self.change_attrs(ch.rev);
@@ -1364,7 +1424,7 @@ impl Writer<'_> {
 }
 
 /// `w:sectPr` content after the header and footer references.
-fn sectpr_body(w: &mut W, s: &SectionProps, ext: Option<&crate::xml::El>) {
+pub(crate) fn sectpr_body(w: &mut W, s: &SectionProps, ext: Option<&crate::xml::El>) {
     // WHIQ: kept properties go where CT_SectPr puts them.
     let kept = |w: &mut W, names: &[&str]| {
         for k in ext.iter().flat_map(|e| e.els()).filter(|k| names.contains(&k.name.as_str())) {

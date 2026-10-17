@@ -15,17 +15,20 @@ pub struct Cell {
     /// Content controls around the cell (see [`crate::control`]).
     #[serde(default, skip_serializing_if = "ControlWrap::is_empty")]
     pub controls: ControlWrap,
+    /// WHIQ: markup kept from a file around it (see [`OpaqueWrap`]).
+    #[serde(default, skip_serializing_if = "OpaqueWrap::is_empty")]
+    pub wraps: OpaqueWrap,
 }
 
 impl Cell {
     pub fn empty() -> Cell {
-        Cell { props: CellProps { span: 1, ..Default::default() }, blocks: vec![para_block(Paragraph::new())], controls: ControlWrap::default() }
+        Cell { props: CellProps { span: 1, ..Default::default() }, blocks: vec![para_block(Paragraph::new())], ..Default::default() }
     }
     pub fn with_text(s: &str) -> Cell {
         Cell {
             props: CellProps { span: 1, ..Default::default() },
             blocks: vec![para_block(Paragraph::with_text(s, Default::default()))],
-            controls: ControlWrap::default(),
+            ..Default::default()
         }
     }
     pub fn span(&self) -> usize {
@@ -41,6 +44,9 @@ pub struct Row {
     /// Content controls around the row (repeating sections; see [`crate::control`]).
     #[serde(default, skip_serializing_if = "ControlWrap::is_empty")]
     pub controls: ControlWrap,
+    /// WHIQ: markup kept from a file around it (see [`OpaqueWrap`]).
+    #[serde(default, skip_serializing_if = "OpaqueWrap::is_empty")]
+    pub wraps: OpaqueWrap,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -53,6 +59,43 @@ pub struct Table {
     /// Content controls whose content starts or ends with this table (see [`crate::control`]).
     #[serde(default, skip_serializing_if = "ControlWrap::is_empty")]
     pub controls: ControlWrap,
+    /// WHIQ: markup kept from a file around it (see [`OpaqueWrap`]).
+    #[serde(default, skip_serializing_if = "OpaqueWrap::is_empty")]
+    pub wraps: OpaqueWrap,
+}
+
+/// WHIQ: markup a file has around a table, row or cell that the model has no place for, kept so
+/// saving writes it back: the start tags of wrappers (`w:customXml`), and the markers of a
+/// block-level `mc:AlternateContent` whose chosen branch starts or ends here. `open` is written
+/// before the element, outermost first; `close` after it, innermost first. Each tag's `inner` is
+/// how many of the element's content controls are inside it (of `controls.open`, the last
+/// `inner`; of the controls closing after it, the first `inner`), so wrappers and controls nest
+/// as they did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OpaqueWrap {
+    pub open: Vec<WrapTag>,
+    pub close: Vec<WrapTag>,
+}
+
+impl OpaqueWrap {
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty() && self.close.is_empty()
+    }
+}
+
+/// One tag of an [`OpaqueWrap`]: its format (as for [`crate::InlineObject::Opaque`]: the
+/// `docx-block-open` / `docx-block-close` of a wrapper, `docx-alt-open` / `docx-alt-close` of an
+/// alternate content's chosen branch), its markup and relationships, and its place among the
+/// content controls (`inner`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WrapTag {
+    pub format: String,
+    pub xml: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<crate::graphic::EmbeddedRef>,
+    pub inner: u32,
 }
 
 /// Hard limits that keep hostile input from exhausting memory.
@@ -78,10 +121,10 @@ impl Table {
                             c
                         })
                         .collect(),
-                    controls: ControlWrap::default(),
+                    ..Default::default()
                 })
                 .collect(),
-            controls: ControlWrap::default(),
+            ..Default::default()
         }
     }
 
@@ -113,7 +156,8 @@ impl Table {
         if self.rows.len() >= MAX_ROWS {
             return;
         }
-        let mut row = Row { props: src.props.clone(), cells: Vec::with_capacity(src.cells.len()), controls: ControlWrap::default() };
+        let mut row =
+            Row { props: src.props.clone(), cells: Vec::with_capacity(src.cells.len()), controls: ControlWrap::default(), wraps: Default::default() };
         row.props.header = false;
         for c in &src.cells {
             let mut nc = Cell::empty();

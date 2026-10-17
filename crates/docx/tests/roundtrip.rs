@@ -116,6 +116,8 @@ fn every_char_prop_round_trips() {
         fmt_change: None,
         // WHIQ: unmodelled run properties ride along as markup.
         ext_xml: Some("<w:webHidden/>".into()),
+        // WHIQ: attributes kept from a file (none here: everything is modelled).
+        ext_attrs: None,
     };
     let auto =
         CharProps { color: Some(TextColor::Auto), highlight: Some(Highlight::None), vert_align: Some(VertAlign::Subscript), ..Default::default() };
@@ -192,6 +194,8 @@ fn every_para_prop_round_trips() {
         snap_to_grid: Some(false),
         // WHIQ: unmodelled paragraph properties ride along as markup.
         ext_xml: Some(r#"<w:divId w:val="7"/>"#.into()),
+        // WHIQ: attributes kept from a file (none here: everything is modelled).
+        ext_attrs: None,
     };
     let variants = [
         ParaProps { line_spacing: Some(LineSpacing::AtLeast(14.0)), indent_first: Some(24.0), align: Some(Align::Center), ..Default::default() },

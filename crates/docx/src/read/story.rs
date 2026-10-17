@@ -8,7 +8,7 @@ use wordcraft_doc::effects::{Glow, Shadow, ShapeEffects};
 use wordcraft_doc::graphic::{Embedded, Graphic, GraphicItem, GraphicKind};
 use wordcraft_doc::para::{AltText, Anchor, Float, FloatAlign, NoteKind, ShapeKind, Wrap, WrapText, cap_alt};
 use wordcraft_doc::props::{CharProps, NumChange, PropChange, Rgb, TextColor};
-use wordcraft_doc::table::{Cell, MAX_COLS, MAX_ROWS, Row, Table};
+use wordcraft_doc::table::{Cell, MAX_COLS, MAX_ROWS, OpaqueWrap, Row, Table, WrapTag};
 use wordcraft_doc::{Block, Blocks, InlineObject, Paragraph, PartKind, RevisionKind, Run, para_block};
 
 use super::Reader;
@@ -41,6 +41,8 @@ pub struct RunCtx {
     link: Option<String>,
     ins: Option<u32>,
     del: Option<u32>,
+    /// WHIQ: the enclosing hyperlink's attributes the writer leaves out (`keep.rs`, `^h`).
+    link_attrs: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -106,6 +108,35 @@ fn last_para_mut(out: &mut Blocks, depth: usize) -> Option<&mut Paragraph> {
         Block::Para(p) => Some(p),
         Block::Table(t) if depth < MAX_TABLE_DEPTH => last_para_mut(&mut t.rows.last_mut()?.cells.last_mut()?.blocks, depth + 1),
         Block::Table(_) => None,
+    }
+}
+
+/// The first paragraph of a block list: its first block, or inside a leading table the first
+/// paragraph of its first cell.
+fn first_para_mut(out: &mut Blocks, depth: usize) -> Option<&mut Paragraph> {
+    match Arc::make_mut(out.first_mut()?) {
+        Block::Para(p) => Some(p),
+        Block::Table(t) if depth < MAX_TABLE_DEPTH => first_para_mut(&mut t.rows.first_mut()?.cells.first_mut()?.blocks, depth + 1),
+        Block::Table(_) => None,
+    }
+}
+
+/// WHIQ: markers that waited for a paragraph before kept markup around `inner` (`before`): ahead
+/// of the markup's start, where the first paragraph would have taken them; back to waiting when
+/// `inner` has no paragraph.
+fn put_before(sc: &mut StoryCtx, inner: &mut Blocks, before: Vec<InlineObject>) {
+    if before.is_empty() {
+        return;
+    }
+    match first_para_mut(inner, 0) {
+        Some(p) => {
+            for o in before.into_iter().rev() {
+                let _ = p.insert_object(0, o, &CharProps::default());
+            }
+        }
+        None => {
+            sc.pending.splice(0..0, before);
+        }
     }
 }
 
@@ -220,11 +251,8 @@ impl Reader<'_> {
                 // WHIQ: the wrapper's tags are kept around its paragraphs.
                 "w:customXml" | "w:smartTag" => self.read_block_wrapper(sc, e, rels, out, depth),
                 "w:ins" | "w:moveTo" => self.read_blocks(sc, e, rels, out, depth + 1),
-                "mc:AlternateContent" => {
-                    if let Some(c) = children_of_choice(e) {
-                        self.read_blocks(sc, c, rels, out, depth + 1);
-                    }
-                }
+                // WHIQ: the chosen branch is read, and the whole element kept around it.
+                "mc:AlternateContent" => self.read_block_alternate(sc, e, rels, out, depth),
                 "w:bookmarkStart" | "w:bookmarkEnd" | "w:commentRangeStart" | "w:commentRangeEnd" | "w:permStart" | "w:permEnd" => {
                     if let Some(o) = self.marker(e) {
                         sc.pending.push(o);
@@ -246,19 +274,74 @@ impl Reader<'_> {
     /// blocks, with its start tag kept at the start of the first paragraph and its end tag at the
     /// end of the last. Content that starts or ends with a table is unwrapped instead.
     fn read_block_wrapper(&mut self, sc: &mut StoryCtx, e: &El, rels: &Rels, out: &mut Blocks, depth: usize) {
+        let before = std::mem::take(&mut sc.pending);
         let mut inner = Blocks::new();
         self.read_blocks(sc, e, rels, &mut inner, depth + 1);
-        let paras = matches!(inner.first().map(|b| &**b), Some(Block::Para(_))) && matches!(inner.last().map(|b| &**b), Some(Block::Para(_)));
-        if paras && let Some((open, close)) = self.wrapper_objects(e, true) {
-            if let Some(Block::Para(p)) = inner.first_mut().map(Arc::make_mut) {
-                let props = p.props_of_char(0).clone();
-                let _ = p.insert_object(0, open, &props);
+        if !inner.is_empty()
+            && let Some((open, close)) = self.wrapper_objects(e, true)
+        {
+            wrap_blocks(&mut inner, open, close);
+        }
+        put_before(sc, &mut inner, before);
+        out.extend(inner);
+    }
+
+    /// WHIQ: a block-level `mc:AlternateContent`: the chosen branch's blocks, between markers
+    /// (`docx-alt-open` / `docx-alt-close`) holding the whole element with the chosen branch's
+    /// content left out (a slot naming the markers and a fingerprint of the blocks). Saving writes
+    /// every branch back, the chosen one from the model, while the blocks are unchanged; edited,
+    /// they are written alone. A branch with nothing the model reads keeps the whole element as
+    /// unknown block markup.
+    fn read_block_alternate(&mut self, sc: &mut StoryCtx, e: &El, rels: &Rels, out: &mut Blocks, depth: usize) {
+        let Some(chosen) = children_of_choice(e) else { return };
+        let before = std::mem::take(&mut sc.pending);
+        let mut inner = Blocks::new();
+        self.read_blocks(sc, chosen, rels, &mut inner, depth + 1);
+        if inner.is_empty() {
+            sc.pending = before;
+            if let Some(o) = self.opaque(e, rels, crate::write::passthrough::BLOCK, false) {
+                sc.pending.push(o);
             }
-            if let Some(Block::Para(p)) = inner.last_mut().map(Arc::make_mut) {
+            return;
+        }
+        // Unknown block markup at the end of the branch stays in it.
+        let kept: Vec<InlineObject> = std::mem::take(&mut sc.pending);
+        let (blocky, rest): (Vec<_>, Vec<_>) =
+            kept.into_iter().partition(|o| matches!(o, InlineObject::Opaque { format, .. } if format == crate::write::passthrough::BLOCK));
+        sc.pending = rest;
+        if !blocky.is_empty()
+            && let Some(Block::Para(p)) = inner.last_mut().map(Arc::make_mut)
+        {
+            for o in blocky {
                 let (at, props) = (p.len(), p.runs.last().map(|r| r.props.clone()).unwrap_or_else(|| p.mark.clone()));
-                let _ = p.insert_object(at, close, &props);
+                let _ = p.insert_object(at, o, &props);
             }
         }
+        self.alt_seq += 1;
+        let id = format!("a{}", self.alt_seq);
+        let slot = El { name: "w:wordcraftSlot".into(), attrs: vec![("w:n".into(), id.clone()), ("w:fp".into(), "?".into())], kids: Vec::new() };
+        let kids = e
+            .kids
+            .iter()
+            .map(|k| match k {
+                Node::El(b) if std::ptr::eq(b, chosen) => {
+                    Node::El(El { name: b.name.clone(), attrs: b.attrs.clone(), kids: vec![Node::El(slot.clone())] })
+                }
+                other => other.clone(),
+            })
+            .collect();
+        let shell = El { name: e.name.clone(), attrs: e.attrs.clone(), kids };
+        let Some(InlineObject::Opaque { xml, refs, .. }) = self.opaque(&shell, rels, crate::write::passthrough::ALT_OPEN, false) else {
+            put_before(sc, &mut inner, before);
+            out.extend(inner);
+            return;
+        };
+        let close = InlineObject::Opaque { format: crate::write::passthrough::ALT_CLOSE.into(), xml: id, text: String::new(), refs: Vec::new() };
+        let open = InlineObject::Opaque { format: crate::write::passthrough::ALT_OPEN.into(), xml, text: String::new(), refs };
+        wrap_blocks(&mut inner, open, close);
+        put_before(sc, &mut inner, before);
+        let fp = crate::write::passthrough::blocks_fingerprint(&self.doc, &inner);
+        set_alt_fingerprint(&mut inner, &fp);
         out.extend(inner);
     }
 
@@ -415,6 +498,8 @@ impl Reader<'_> {
                 para.section = Some(Box::new(self.read_section(s, rels)));
             }
         }
+        // WHIQ: the paragraph's own attributes the writer leaves out (`keep.rs`).
+        crate::keep::add(&mut para.props.ext_attrs, &crate::keep::capture_tag("^p", e, &[]));
         let ctx = RunCtx::default();
         self.read_inline_children(sc, &mut pb, e, rels, &ctx, depth + 1);
         self.spill_fields(sc, &mut pb);
@@ -492,6 +577,8 @@ impl Reader<'_> {
                     (None, Some(a)) => Some(format!("#{a}")),
                     (None, None) => ctx.link.clone(),
                 };
+                let kept = crate::keep::capture_tag("^h", k, &["r:id", "w:anchor", "w:history"]);
+                c.link_attrs = (!kept.is_empty()).then_some(kept);
                 self.read_inline_children(sc, pb, k, rels, &c, depth + 1);
             }
             "w:ins" | "w:moveTo" => {
@@ -604,17 +691,20 @@ impl Reader<'_> {
         p.ins = ctx.ins;
         p.del = ctx.del;
         p.fmt_change = self.rpr_change(rpr);
+        crate::keep::add(&mut p.ext_attrs, ctx.link_attrs.as_deref().unwrap_or(""));
         p
     }
     fn run_props_none(&self, ctx: &RunCtx) -> CharProps {
-        CharProps { link: ctx.link.clone(), ins: ctx.ins, del: ctx.del, ..Default::default() }
+        CharProps { link: ctx.link.clone(), ins: ctx.ins, del: ctx.del, ext_attrs: ctx.link_attrs.clone(), ..Default::default() }
     }
 
     fn read_run(&mut self, sc: &mut StoryCtx, pb: &mut PB, r: &El, rels: &Rels, ctx: &RunCtx, depth: usize) {
-        let props = match r.child("w:rPr") {
+        let mut props = match r.child("w:rPr") {
             Some(p) => self.run_props(p, ctx),
             None => self.run_props_none(ctx),
         };
+        // WHIQ: the run's own attributes the writer leaves out (`keep.rs`).
+        crate::keep::add(&mut props.ext_attrs, &crate::keep::capture_tag("^r", r, &[]));
         let mut note: Option<(NoteKind, u32, Option<String>)> = None;
         for k in r.els() {
             self.read_run_child(sc, pb, k, &props, rels, &mut note, depth + 1);
@@ -707,17 +797,34 @@ impl Reader<'_> {
             },
             "w:drawing" => {
                 if let Some(o) = self.read_drawing(sc, k, rels) {
+                    // WHIQ: what the writer leaves out of the drawing comes back (`keep_drawing`);
+                    // a drawing with alternate content inside (a picture with a fallback picture)
+                    // is kept whole, its parts with it, and written back while unchanged.
+                    if k.find("mc:AlternateContent").is_some() {
+                        self.keep_alternate(k, rels, &o);
+                    } else {
+                        self.keep_drawing(k, rels, &o);
+                    }
                     self.emit_obj(sc, pb, o, props);
+                } else if let Some(o) = self.opaque(k, rels, "docx", true) {
+                    // WHIQ: a drawing the reader can't show is kept as it is.
+                    pb.push_obj(o, props);
                 }
             }
             "w:pict" => {
-                if let Some(o) = self.read_vml(sc, k, rels) {
+                // WHIQ: a horizontal rule (`o:hr`) has no object to be: it is kept as it is.
+                let rule = k.els().any(|v| v.attr("o:hr").is_some_and(|x| matches!(x, "t" | "true" | "1")));
+                if rule && let Some(o) = self.opaque(k, rels, "docx", true) {
+                    pb.push_obj(o, props);
+                } else if let Some(o) = self.read_vml(sc, k, rels) {
                     self.emit_obj(sc, pb, o, props);
                 }
             }
             "w:object" => {
                 if let Some(o) = self.read_object(sc, k, rels) {
                     self.emit_obj(sc, pb, o, props);
+                } else if let Some(o) = self.opaque(k, rels, "docx", true) {
+                    pb.push_obj(o, props);
                 }
             }
             "w:contentPart" => {
@@ -1623,11 +1730,17 @@ impl Reader<'_> {
         let mut table = Table::default();
         if let Some(p) = t.child("w:tblPr") {
             table.props = self.pc.tblpr(p);
+            // WHIQ: what isn't modelled rides along as markup.
+            table.props.ext_xml = super::passthrough::table_ext(p, "tbl");
             if let Some(ch) = p.child("w:tblPrChange") {
                 let old = ch.child("w:tblPr").map(|o| self.pc.tblpr(o)).unwrap_or_default();
                 table.props.fmt_change = PropChange::boxed(self.revision(RevisionKind::Format, ch), old);
             }
         }
+        // WHIQ: attributes the writer would leave out are kept (`keep.rs`).
+        let mut sim = crate::xml::W { s: String::new() };
+        crate::write::props::tblpr(&mut sim, &table.props, None);
+        table.props.ext_attrs = crate::keep::join(&[&keep_below(t, &["w:tblPr"], &sim.s), &crate::keep::capture_tag("^t", t, &[])]);
         if let Some(g) = t.child("w:tblGrid") {
             table.grid = g
                 .children("w:gridCol")
@@ -1636,17 +1749,23 @@ impl Reader<'_> {
                 .collect();
         }
         let mut rows = Vec::new();
-        collect(t, "w:tr", &mut rows, &mut Vec::new(), 0);
-        for (tr, row_controls) in rows.into_iter().take(MAX_ROWS) {
-            let mut row = Row { props: tr.child("w:trPr").map(trpr).unwrap_or_default(), cells: Vec::new(), controls: row_controls };
+        collect(t, "w:tr", &mut rows, &mut Vec::new(), &mut Vec::new(), 0);
+        for g in rows.into_iter().take(MAX_ROWS) {
+            let tr = g.el;
+            let mut row = Row { props: tr.child("w:trPr").map(trpr).unwrap_or_default(), cells: Vec::new(), controls: g.controls, wraps: g.wraps };
+            row.props.ext_xml = tr.child("w:trPr").and_then(|p| super::passthrough::table_ext(p, "tr"));
             row.props.exceptions = tr.child("w:tblPrEx").map(|e| Box::new(self.pc.tblpr(e)));
             if let Some(ch) = tr.child("w:trPr").and_then(|p| p.child("w:trPrChange")) {
                 let old = ch.child("w:trPr").map(trpr).unwrap_or_default();
                 row.props.fmt_change = PropChange::boxed(self.revision(RevisionKind::Format, ch), old);
             }
+            let mut sim = crate::xml::W { s: String::new() };
+            crate::write::props::trpr(&mut sim, &row.props, None);
+            row.props.ext_attrs = crate::keep::join(&[&keep_below(tr, &["w:tblPrEx", "w:trPr"], &sim.s), &crate::keep::capture_tag("^w", tr, &[])]);
             let mut tcs = Vec::new();
-            collect(tr, "w:tc", &mut tcs, &mut Vec::new(), 0);
-            for (tc, cell_controls) in tcs.into_iter().take(MAX_COLS) {
+            collect(tr, "w:tc", &mut tcs, &mut Vec::new(), &mut Vec::new(), 0);
+            for g in tcs.into_iter().take(MAX_COLS) {
+                let tc = g.el;
                 let (mut props, hcont) = tc
                     .child("w:tcPr")
                     .map(|p| tcpr(&self.pc, p))
@@ -1659,10 +1778,14 @@ impl Reader<'_> {
                     prev.props.span = (prev.props.span + props.span.max(1)).min(63);
                     continue;
                 }
+                props.ext_xml = tc.child("w:tcPr").and_then(|p| super::passthrough::table_ext(p, "tc"));
+                let mut sim = crate::xml::W { s: String::new() };
+                crate::write::props::tcpr(&mut sim, &props, None);
+                props.ext_attrs = crate::keep::join(&[&keep_below(tc, &["w:tcPr"], &sim.s), &crate::keep::capture_tag("^c", tc, &[])]);
                 let mut blocks = Blocks::new();
                 self.read_blocks(sc, tc, rels, &mut blocks, depth + 4);
                 self.flush_pending(sc, &mut blocks);
-                row.cells.push(Cell { props, blocks, controls: cell_controls });
+                row.cells.push(Cell { props, blocks, controls: g.controls, wraps: g.wraps });
             }
             if !row.cells.is_empty() {
                 table.rows.push(row);
@@ -1679,26 +1802,111 @@ impl Reader<'_> {
     }
 }
 
+/// WHIQ: put the start and end objects of kept markup around `inner`: in the first paragraph (or
+/// before the first table) and the last paragraph (or after the last table).
+fn wrap_blocks(inner: &mut Blocks, open: InlineObject, close: InlineObject) {
+    let tag = |o: InlineObject, inner: u32| match o {
+        InlineObject::Opaque { format, xml, refs, .. } => Some(WrapTag { format, xml, refs, inner }),
+        _ => None,
+    };
+    if let Some(first) = inner.first_mut() {
+        match Arc::make_mut(first) {
+            Block::Para(p) => {
+                let props = p.props_of_char(0).clone();
+                let _ = p.insert_object(0, open, &props);
+            }
+            Block::Table(t) => {
+                let n = t.controls.open.len() as u32;
+                if let Some(x) = tag(open, n) {
+                    t.wraps.open.insert(0, x);
+                }
+            }
+        }
+    }
+    if let Some(last) = inner.last_mut() {
+        match Arc::make_mut(last) {
+            Block::Para(p) => {
+                let (at, props) = (p.len(), p.runs.last().map(|r| r.props.clone()).unwrap_or_else(|| p.mark.clone()));
+                let _ = p.insert_object(at, close, &props);
+            }
+            Block::Table(t) => {
+                let n = t.controls.close;
+                if let Some(x) = tag(close, n) {
+                    t.wraps.close.push(x);
+                }
+            }
+        }
+    }
+}
+
+/// WHIQ: write `fp` into the slot of the alternate content marker that opens `inner`.
+fn set_alt_fingerprint(inner: &mut Blocks, fp: &str) {
+    let fix = |xml: &mut String| *xml = xml.replacen("w:fp=\"?\"", &format!("w:fp=\"{fp}\""), 1);
+    let Some(first) = inner.first_mut() else { return };
+    match Arc::make_mut(first) {
+        Block::Para(p) => {
+            if let Some(InlineObject::Opaque { xml, .. }) = p.objects.iter_mut().find(|o| matches!(o, InlineObject::Opaque { format, xml, .. } if format == crate::write::passthrough::ALT_OPEN && xml.contains("w:fp=\"?\""))) {
+                fix(xml);
+            }
+        }
+        Block::Table(t) => {
+            if let Some(x) = t.wraps.open.iter_mut().find(|x| x.format == crate::write::passthrough::ALT_OPEN && x.xml.contains("w:fp=\"?\"")) {
+                fix(&mut x.xml);
+            }
+        }
+    }
+}
+
+/// WHIQ: [`crate::keep::capture`] of the children of `e` named in `names` (the properties the
+/// writer wrote as `written`).
+fn keep_below(e: &El, names: &[&str], written: &str) -> String {
+    let kids = e.els().filter(|k| names.contains(&k.name.as_str())).cloned().map(Node::El).collect();
+    crate::keep::capture(&El { name: e.name.clone(), attrs: Vec::new(), kids }, written)
+}
+
+/// A row or cell [`collect`] found, with the content controls that open before it and how many
+/// close after it, and (WHIQ) the custom XML wrappers around it.
+struct Gathered<'a> {
+    el: &'a El,
+    controls: ControlWrap,
+    wraps: OpaqueWrap,
+}
+
 /// Gather `name` children (rows, cells), looking through `w:sdt`/`w:customXml` wrappers; each
 /// with the content controls that open before it and how many close after it. `pending` holds
-/// controls opened but not yet given to an element.
-fn collect<'a>(e: &'a El, name: &str, out: &mut Vec<(&'a El, ControlWrap)>, pending: &mut Vec<ContentControl>, depth: usize) {
+/// controls opened but not yet given to an element; `pending_wraps` the same for wrappers (WHIQ:
+/// their tags are kept around the element).
+fn collect<'a>(
+    e: &'a El,
+    name: &str,
+    out: &mut Vec<Gathered<'a>>,
+    pending: &mut Vec<ContentControl>,
+    pending_wraps: &mut Vec<WrapTag>,
+    depth: usize,
+) {
     if depth > 8 {
         return;
     }
     for k in e.els() {
         if k.name == name {
-            out.push((k, ControlWrap { open: std::mem::take(pending), close: 0 }));
+            let open = std::mem::take(pending);
+            // A pending wrapper's `inner` holds how many controls were open before it: the rest
+            // are inside it.
+            let mut wraps = std::mem::take(pending_wraps);
+            for t in &mut wraps {
+                t.inner = (open.len() as u32).saturating_sub(t.inner);
+            }
+            out.push(Gathered { el: k, controls: ControlWrap { open, close: 0 }, wraps: OpaqueWrap { open: wraps, close: Vec::new() } });
         } else if k.name == "w:sdt" {
             if let Some(c) = k.child("w:sdtContent") {
                 let mut ctl = super::sdt::sdt_pr(k.child("w:sdtPr"), true);
                 ctl.end_pr_xml = super::sdt::sdt_end_pr(k.child("w:sdtEndPr"));
                 let before = out.len();
                 pending.push(ctl);
-                collect(c, name, out, pending, depth + 1);
+                collect(c, name, out, pending, pending_wraps, depth + 1);
                 let grew = out.len() > before;
                 match out.last_mut() {
-                    Some((_, w)) if grew => w.close = w.close.saturating_add(1),
+                    Some(g) if grew => g.controls.close = g.controls.close.saturating_add(1),
                     // Nothing inside: the control goes (as before).
                     _ => {
                         pending.pop();
@@ -1706,7 +1914,31 @@ fn collect<'a>(e: &'a El, name: &str, out: &mut Vec<(&'a El, ControlWrap)>, pend
                 }
             }
         } else if k.name == "w:customXml" {
-            collect(k, name, out, pending, depth + 1);
+            // WHIQ: the wrapper's tags are kept around the first and last element inside it.
+            let tags = super::passthrough::wrapper_tags(k, &["w:customXmlPr"]);
+            let before = out.len();
+            if let Some((open, _)) = &tags {
+                let before_it = pending.len() as u32;
+                pending_wraps.push(WrapTag {
+                    format: crate::write::passthrough::BLOCK_OPEN.into(),
+                    xml: open.clone(),
+                    refs: Vec::new(),
+                    inner: before_it,
+                });
+            }
+            collect(k, name, out, pending, pending_wraps, depth + 1);
+            if let Some((_, close)) = tags {
+                let grew = out.len() > before;
+                match out.last_mut() {
+                    Some(g) if grew => {
+                        let inner = g.controls.close;
+                        g.wraps.close.push(WrapTag { format: crate::write::passthrough::BLOCK_CLOSE.into(), xml: close, refs: Vec::new(), inner });
+                    }
+                    _ => {
+                        pending_wraps.pop();
+                    }
+                }
+            }
         }
     }
 }

@@ -140,6 +140,40 @@ const SECTPR_KNOWN: &[&str] = &[
     "w:sectPrChange",
 ];
 
+/// Table, row and cell properties the reader models (or reads elsewhere).
+const TBLPR_KNOWN: &[&str] = &[
+    "w:tblStyle",
+    "w:tblpPr",
+    "w:tblOverlap",
+    "w:bidiVisual",
+    "w:tblW",
+    "w:jc",
+    "w:tblInd",
+    "w:tblBorders",
+    "w:shd",
+    "w:tblLayout",
+    "w:tblCellMar",
+    "w:tblLook",
+    "w:tblCaption",
+    "w:tblDescription",
+    "w:tblPrChange",
+];
+const TRPR_KNOWN: &[&str] = &["w:cantSplit", "w:gridAfter", "w:gridBefore", "w:trHeight", "w:tblHeader", "w:wAfter", "w:wBefore", "w:trPrChange"];
+const TCPR_KNOWN: &[&str] = &[
+    "w:gridSpan",
+    "w:hMerge",
+    "w:hideMark",
+    "w:noWrap",
+    "w:shd",
+    "w:tcBorders",
+    "w:tcMar",
+    "w:tcW",
+    "w:textDirection",
+    "w:vAlign",
+    "w:vMerge",
+    "w:tcPrChange",
+];
+
 /// Longest kept property markup on one run or paragraph.
 const MAX_EXT: usize = 64 * 1024;
 
@@ -177,6 +211,23 @@ pub fn ppr_ext(ppr: &El) -> Option<String> {
     let mut s = String::new();
     for k in ppr.els() {
         if !PPR_KNOWN.contains(&k.name.as_str()) && nameable(k) {
+            s.push_str(&k.to_xml_ext());
+        }
+    }
+    (!s.is_empty() && s.len() <= MAX_EXT).then_some(s)
+}
+
+/// The unknown children of `pr` (`w:tblPr`, `w:trPr`, `w:tcPr`: `which` = `tbl`, `tr`, `tc`), as
+/// markup (`None` when there are none).
+pub fn table_ext(pr: &El, which: &str) -> Option<String> {
+    let known = match which {
+        "tbl" => TBLPR_KNOWN,
+        "tr" => TRPR_KNOWN,
+        _ => TCPR_KNOWN,
+    };
+    let mut s = String::new();
+    for k in pr.els() {
+        if !known.contains(&k.name.as_str()) && nameable(k) {
             s.push_str(&k.to_xml_ext());
         }
     }
@@ -298,6 +349,29 @@ impl Reader<'_> {
         self.doc.passthrough.insert(key, std::sync::Arc::new(bytes));
     }
 
+    /// WHIQ: keep drawing `d` (`w:drawing`) that `obj` was read from, its text boxes' content
+    /// left out, under the object's fingerprint: saving the object unchanged gives the written
+    /// drawing back the attributes and elements the writer has no field for (`wp14:anchorId`,
+    /// `a:graphicFrameLocks`, extension lists…; see `write/passthrough.rs` `merge_kept_drawing`).
+    pub(super) fn keep_drawing(&mut self, d: &El, rels: &Rels, obj: &InlineObject) {
+        const MAX_KEPT_DRAWING: usize = 256 * 1024;
+        let Some(key) = crate::write::passthrough::fingerprint(&self.doc, obj) else { return };
+        let key = key.replacen(crate::write::passthrough::ALT_PREFIX, crate::write::passthrough::DRAWING_PREFIX, 1);
+        let mut copy = d.clone();
+        strip_text_boxes(&mut copy, 0);
+        // External relationships (a picture's hyperlink) come along; internal ones are the
+        // writer's (its parts are written from the model), so markup using them isn't added back.
+        let mut refs = Vec::new();
+        mark_relationships(&mut copy, rels, &mut refs, 0);
+        let Some(xml) = standalone(&copy).filter(|x| x.len() <= MAX_KEPT_DRAWING) else { return };
+        if self.opaque_bytes.saturating_add(xml.len()) > MAX_OPAQUE_TOTAL {
+            return;
+        }
+        self.opaque_bytes += xml.len();
+        let bytes = crate::write::passthrough::encode_kept(&xml, &refs);
+        self.doc.passthrough.insert(key, std::sync::Arc::new(bytes));
+    }
+
     /// The `docx-open` / `docx-close` objects of an inline wrapper (`w:customXml`, `w:smartTag`,
     /// `w:bdo`, `w:dir`).
     pub(super) fn wrapper_objects(&mut self, e: &El, block: bool) -> Option<(InlineObject, InlineObject)> {
@@ -307,6 +381,51 @@ impl Reader<'_> {
         let (fo, fc) = if block { ("docx-block-open", "docx-block-close") } else { ("docx-open", "docx-close") };
         let mk = |format: &str, xml: String| InlineObject::Opaque { format: format.into(), xml, text: String::new(), refs: Vec::new() };
         Some((mk(fo, open), mk(fc, close)))
+    }
+}
+
+/// A relationship id the writer owns, in a kept drawing (see `merge_kept`).
+pub const INTERNAL_REL: &str = "wordcraft-internal";
+
+/// In kept drawing markup: external relationships' ids go into `refs`; internal ones become
+/// [`INTERNAL_REL`].
+fn mark_relationships(e: &mut El, rels: &Rels, refs: &mut Vec<EmbeddedRef>, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    for (k, v) in e.attrs.iter_mut() {
+        if !k.starts_with("r:") {
+            continue;
+        }
+        match rels.by_id(v) {
+            Some(rel) if rel.external => {
+                if !refs.iter().any(|r| r.id == *v) {
+                    refs.push(EmbeddedRef { id: v.clone(), kind: rel.kind.clone(), target: rel.target.clone(), external: true });
+                }
+            }
+            _ => *v = INTERNAL_REL.into(),
+        }
+    }
+    for k in e.kids.iter_mut() {
+        if let Node::El(c) = k {
+            mark_relationships(c, rels, refs, depth + 1);
+        }
+    }
+}
+
+/// Empty every `w:txbxContent` under `e` (a text box's content is written from the model).
+fn strip_text_boxes(e: &mut El, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if e.name == "w:txbxContent" {
+        e.kids.clear();
+        return;
+    }
+    for k in e.kids.iter_mut() {
+        if let Node::El(c) = k {
+            strip_text_boxes(c, depth + 1);
+        }
     }
 }
 

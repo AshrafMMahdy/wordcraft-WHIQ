@@ -143,6 +143,18 @@ impl PropCtx {
     }
 
     pub fn rpr(&self, e: &El) -> CharProps {
+        let mut c = self.rpr_model(e);
+        // WHIQ: attributes the writer would leave out, and elements it wouldn't write that hold
+        // nothing the model reads, are kept (`keep.rs`).
+        let mut sim = crate::xml::W { s: String::new() };
+        crate::write::props::rpr_inner(&mut sim, &c);
+        let inert = |i: usize| self.rpr_model(&crate::keep::without_child(e, i)) == c;
+        let missing = crate::keep::capture_missing(e, &sim.s, crate::keep::RPR_ELSEWHERE, &inert);
+        c.ext_attrs = crate::keep::join(&[&crate::keep::capture(e, &sim.s), &missing]);
+        c
+    }
+
+    fn rpr_model(&self, e: &El) -> CharProps {
         let mut c = CharProps::default();
         for k in e.els() {
             match k.name.as_str() {
@@ -245,6 +257,19 @@ impl PropCtx {
 
     /// `w:pPr` (without `w:sectPr`; `w:rPr` is the paragraph mark, returned separately).
     pub fn ppr(&self, e: &El) -> (ParaProps, CharProps) {
+        let (mut p, mark) = self.ppr_model(e);
+        // WHIQ: attributes the writer would leave out, and elements it wouldn't write that hold
+        // nothing the model reads, are kept (`keep.rs`).
+        let mut sim = crate::xml::W { s: String::new() };
+        crate::write::props::ppr_inner(&mut sim, &p, false, None);
+        let base = (p.clone(), mark.clone());
+        let inert = |i: usize| self.ppr_model(&crate::keep::without_child(e, i)) == base;
+        let missing = crate::keep::capture_missing(e, &sim.s, crate::keep::PPR_ELSEWHERE, &inert);
+        p.ext_attrs = crate::keep::join(&[&crate::keep::capture(e, &sim.s), &missing]);
+        (p, mark)
+    }
+
+    fn ppr_model(&self, e: &El) -> (ParaProps, CharProps) {
         // (`w:numPr` with a level and no list sets `LEVEL_ONLY`, resolved by the caller.)
         let mut p = ParaProps::default();
         let mut mark = CharProps::default();
@@ -709,6 +734,10 @@ pub fn sectpr(e: &El) -> (SectionProps, Vec<HfRef>) {
             _ => {}
         }
     }
+    // WHIQ: attributes the writer would leave out are kept (`keep.rs`).
+    let mut sim = crate::xml::W { s: String::new() };
+    crate::write::story::sectpr_body(&mut sim, &s, None);
+    s.ext_attrs = crate::keep::join(&[&crate::keep::capture(e, &sim.s), &crate::keep::capture_tag("^s", e, &[])]);
     (s, refs)
 }
 

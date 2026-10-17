@@ -108,6 +108,8 @@ pub(crate) struct Reader<'p> {
     pub txbx_links: Vec<(u32, u32, u32)>,
     /// WHIQ: bytes of unknown markup kept so far (see `passthrough`), bounded.
     opaque_bytes: usize,
+    /// WHIQ: block-level alternate contents read so far (their markers' ids).
+    alt_seq: u32,
 }
 
 /// The package path that internal relationship `id` points at, if it has type `kind` (an `rt`
@@ -145,6 +147,8 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
     let rels = pkg.rels(&main);
     let mut doc = Document::new();
     doc.body.clear();
+    // WHIQ: the root's markup-compatibility attributes are kept (`keep.rs`).
+    crate::keep::note_root_compat(&mut doc, pkg.get(&main));
     let mut r = Reader {
         pkg,
         doc,
@@ -172,6 +176,7 @@ pub(crate) fn read_opened(pkg: &Package) -> Result<Document, DocxError> {
         embedded: EmbeddedManifest::default(),
         txbx_links: Vec::new(),
         opaque_bytes: 0,
+        alt_seq: 0,
     };
     r.pc.major_font = r.doc.settings.major_font.clone();
     r.pc.minor_font = r.doc.settings.minor_font.clone();
@@ -627,6 +632,10 @@ impl Reader<'_> {
             RevisionKind::Delete => 1,
             RevisionKind::Format => 2,
         };
+        // WHIQ: attributes beyond the ones read (`w16du:dateUtc`) are kept for the author and date.
+        if let Some(x) = crate::keep::extra_attrs(e, &["w:id", "w:author", "w:date", "w:name", "w:original"]) {
+            crate::keep::note_revision(&mut self.doc, &author, &date, &x);
+        }
         let key = (k, author.clone(), date.clone(), move_name.clone());
         if let Some(i) = self.revs.get(&key) {
             return *i;

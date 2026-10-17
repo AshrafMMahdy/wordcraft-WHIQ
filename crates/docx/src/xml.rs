@@ -121,6 +121,15 @@ fn unknown_prefix(uri: &[u8]) -> String {
     }
 }
 
+/// WHIQ: the prefix the writer uses for namespace `uri`: its canonical one, or `xhhhhhhhh` for one
+/// no reader here knows (see [`El::to_xml_ext`]); `None` when it can't be named.
+pub fn written_prefix_for_uri(uri: &str) -> Option<String> {
+    match prefix_for(uri.as_bytes(), &[]) {
+        "?" => written_prefix(&unknown_prefix(uri.as_bytes())),
+        p => Some(p.to_string()),
+    }
+}
+
 /// The URI of an unknown namespace named `?hhhhhhhh` by [`unknown_prefix`] (`hash` without the `?`).
 pub fn unknown_uri(hash: &str) -> Option<String> {
     unknown_namespaces().lock().ok()?.get(hash).cloned()

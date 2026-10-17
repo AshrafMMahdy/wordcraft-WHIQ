@@ -625,7 +625,8 @@ impl<'a> Builder<'a> {
         }
         tb.rows.clear();
         for r in rows {
-            let mut row = wordcraft_doc::Row { props: RowProps::default(), cells: Vec::new(), controls: Default::default() };
+            let mut row =
+                wordcraft_doc::Row { props: RowProps::default(), cells: Vec::new(), controls: Default::default(), wraps: Default::default() };
             row.props.header = !r.is_empty() && r.iter().all(|c| c.header);
             let mut g = 0usize;
             for c in r.iter().take(wordcraft_doc::table::MAX_COLS) {
@@ -647,6 +648,7 @@ impl<'a> Builder<'a> {
                     props: CellProps { width: Some(w), span: span as u32, vmerge, shading: c.shading, borders: c.borders, ..Default::default() },
                     blocks,
                     controls: Default::default(),
+                    wraps: Default::default(),
                 });
             }
             if row.cells.is_empty() {

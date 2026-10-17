@@ -693,7 +693,9 @@ fn split_table(s: &mut Session, _: &Value) -> CmdResult {
     // Content controls closing after the table now close after its second part.
     let close = std::mem::take(&mut t.controls.close);
     let controls = wordcraft_doc::ControlWrap { open: Vec::new(), close };
-    let tail = Table { props: t.props.clone(), grid: t.grid.clone(), rows: tail_rows, controls };
+    // WHIQ: so do the ends of markup kept from the file around it.
+    let wraps = wordcraft_doc::table::OpaqueWrap { open: Vec::new(), close: std::mem::take(&mut t.wraps.close) };
+    let tail = Table { props: t.props.clone(), grid: t.grid.clone(), rows: tail_rows, controls, wraps };
     let after = tp.with_last(tp.last() + 1);
     s.doc.insert_block(story, &after, Block::Para(Paragraph::new()))?;
     s.doc.insert_block(story, &after.with_last(after.last() + 1), Block::Table(tail))?;

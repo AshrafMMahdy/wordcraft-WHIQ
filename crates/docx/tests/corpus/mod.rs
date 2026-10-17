@@ -386,6 +386,97 @@ pub fn misc() -> Vec<u8> {
     )
 }
 
+/// A block-level `mc:AlternateContent`: a choice in an ignorable future namespace holding two
+/// paragraphs and a table, and a fallback paragraph (ECMA-376 Part 3 §10.2). Both branches must
+/// survive; the fallback is what WordCraft shows (it understands no `fut2` requirement).
+pub fn block_alternate() -> Vec<u8> {
+    let body = concat!(
+        r#"<w:p><w:r><w:t>Before the alternate content.</w:t></w:r></w:p>"#,
+        // Markup waiting for the next paragraph stays ahead of the alternate content.
+        r#"<fut:beforeAlternate fut:n="1"/>"#,
+        r#"<mc:AlternateContent xmlns:fut2="urn:example:future-blocks"><mc:Choice Requires="fut2"><fut2:region fut2:kind="sidebar"/><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Choice paragraph one.</w:t></w:r></w:p><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Choice cell.</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Choice paragraph two.</w:t></w:r></w:p></mc:Choice><mc:Fallback><w:p><w:r><w:t>Fallback paragraph.</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+        r#"<w:p><w:r><w:t>Between.</w:t></w:r></w:p>"#,
+        // A choice WordCraft understands (w14): it is shown, the fallback kept.
+        r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>w14 choice table.</w:t></w:r></w:p></w:tc></w:tr></w:tbl></mc:Choice><mc:Fallback><w:p><w:r><w:t>Fallback for the table.</w:t></w:r></w:p></mc:Fallback></mc:AlternateContent>"#,
+        r#"<w:p><w:r><w:t>After the alternate content.</w:t></w:r></w:p>"#
+    );
+    package(MAIN, body, &[], &[], vec![])
+}
+
+/// `w:customXml` around a table, around paragraphs and a table together, around a row and a
+/// cell, and around runs (ECMA-376 §17.5.1).
+pub fn custom_xml_tables() -> Vec<u8> {
+    let tbl = |t: &str| {
+        format!(
+            r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+        )
+    };
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:t>Custom XML around tables.</w:t></w:r></w:p>"#,
+            r#"<w:customXml w:uri="urn:example:invoice" w:element="lines"><w:customXmlPr><w:attr w:name="n" w:val="1"/></w:customXmlPr>{t1}</w:customXml>"#,
+            r#"<w:p><w:r><w:t>Between tables.</w:t></w:r></w:p>"#,
+            r#"<fut:beforeWrapper/>"#,
+            r#"<w:customXml w:uri="urn:example:invoice" w:element="section"><w:p><w:r><w:t>Section heading.</w:t></w:r></w:p>{t2}</w:customXml>"#,
+            r#"<w:customXml w:uri="urn:example:invoice" w:element="outer"><w:customXml w:uri="urn:example:invoice" w:element="inner">{t3}</w:customXml><w:p><w:r><w:t>After the inner table.</w:t></w:r></w:p></w:customXml>"#,
+            r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid><w:customXml w:uri="urn:example:invoice" w:element="row"><w:tr><w:customXml w:uri="urn:example:invoice" w:element="cell"><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Row and cell</w:t></w:r></w:p></w:tc></w:customXml><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Plain cell</w:t></w:r></w:p></w:tc></w:tr></w:customXml></w:tbl>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">Runs: </w:t></w:r><w:customXml w:uri="urn:example:invoice" w:element="total"><w:r><w:t>42</w:t></w:r><w:customXml w:element="currency"><w:r><w:t xml:space="preserve"> EUR</w:t></w:r></w:customXml></w:customXml></w:p>"#,
+        ),
+        t1 = tbl("Table in custom XML."),
+        t2 = tbl("Table after a paragraph."),
+        t3 = tbl("Nested custom XML table."),
+    );
+    package(MAIN, &body, &[], &[], vec![])
+}
+
+/// Attributes the model has no field for, on elements it reads (as Word 365 writes them, from
+/// ECMA-376 and [MS-DOCX]): theme colours and fonts, language and hint attributes, `w16du:dateUtc`
+/// on revisions, table look and theme fills, row and cell attributes, drawing ids
+/// (`wp14:anchorId`), section attributes, and attributes in an unknown namespace on paragraphs,
+/// runs, tables, rows, cells, hyperlinks and the section.
+pub fn unknown_attributes() -> Vec<u8> {
+    let body = format!(
+        concat!(
+            r#"<w:p w14:paraId="11111111" w14:textId="22222222" w:rsidR="00112233" w:rsidRDefault="00112233" fut:pmark="p1"><w:pPr><w:spacing w:before="120" w:after="120" w:line="276" w:lineRule="auto" w:beforeAutospacing="0"/><w:ind w:left="720" w:firstLine="0" fut:indMark="i"/><w:jc w:val="both"/><w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:cs="Arial" w:hint="eastAsia"/><w:color w:val="0F4761" w:themeColor="accent1" w:themeShade="BF"/><w:lang w:val="en-GB" w:eastAsia="ja-JP" w:bidi="ar-SA"/></w:rPr></w:pPr>"#,
+            r#"<w:r w:rsidRPr="00445566" fut:rmark="r1"><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi" w:eastAsiaTheme="majorEastAsia" w:cstheme="majorBidi"/><w:color w:val="2F5496" w:themeColor="accent1" w:themeShade="BF"/><w:sz w:val="28"/><w:szCs w:val="28"/><w:shd w:val="clear" w:color="auto" w:fill="DEEAF6" w:themeFill="accent5" w:themeFillTint="33"/><w:u w:val="single" w:color="FF0000" w:themeColor="accent2"/><w:lang w:val="en-US" w:eastAsia="zh-CN"/></w:rPr><w:t>Theme formatted.</w:t></w:r>"#,
+            r#"<w:ins w:id="1" w:author="Ada" w:date="{d}" w16du:dateUtc="{d}"><w:r><w:t xml:space="preserve"> Inserted</w:t></w:r></w:ins>"#,
+            r#"<w:del w:id="2" w:author="Ada" w:date="{d}" w16du:dateUtc="{d}"><w:r><w:delText xml:space="preserve"> deleted</w:delText></w:r></w:del>"#,
+            r#"<w:hyperlink w:anchor="target" w:history="1" w:tooltip="Go" fut:hmark="h"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t xml:space="preserve"> link</w:t></w:r></w:hyperlink>"#,
+            r#"<w:r><w:rPr><w:b/><w:rPrChange w:id="3" w:author="Ben" w:date="{d}" w16du:dateUtc="{d}"><w:rPr/></w:rPrChange></w:rPr><w:t xml:space="preserve"> bold now</w:t></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:bookmarkStart w:id="0" w:name="target"/><w:r><w:t>Target heading</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>"#,
+            r#"<w:tbl fut:tmark="t"><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="5000" w:type="pct"/><w:tblBorders><w:top w:val="single" w:sz="4" w:space="0" w:color="4472C4" w:themeColor="accent1"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="4472C4" w:themeColor="accent1" w:themeTint="99"/></w:tblBorders><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid><w:gridCol w:w="4675"/><w:gridCol w:w="4675"/></w:tblGrid>"#,
+            r#"<w:tr w:rsidR="00AA0000" w14:paraId="33333333" w14:textId="44444444" fut:rowmark="row"><w:trPr><w:trHeight w:val="400" w:hRule="atLeast"/><w:tblHeader/></w:trPr>"#,
+            r#"<w:tc fut:cellmark="c"><w:tcPr><w:tcW w:w="4675" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="4472C4" w:themeFill="accent1"/></w:tcPr><w:p><w:r><w:rPr><w:color w:val="FFFFFF" w:themeColor="background1"/></w:rPr><w:t>Head A</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:tcPr><w:tcW w:w="4675" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="4472C4" w:themeFill="accent1"/></w:tcPr><w:p><w:r><w:t>Head B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+            r#"<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" wp14:anchorId="5A5A5A5A" wp14:editId="6B6B6B6B"><wp:extent cx="914400" cy="914400"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="Picture 1" descr="A dot"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="Picture 1"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImg"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+            r#"<w:p><w:pPr><w:sectPr w:rsidR="00112233" fut:smark="s"><w:pgSz w:w="11906" w:h="16838" w:code="9"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr></w:pPr><w:r><w:t>End of section one.</w:t></w:r></w:p>"#,
+        ),
+        d = DATE
+    );
+    package(
+        MAIN,
+        &body,
+        &[("rIdImg", "image", "media/image1.png"), ("rIdTheme", "theme", "theme/theme1.xml")],
+        &[("word/theme/theme1.xml", "application/vnd.openxmlformats-officedocument.theme+xml")],
+        vec![("word/media/image1.png".into(), PNG.to_vec()), ("word/theme/theme1.xml".into(), s(THEME))],
+    )
+}
+
+/// A small theme (ECMA-376 Part 1 §20.1.6): colour and font schemes, no format scheme details.
+const THEME: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Corpus"><a:themeElements>"#,
+    r#"<a:clrScheme name="Corpus"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>"#,
+    r#"<a:dk2><a:srgbClr val="0E2841"/></a:dk2><a:lt2><a:srgbClr val="E8E8E8"/></a:lt2><a:accent1><a:srgbClr val="156082"/></a:accent1><a:accent2><a:srgbClr val="E97132"/></a:accent2>"#,
+    r#"<a:accent3><a:srgbClr val="196B24"/></a:accent3><a:accent4><a:srgbClr val="0F9ED5"/></a:accent4><a:accent5><a:srgbClr val="A02B93"/></a:accent5><a:accent6><a:srgbClr val="4EA72E"/></a:accent6>"#,
+    r#"<a:hlink><a:srgbClr val="467886"/></a:hlink><a:folHlink><a:srgbClr val="96607D"/></a:folHlink></a:clrScheme>"#,
+    r#"<a:fontScheme name="Corpus"><a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont><a:minorFont><a:latin typeface="Aptos"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme>"#,
+    r#"<a:fmtScheme name="Corpus"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>"#,
+    r#"<a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>"#,
+    r#"<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>"#,
+    r#"<a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme>"#,
+    r#"</a:themeElements></a:theme>"#
+);
+
 /// Every corpus document: (file name, package).
 pub fn corpus() -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -399,5 +490,8 @@ pub fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("headers-footers-notes.docx", headers_notes()),
         ("macros.docm", macros()),
         ("altchunk-printer-misc.docx", misc()),
+        ("block-alternate-content.docx", block_alternate()),
+        ("custom-xml-tables.docx", custom_xml_tables()),
+        ("unknown-attributes.docx", unknown_attributes()),
     ]
 }

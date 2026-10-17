@@ -23,6 +23,15 @@ fn round(v: f32) -> i64 {
 
 /// `w:rPr` content (without the wrapper). Link and revision marks are not run properties.
 pub fn rpr_inner(w: &mut W, c: &CharProps) {
+    let start = w.s.len();
+    rpr_children(w, c);
+    // WHIQ: attributes kept from the file on elements written unchanged, and elements the model
+    // holds nothing of (`keep.rs`).
+    crate::keep::restore(&mut w.s, start, c.ext_attrs.as_deref());
+    crate::keep::restore_missing(&mut w.s, start, c.ext_attrs.as_deref(), crate::keep::RPR_ORDER);
+}
+
+fn rpr_children(w: &mut W, c: &CharProps) {
     if let Some(s) = &c.style {
         w.val("w:rStyle", s);
     }
@@ -133,8 +142,12 @@ pub type ChangeAttrs = Vec<(&'static str, String)>;
 
 /// Open a tracked change element (`w:rPrChange`, `w:pPrChange`, `w:tblPrChange`…).
 pub fn open_change(w: &mut W, tag: &str, a: &ChangeAttrs) {
-    let refs: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let refs: Vec<(&str, &str)> = a.iter().filter(|(k, _)| !k.is_empty()).map(|(k, v)| (*k, v.as_str())).collect();
     w.open(tag, &refs);
+    // WHIQ: the revision's kept attributes (an entry with an empty name, see `change_attrs`).
+    for (_, x) in a.iter().filter(|(k, _)| k.is_empty()) {
+        crate::keep::extend_last_tag(&mut w.s, Some(x));
+    }
 }
 
 /// A tracked change element holding the properties before the change: `<tag attrs><inner>…</inner></tag>`.
@@ -205,6 +218,15 @@ pub fn borders(w: &mut W, tag: &str, b: &Borders, inner: Option<&str>, extra: &[
 /// `w:pPr` content (without the wrapper); `num_change` are the attributes of a tracked list
 /// numbering change (`w:numberingChange`, written in `w:numPr`).
 pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&ChangeAttrs>) {
+    let start = w.s.len();
+    ppr_children(w, p, framed, num_change);
+    // WHIQ: attributes kept from the file on elements written unchanged, and elements the model
+    // holds nothing of (`keep.rs`).
+    crate::keep::restore(&mut w.s, start, p.ext_attrs.as_deref());
+    crate::keep::restore_missing(&mut w.s, start, p.ext_attrs.as_deref(), crate::keep::PPR_ORDER);
+}
+
+fn ppr_children(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&ChangeAttrs>) {
     if let Some(s) = &p.style {
         w.val("w:pStyle", s);
     }
@@ -252,8 +274,11 @@ pub fn ppr_inner(w: &mut W, p: &ParaProps, framed: bool, num_change: Option<&Cha
         w.val("w:ilvl", &n(nr.level.min(8) as i64));
         w.val("w:numId", &n(nr.num as i64));
         if let Some(a) = num_change {
-            let refs: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let refs: Vec<(&str, &str)> = a.iter().filter(|(k, _)| !k.is_empty()).map(|(k, v)| (*k, v.as_str())).collect();
             w.empty("w:numberingChange", &refs);
+            for (_, x) in a.iter().filter(|(k, _)| k.is_empty()) {
+                crate::keep::extend_last_tag(&mut w.s, Some(x));
+            }
         }
         w.close("w:numPr");
     }
@@ -420,8 +445,57 @@ pub fn look_attrs(l: &TableLook) -> Vec<(&'static str, String)> {
 
 /// `w:tblPr`, with the properties before a tracked change last when `change` gives its attributes.
 pub fn tblpr(w: &mut W, t: &TableProps, change: Option<&ChangeAttrs>) {
+    let start = w.s.len();
+    tblpr_tag(w, t, change);
+    // WHIQ: attributes kept from the file on elements written unchanged (`keep.rs`).
+    crate::keep::restore(&mut w.s, start, t.ext_attrs.as_deref());
+}
+
+/// WHIQ: CT_TblPr, CT_TcPr element order (kept properties go where the schema puts them).
+const TBLPR_ORDER: &[&str] = &[
+    "w:tblStyle",
+    "w:tblpPr",
+    "w:tblOverlap",
+    "w:bidiVisual",
+    "w:tblStyleRowBandSize",
+    "w:tblStyleColBandSize",
+    "w:tblW",
+    "w:jc",
+    "w:tblCellSpacing",
+    "w:tblInd",
+    "w:tblBorders",
+    "w:shd",
+    "w:tblLayout",
+    "w:tblCellMar",
+    "w:tblLook",
+    "w:tblCaption",
+    "w:tblDescription",
+];
+const TCPR_ORDER: &[&str] = &[
+    "w:cnfStyle",
+    "w:tcW",
+    "w:gridSpan",
+    "w:hMerge",
+    "w:vMerge",
+    "w:tcBorders",
+    "w:shd",
+    "w:noWrap",
+    "w:tcMar",
+    "w:textDirection",
+    "w:tcFitText",
+    "w:vAlign",
+    "w:hideMark",
+    "w:headers",
+    "w:cellIns",
+    "w:cellDel",
+    "w:cellMerge",
+];
+
+fn tblpr_tag(w: &mut W, t: &TableProps, change: Option<&ChangeAttrs>) {
     w.open("w:tblPr", &[]);
+    let inner = w.s.len();
     tblpr_inner(w, t);
+    crate::keep::insert_ordered(&mut w.s, inner, t.ext_xml.as_deref(), TBLPR_ORDER);
     if let (Some(a), Some(ch)) = (change, &t.fmt_change) {
         change_el(w, "w:tblPrChange", "w:tblPr", a, |w| tblpr_inner(w, &ch.old));
     }
@@ -476,16 +550,26 @@ fn tblpr_inner(w: &mut W, t: &TableProps) {
 
 /// `w:trPr` (when the row has any), with a tracked change last as for [`tblpr`].
 pub fn trpr(w: &mut W, r: &RowProps, change: Option<&ChangeAttrs>) {
+    let start = w.s.len();
+    trpr_tags(w, r, change);
+    // WHIQ: attributes kept from the file on elements written unchanged (`keep.rs`).
+    crate::keep::restore(&mut w.s, start, r.ext_attrs.as_deref());
+}
+
+fn trpr_tags(w: &mut W, r: &RowProps, change: Option<&ChangeAttrs>) {
     if let Some(x) = &r.exceptions {
         tblprex(w, x);
     }
     let change = change.zip(r.fmt_change.as_ref());
     let gaps = r.grid_before > 0 || r.grid_after > 0 || r.w_before.is_some() || r.w_after.is_some();
-    if r.height.is_none() && !r.header && !r.cant_split && !gaps && change.is_none() {
+    if r.height.is_none() && !r.header && !r.cant_split && !gaps && change.is_none() && r.ext_xml.is_none() {
         return;
     }
     w.open("w:trPr", &[]);
     trpr_inner(w, r);
+    // WHIQ: kept row properties (CT_TrPrBase is a choice: any order), before a tracked change.
+    let inner = w.s.len();
+    crate::keep::insert_ordered(&mut w.s, inner, r.ext_xml.as_deref(), &[]);
     if let Some((a, ch)) = change {
         change_el(w, "w:trPrChange", "w:trPr", a, |w| trpr_inner(w, &ch.old));
     }
@@ -552,8 +636,17 @@ fn trpr_inner(w: &mut W, r: &RowProps) {
 
 /// `w:tcPr`, with a tracked change last as for [`tblpr`].
 pub fn tcpr(w: &mut W, c: &CellProps, change: Option<&ChangeAttrs>) {
+    let start = w.s.len();
+    tcpr_tag(w, c, change);
+    // WHIQ: attributes kept from the file on elements written unchanged (`keep.rs`).
+    crate::keep::restore(&mut w.s, start, c.ext_attrs.as_deref());
+}
+
+fn tcpr_tag(w: &mut W, c: &CellProps, change: Option<&ChangeAttrs>) {
     w.open("w:tcPr", &[]);
+    let inner = w.s.len();
     tcpr_inner(w, c);
+    crate::keep::insert_ordered(&mut w.s, inner, c.ext_xml.as_deref(), TCPR_ORDER);
     if let (Some(a), Some(ch)) = (change, &c.fmt_change) {
         change_el(w, "w:tcPrChange", "w:tcPr", a, |w| tcpr_inner(w, &ch.old));
     }

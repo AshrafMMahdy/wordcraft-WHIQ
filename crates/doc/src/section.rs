@@ -756,6 +756,10 @@ pub struct SectionProps {
     /// them, with the relationships they use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<std::sync::Arc<crate::graphic::Embedded>>,
+    /// WHIQ: attributes read from a file that the model has no field for, on `w:sectPr` and its
+    /// children (`w:pgSz w:code`…), written back while unchanged (`wordcraft_docx` `keep.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_attrs: Option<String>,
 }
 
 impl Default for SectionProps {
@@ -792,6 +796,7 @@ impl Default for SectionProps {
             footnote_pr: NoteProps::default(),
             endnote_pr: NoteProps::default(),
             ext: None,
+            ext_attrs: None,
         }
     }
 }

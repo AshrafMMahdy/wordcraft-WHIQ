@@ -247,7 +247,7 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
         if blocks.is_empty() {
             blocks.push(para_block(Paragraph::new()));
         }
-        cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default() });
+        cells.push(Cell { props: CellProps { span: 1, ..Default::default() }, blocks, controls: Default::default(), wraps: Default::default() });
     }
     fn build_row(mut cells: Vec<Cell>, info: &RowInfo) -> Row {
         // Per-cell overrides first (sprm cell indices count pre-merge cells), then merges.
@@ -292,6 +292,7 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
             },
             cells,
             controls: Default::default(),
+            wraps: Default::default(),
         }
     }
     fn flush_table(out: &mut Blocks, rows: &mut Vec<Row>, cells: &mut Vec<Cell>, cell: &mut Blocks, grid: &[f32], props: &TableProps, nested: bool) {
@@ -322,6 +323,7 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
                 grid: grid.to_vec(),
                 rows: std::mem::take(rows),
                 controls: Default::default(),
+                wraps: Default::default(),
             })));
         }
         rows.clear();
