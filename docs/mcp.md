@@ -15,6 +15,19 @@ With `--connect`, the bridge sends the app's control key, which it reads from
 `WORDCRAFT_CONTROL_KEY` or from the key file the app writes at start. It sends the key only to
 loopback addresses; see [Keys](control-protocol.md#keys).
 
+## WHIQ fork: the "no dead stops" contract
+
+On the `whiq` branch every tool error carries `code`, `reason` and `next_step`; a busy server
+answers `busy` with `retry_after_ms`; long calls become jobs (`job_status`); big results come
+trimmed with `continue_from`; `server_status` reports memory, the document, jobs and recovered
+files; unsaved work is auto-saved to `<name>.recovered-<stamp>.docx` on SIGTERM, disconnect,
+panic or memory eviction; saves keep a replaced file as `OLD_<name>` unless `overwrite: true`;
+`caller` signs each call's changes. Tools added: `server_status`, `job_status`, `export_pdf`,
+`close_document`, `review_edit`, `list_changes`, `accept_changes`, `reject_changes`,
+`find_anchor`, `compare_documents`, `import_markdown`, `apply_theme`, `roundtrip_check`. Flags:
+`--job-after-ms`, `--max-result-bytes`, `--max-memory-mb`. Details and tests:
+[WHIQ-CHANGES.md](../WHIQ-CHANGES.md), `tests/mcp-contract/`.
+
 ## Tracked changes by an agent
 
 Tracked changes and comments are recorded under the session's user name ("WordCraft User" by
