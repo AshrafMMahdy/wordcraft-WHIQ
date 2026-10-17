@@ -10,6 +10,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 bin="${1:-${CARGO_TARGET_DIR:-$repo/target}/release/wordcraft-cli}"
 [ -x "$bin" ] || { echo "no binary at $bin (cargo build --release -p wordcraft-cli)"; exit 2; }
+bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"   # the server is exec'd after a cd into the scratch folder, so a relative path must be made absolute first
 work="$(mktemp -d "${TMPDIR:-/tmp}/whiq-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 fail=0
