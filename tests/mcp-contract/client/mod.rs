@@ -27,7 +27,7 @@ impl Dir {
         let p = std::env::temp_dir().join(format!("whiq-mcp-{tag}-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
-        Dir(std::fs::canonicalize(&p).unwrap())
+        Dir(plain_path(std::fs::canonicalize(&p).unwrap()))
     }
     pub fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
@@ -240,4 +240,15 @@ pub fn check_shape(name: &str, res: &Value) {
         }
         assert!(CODES.contains(&e["code"].as_str().unwrap_or("")), "{name}: `{}` is not a shared error code: {res}", e["code"]);
     }
+}
+
+/// The canonical path in the form the server reports it: on Windows, canonicalize gives the verbatim `\\?\C:\...` form, while
+/// the server (and the person reading its answers) uses the plain `C:\...` path to the same folder. A UNC path keeps its prefix.
+pub fn plain_path(p: PathBuf) -> PathBuf {
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        if !rest.starts_with(r"UNC\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
