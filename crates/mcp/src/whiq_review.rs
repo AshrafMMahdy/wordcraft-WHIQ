@@ -125,7 +125,7 @@ pub fn run(b: &mut dyn Backend, name: &str, a: &Value, _limits: &Limits, _warnin
         }
         "accept_changes" | "reject_changes" => {
             let v = exec(b, "review.resolve", which(a, name == "accept_changes"))
-                .map_err(|e| ToolError::new("bad_params", e, "say which changes: ids (from list_changes), author, kind, or all: true"))?;
+                .map_err(|e| ToolError::new("invalid_argument", e, "say which changes: ids (from list_changes), author, kind, or all: true"))?;
             Ok(Out::Json(v))
         }
         "find_anchor" => {
@@ -150,7 +150,7 @@ pub fn run(b: &mut dyn Backend, name: &str, a: &Value, _limits: &Limits, _warnin
             report["compared"] = compared;
             Ok(Out::Json(report))
         }
-        other => Err(ToolError::new("unknown_tool", format!("no tool `{other}`"), "call tools/list for the tools")),
+        other => Err(ToolError::new("not_found", format!("no tool `{other}`"), "call tools/list for the tools")),
     }
 }
 
@@ -176,7 +176,7 @@ fn edit_error(msg: &str) -> ToolError {
             "nothing was changed: fix {at} (ops: replace, insert, insert_paragraph, delete_paragraph, delete, comment) and send the batch again"
         ),
     };
-    let mut e = ToolError::new(if not_found { "not_found" } else { "bad_params" }, head, next).with("closest", json!(closest));
+    let mut e = ToolError::new(if not_found { "not_found" } else { "invalid_argument" }, head, next).with("closest", json!(closest));
     if let Some(i) = detail["failedAt"].as_u64() {
         e = e.with("failed_at", json!(i));
     }

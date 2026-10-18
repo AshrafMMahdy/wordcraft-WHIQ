@@ -30,6 +30,8 @@ pub const NEEDS_APP: &str = "needs the desktop app: start `wordcraft --control 7
 pub struct Headless {
     pub session: Session,
     roots: Option<Arc<AutomationRoots>>,
+    /// WHIQ parity pass: the document before the running multi-command call (for a cancel).
+    before_call: Option<wordcraft_engine::EditSnapshot>,
 }
 
 impl Headless {
@@ -78,7 +80,7 @@ impl Headless {
 
 impl Default for Headless {
     fn default() -> Self {
-        Headless { session: Session::new(wordcraft_doc::Document::new()), roots: None }
+        Headless { session: Session::new(wordcraft_doc::Document::new()), roots: None, before_call: None }
     }
 }
 
@@ -107,6 +109,21 @@ impl Backend for Headless {
     }
     fn author(&self) -> Option<String> {
         Some(self.session.author.clone())
+    }
+    fn begin_call(&mut self) {
+        self.before_call = Some(self.session.edit_snapshot());
+    }
+    fn rollback_call(&mut self) -> bool {
+        match self.before_call.take() {
+            Some(snap) => {
+                self.session.restore(snap);
+                true
+            }
+            None => false,
+        }
+    }
+    fn end_call(&mut self) {
+        self.before_call = None;
     }
 }
 

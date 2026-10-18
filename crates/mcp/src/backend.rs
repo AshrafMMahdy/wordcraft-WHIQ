@@ -25,6 +25,16 @@ pub trait Backend: Send {
     fn author(&self) -> Option<String> {
         None
     }
+    /// WHIQ parity pass: remember the document before a call made of several commands, so a
+    /// cancel can put it back ([`Backend::rollback_call`]).
+    fn begin_call(&mut self) {}
+    /// WHIQ parity pass: put the document back as [`Backend::begin_call`] found it. `false` when the
+    /// backend can't (a running app keeps its own undo).
+    fn rollback_call(&mut self) -> bool {
+        false
+    }
+    /// WHIQ parity pass: the call is over; forget what [`Backend::begin_call`] kept.
+    fn end_call(&mut self) {}
 }
 
 /// Looks up the control key for an address (`HOST:PORT`).

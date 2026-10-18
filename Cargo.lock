@@ -5361,6 +5361,7 @@ dependencies = [
  "wordcraft-doc",
  "wordcraft-docx",
  "wordcraft-engine",
+ "wordcraft-fonts",
  "wordcraft-render",
 ]
 

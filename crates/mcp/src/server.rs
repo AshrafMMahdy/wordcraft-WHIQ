@@ -43,7 +43,7 @@ pub fn initialize_result(params: &Value, describe: &str) -> Value {
 }
 
 /// WHIQ: how the contract shows to agents.
-const WHIQ_INSTRUCTIONS: &str = "Errors carry code, reason and next_step. A busy server answers code busy with retry_after_ms; a long call answers with a job_id (follow it with job_status; the result is kept). Big results come trimmed with truncated and continue_from (pass it back). server_status shows memory, the open document, jobs and recovered files. Saves never replace a file silently: the old one is kept as OLD_<name> unless overwrite: true. Pass caller to sign tracked changes and comments.";
+const WHIQ_INSTRUCTIONS: &str = "Contract: no call is a dead stop. Every error has code, reason and next_step (structuredContent.error). A busy server answers code busy with retry_after_ms; a long call (or async: true, or a very large open) answers with a job_id: poll job_status (status, progress, stage; the result is kept; cancel stops it). Unsaved work is auto-saved to <name>.recovered-<stamp>.docx in the write root when the server must close it (idle, memory, SIGTERM, a crash, evict) and the next answer names the file (recovered_files). Big results come trimmed with truncated and continue_from (pass it back). server_status shows memory, the open document, jobs and recovered files. Saves never replace a file silently: the old one becomes OLD_<name> unless overwrite: true. Unknown arguments are ignored with a warnings entry. Pass caller to sign tracked changes and comments.";
 
 /// The `resources/list` result.
 pub fn resources_list() -> Value {
@@ -61,8 +61,8 @@ pub struct Server {
     limits: crate::whiq::Limits,
     /// WHIQ: what the runtime's main thread reads (the open document, recovered files, roots).
     shared: crate::runtime::SharedState,
-    /// WHIQ: recovered work the agent hasn't been told about (eviction, or a previous process's
-    /// auto-save): the next call that needs the document answers `evicted` with it.
+    /// WHIQ: the document the server closed (eviction): until a document is opened or started,
+    /// a call that needs it answers `evicted` with the recovered file.
     notice: Option<Value>,
     started: std::time::Instant,
 }
@@ -90,8 +90,9 @@ impl Server {
         self
     }
 
-    /// WHIQ: share state with the runtime (and report documents an earlier process recovered in
-    /// the write root: the first call that needs the document answers `evicted` with them).
+    /// WHIQ: share state with the runtime, and report the recovered files an earlier process left
+    /// in the write root: `server_status` lists them and the next answer names them
+    /// (`recovered_files`), as in every craft app.
     pub fn with_shared(mut self, shared: crate::runtime::SharedState) -> Self {
         let dir = if let Ok(mut g) = shared.lock() {
             g.backend = self.backend.describe();
@@ -102,16 +103,13 @@ impl Server {
         };
         self.shared = shared;
         let dir = crate::recover::recovery_dir(dir.as_deref(), None);
-        let found = crate::recover::read_marker(&dir);
-        if !found.is_empty() {
-            if let Ok(mut g) = self.shared.lock() {
-                for f in &found {
-                    if !g.recovered.contains(f) {
-                        g.recovered.push(f.clone());
-                    }
-                }
+        crate::recover::clear_marker(&dir);
+        for f in crate::recover::scan(&dir) {
+            if let Ok(mut g) = self.shared.lock()
+                && !g.recovered.iter().any(|e| e["path"] == f["path"])
+            {
+                g.add_recovered(f);
             }
-            self.notice = Some(json!({"reason": "an earlier server auto-saved the work", "recovered": found}));
         }
         self.publish(false);
         self
@@ -206,6 +204,12 @@ impl Server {
                 Ok(self.call(name, &args))
             }
             "resources/list" => Ok(resources_list()),
+            // WHIQ: the runtime's idle eviction.
+            "whiq/evict" => {
+                let reason = params.get("reason").and_then(Value::as_str).unwrap_or("the server closed the document").to_string();
+                let kind = params.get("kind").and_then(Value::as_str).unwrap_or("evict").to_string();
+                Ok(self.evict(&reason, &kind))
+            }
             "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
@@ -222,9 +226,24 @@ impl Server {
     }
 }
 
-/// WHIQ: tools that may run while recovered work waits to be reopened (they don't need it).
-const WITHOUT_DOCUMENT: &[&str] =
-    &["open_document", "new_document", "import_markdown", "close_document", "server_status", "job_status", "list_commands", "parity"];
+/// WHIQ: tools that may run while an evicted document waits to be reopened (they don't need it).
+const WITHOUT_DOCUMENT: &[&str] = &[
+    "open_document",
+    "new_document",
+    "import_markdown",
+    "close_document",
+    "server_status",
+    "job_status",
+    "list_jobs",
+    "cancel",
+    "evict",
+    "list_commands",
+    "parity",
+    "roundtrip_check",
+];
+
+/// WHIQ: tools that put a document in place of an evicted one.
+const REPLACES_DOCUMENT: &[&str] = &["open_document", "new_document", "import_markdown", "close_document"];
 
 impl Server {
     /// A `tools/call` through the contract: recovered work reported first, the call, then the
@@ -234,16 +253,19 @@ impl Server {
         // Without the runtime (in-process use) the status tools are answered here.
         match canonical.as_str() {
             "server_status" => {
-                let jobs = Vec::new();
                 let st = match self.shared.lock() {
-                    Ok(g) => crate::runtime::status_json(&g, jobs, Value::Null, self.started, &self.limits),
+                    Ok(g) => crate::runtime::status_json(&g, Vec::new(), Value::Null, self.started, &self.limits),
                     Err(_) => json!({}),
                 };
                 return crate::whiq::json_result(st, &[]);
             }
+            "list_jobs" => return crate::whiq::json_result(json!({"jobs": []}), &[]),
             "job_status" => {
+                if args.get("job_id").is_none() {
+                    return crate::whiq::json_result(json!({"jobs": []}), &[]);
+                }
                 let e = crate::contract::ToolError::new(
-                    "job_not_found",
+                    crate::contract::code::NOT_FOUND,
                     "no jobs in this session",
                     "call the tool again; jobs exist only when the server runs on stdio (wordcraft-cli mcp)",
                 );
@@ -252,46 +274,92 @@ impl Server {
             // Calls run one at a time here: when this one is read, nothing else runs.
             "cancel" => {
                 return crate::whiq::json_result(
-                    json!({"cancelled": false, "reason": "no call is running", "next_step": "nothing to stop: carry on"}),
+                    json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"}),
                     &[],
                 );
             }
+            "evict" => {
+                let reason = args.get("reason").and_then(Value::as_str).unwrap_or("evicted by the supervisor").to_string();
+                let v = self.evict(&reason, "evict");
+                return crate::whiq::json_result(v, &[]);
+            }
             _ => {}
         }
-        let mut notice_warning = None;
-        if let Some(n) = self.notice.take() {
-            let dir = crate::recover::recovery_dir(self.shared.lock().ok().and_then(|g| g.write_root.clone()).as_deref(), None);
-            let first =
-                n.pointer("/recovered/0/path").and_then(Value::as_str).or_else(|| n.get("recovered").and_then(Value::as_str)).map(str::to_string);
-            let source = n.get("source").and_then(Value::as_str).map(str::to_string);
-            if !WITHOUT_DOCUMENT.contains(&canonical.as_str()) {
-                crate::recover::clear_marker(&dir);
-                let next = match (&first, &source) {
-                    (Some(p), _) => format!("your work is auto-saved at {p}: call open_document {{\"path\": \"{p}\"}}, then carry on"),
-                    (None, Some(src)) => format!("the document was saved; reopen it with open_document {{\"path\": \"{src}\"}}"),
-                    (None, None) => "start again with new_document or open_document".to_string(),
-                };
-                let reason = n.get("reason").and_then(Value::as_str).unwrap_or("the document was closed").to_string();
-                let mut e = crate::contract::ToolError::new("evicted", format!("{reason}; the open document was closed"), next);
-                for (k, v) in n.as_object().into_iter().flatten() {
-                    e = e.with(k, v.clone());
-                }
-                return crate::whiq::error_result(&e, &[]);
-            }
-            crate::recover::clear_marker(&dir);
-            notice_warning = Some(match first {
-                Some(p) => format!("note: earlier work was auto-saved at {p} (open_document on it to continue it)"),
-                None => "note: the previous document was closed".to_string(),
-            });
+        if let Some(n) = &self.notice
+            && !WITHOUT_DOCUMENT.contains(&canonical.as_str())
+        {
+            let recovered = n.get("recovered_path").and_then(Value::as_str).map(str::to_string);
+            let original = n.get("original_path").and_then(Value::as_str).map(str::to_string);
+            let next = match (&recovered, &original) {
+                (Some(p), _) => format!("your work is auto-saved at {p}: call open_document {{\"path\": \"{p}\"}} again on it, then carry on"),
+                (None, Some(src)) => format!("the document had no unsaved changes; reopen it with open_document {{\"path\": \"{src}\"}}"),
+                (None, None) => "start again with new_document or open_document".to_string(),
+            };
+            let reason = n.get("reason").and_then(Value::as_str).unwrap_or("the document was closed").to_string();
+            let e = crate::contract::ToolError::new(crate::contract::code::EVICTED, format!("{reason}; the open document was closed"), next)
+                .with("recovered_path", json!(recovered))
+                .with("original_path", json!(original));
+            return crate::whiq::error_result(&e, &[]);
         }
         let mut r = crate::whiq::call_tool(self.backend.as_mut(), name, args, &self.limits);
-        if let Some(w) = notice_warning {
-            add_warning(&mut r, &w);
+        if r["isError"] != true && REPLACES_DOCUMENT.contains(&canonical.as_str()) {
+            self.notice = None;
+            if let Ok(mut g) = self.shared.lock() {
+                g.evicted.clear();
+            }
+        }
+        // A close that kept unsaved work: the answer names the file; server_status lists it.
+        if let Some(p) = r.pointer("/structuredContent/recovered_path").and_then(Value::as_str).map(std::path::PathBuf::from)
+            && canonical == "close_document"
+            && let Ok(mut g) = self.shared.lock()
+        {
+            g.recovered.push(crate::recover::entry(&p, "close", None));
         }
         if let Some(w) = self.publish(true) {
             add_warning(&mut r, &w);
         }
         r
+    }
+
+    /// Auto-save the open document's unsaved work and close it (a blank one takes its place):
+    /// memory pressure, the idle timeout, or the `evict` tool. `kind` is the recovered file's
+    /// reason (`memory`, `idle`, `evict`). Returns `{evicted: [...]}`.
+    fn evict(&mut self, reason: &str, kind: &str) -> Value {
+        let Some(snap) = self.backend.snapshot() else { return json!({"evicted": []}) };
+        let root = self.shared.lock().ok().and_then(|g| g.write_root.clone());
+        let recovered = if snap.dirty {
+            let dir = crate::recover::recovery_dir(root.as_deref(), Some(&snap));
+            match crate::recover::autosave(&snap, &dir, kind) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    // Never discard: a document that cannot be saved stays open.
+                    eprintln!("wordcraft-cli: not evicting: auto-save failed: {e}");
+                    return json!({"evicted": [], "warnings": [format!("not evicted: the auto-save failed ({e})")]});
+                }
+            }
+        } else {
+            None
+        };
+        let original = snap.path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let _ = self.backend.call("engine.execute", json!({"command": "file.new", "params": {"template": "blank"}}));
+        let ev = json!({
+            "name": snap.stem(),
+            "reason": reason,
+            "recovered_path": recovered.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "original_path": original,
+        });
+        if let Ok(mut g) = self.shared.lock() {
+            if let Some(p) = &recovered {
+                let e = crate::recover::entry(p, kind, snap.path.as_deref());
+                // The `evicted` answer names it: no separate announcement.
+                g.recovered.retain(|x| x["path"] != e["path"]);
+                g.recovered.push(e);
+            }
+            g.evicted.push(ev.clone());
+            g.snapshot = self.backend.snapshot();
+        }
+        self.notice = Some(ev.clone());
+        json!({"evicted": [ev]})
     }
 
     /// Publish the open document for auto-saves and `server_status`; evict it when memory is past
@@ -310,29 +378,11 @@ impl Server {
             }
             return None;
         };
-        let reason = format!("memory: {used} bytes in use, over the {limit}-byte limit");
-        let root = self.shared.lock().ok().and_then(|g| g.write_root.clone());
-        let recovered = if snap.dirty {
-            let dir = crate::recover::recovery_dir(root.as_deref(), Some(&snap));
-            crate::recover::autosave(&snap, &dir, &reason).ok()
-        } else {
-            None
-        };
-        let source = snap.path.as_ref().map(|p| p.to_string_lossy().into_owned());
-        let _ = self.backend.call("engine.execute", json!({"command": "file.new", "params": {"template": "blank"}}));
-        let mut notice = json!({"reason": format!("evicted to free memory ({reason})"), "source": source});
-        if let Some(p) = &recovered {
-            notice["recovered"] = json!(p.to_string_lossy());
-        }
-        if let Ok(mut g) = self.shared.lock() {
-            if let Some(p) = &recovered {
-                g.recovered.push(json!({"path": p.to_string_lossy(), "reason": reason}));
-            }
-            g.snapshot = self.backend.snapshot();
-        }
-        self.notice = Some(notice);
-        Some(match &recovered {
-            Some(p) => format!("this call finished, then the document was evicted to free memory: it is auto-saved at {}", p.display()),
+        let reason = format!("memory: {used} bytes in use, over the {limit}-byte limit ({} MB)", limit / (1024 * 1024));
+        let v = self.evict(&format!("evicted to free memory ({reason})"), "memory");
+        let recovered = v.pointer("/evicted/0/recovered_path").and_then(Value::as_str).map(str::to_string);
+        Some(match recovered {
+            Some(p) => format!("this call finished, then the document was evicted to free memory: it is auto-saved at {p}"),
             None => "this call finished, then the document (saved, no unsaved changes) was closed to free memory".to_string(),
         })
     }

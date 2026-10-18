@@ -11,6 +11,50 @@
 
 use serde_json::{Map, Value, json};
 
+/// The error codes an agent can branch on: the same set in WordCraft, GridCraft and DeckCraft
+/// (CONTRACT-PARITY.md). Every error a tool answers carries one of these.
+pub mod code {
+    pub const BUSY: &str = "busy";
+    pub const CANCELLED: &str = "cancelled";
+    pub const DISK_FULL: &str = "disk_full";
+    pub const EVICTED: &str = "evicted";
+    pub const FAILED: &str = "failed";
+    pub const INTERNAL: &str = "internal";
+    pub const INVALID_ARGUMENT: &str = "invalid_argument";
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const LOCKED: &str = "locked";
+    pub const NO_DOCUMENT: &str = "no_document";
+    pub const NOT_AVAILABLE: &str = "not_available";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const OUT_OF_RANGE: &str = "out_of_range";
+    pub const OUTSIDE_ROOT: &str = "outside_root";
+    pub const PASSWORD_REQUIRED: &str = "password_required";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const WRONG_PASSWORD: &str = "wrong_password";
+    /// Every code, sorted.
+    pub const ALL: &[&str] = &[
+        BUSY,
+        CANCELLED,
+        DISK_FULL,
+        EVICTED,
+        FAILED,
+        INTERNAL,
+        INVALID_ARGUMENT,
+        INVALID_REQUEST,
+        LOCKED,
+        NO_DOCUMENT,
+        NOT_AVAILABLE,
+        NOT_FOUND,
+        OUT_OF_RANGE,
+        OUTSIDE_ROOT,
+        PASSWORD_REQUIRED,
+        TOO_LARGE,
+        UNSUPPORTED,
+        WRONG_PASSWORD,
+    ];
+}
+
 /// A tool error in the contract's shape.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolError {
@@ -44,6 +88,11 @@ impl ToolError {
             m.insert(k.clone(), v.clone());
         }
         Value::Object(m)
+    }
+
+    /// The text block shown to the model (the same form in every craft app).
+    pub fn text(&self) -> String {
+        format!("[{}] {}\nnext_step: {}", self.code, self.reason, self.next_step)
     }
 
     pub fn busy(retry_after_ms: u64, what: &str, job: Option<&str>) -> Self {
@@ -160,8 +209,29 @@ pub fn find_ci(hay: &str, needle: &str, occurrence: usize) -> Option<usize> {
     None
 }
 
-/// Arguments every tool takes besides its own (see [`crate::tools::tool_definitions`]).
-pub const COMMON_ARGS: &[&str] = &["caller", "background", "overwrite", "continue_from", "max_bytes"];
+/// Arguments every tool takes besides its own (see [`crate::tools::tool_definitions`]): the same
+/// in every craft app (`background` is WordCraft's older name for `async`, still read).
+pub const COMMON_ARGS: &[&str] = &["caller", "async", "background", "overwrite", "continue_from", "max_bytes"];
+
+/// Other names agents give arguments: (alias, the argument it means when the tool takes it).
+const ARG_SYNONYMS: &[(&str, &str)] = &[
+    ("file", "path"),
+    ("filename", "path"),
+    ("filepath", "path"),
+    ("file_path", "path"),
+    ("output", "path"),
+    ("out", "path"),
+    ("destination", "path"),
+    ("job", "job_id"),
+    ("jobid", "job_id"),
+    ("id", "job_id"),
+    ("offset", "continue_from"),
+    ("cmd", "command"),
+    ("args", "params"),
+    ("arguments", "params"),
+    ("parameters", "params"),
+    ("query", "anchor"),
+];
 
 /// Arguments after matching names to the schema's `properties` (case and spelling), reading
 /// numbers and booleans given as strings, with a warning for each argument outside the schema
@@ -176,11 +246,22 @@ pub fn normalise_args(args: &Value, schema: &Value) -> Result<(Value, Vec<String
         Value::Null => {}
         Value::Object(m) => {
             for (k, v) in m {
-                let key = if names.iter().any(|n| n == k) {
+                let synonym = ARG_SYNONYMS
+                    .iter()
+                    .find(|(a, _)| norm(a) == norm(k))
+                    .map(|(_, to)| (*to).to_string())
+                    .filter(|to| names.iter().any(|n| n == to) && !m.contains_key(to));
+                let key = if k == "background" {
+                    // WordCraft's older name for the common `async`.
+                    "async".to_string()
+                } else if names.iter().any(|n| n == k) {
                     k.clone()
                 } else if let Some(n) = unique_match(k, names.iter().map(String::as_str)) {
                     warnings.push(format!("argument `{k}` read as `{n}`"));
                     n.to_string()
+                } else if let Some(to) = synonym {
+                    warnings.push(format!("argument `{k}` read as `{to}`"));
+                    to
                 } else {
                     let near = closest(k, names.iter().map(String::as_str), 3);
                     let hint = if near.is_empty() { String::new() } else { format!(" (did you mean {}?)", near.join(", ")) };
@@ -188,12 +269,24 @@ pub fn normalise_args(args: &Value, schema: &Value) -> Result<(Value, Vec<String
                     continue;
                 };
                 let ty = props.get(&key).and_then(|p| p.get("type")).and_then(Value::as_str).unwrap_or("");
-                out.insert(key, coerce(v, ty));
+                let mut v = coerce(v, ty, props.get(&key).and_then(|p| p.pointer("/items/type")).and_then(Value::as_str));
+                // Enumerated values in any case or spelling.
+                if let (Some(allowed), Some(given)) = (props.get(&key).and_then(|p| p.get("enum")).and_then(Value::as_array), v.as_str())
+                    && !allowed.iter().any(|a| a.as_str() == Some(given))
+                    && let Some(hit) = allowed.iter().filter_map(Value::as_str).find(|a| norm(a) == norm(given))
+                {
+                    warnings.push(format!("`{key}`: `{given}` read as `{hit}`"));
+                    v = json!(hit);
+                }
+                if key == "async" && out.contains_key("async") {
+                    continue;
+                }
+                out.insert(key, v);
             }
         }
         other => {
             return Err(ToolError::new(
-                "bad_params",
+                code::INVALID_ARGUMENT,
                 format!("arguments must be an object, got {}", kind(other)),
                 "send the arguments as a JSON object, e.g. {\"path\": \"out.docx\"}",
             ));
@@ -214,7 +307,7 @@ pub fn normalise_args(args: &Value, schema: &Value) -> Result<(Value, Vec<String
             })
             .collect();
         return Err(ToolError::new(
-            "bad_params",
+            code::INVALID_ARGUMENT,
             format!("missing required argument {}", list.join(", ")),
             format!("call again with {}; arguments: {}", list.join(" and "), props_doc.join("; ")),
         ));
@@ -233,9 +326,16 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-/// `v` read as `ty` where that is safe: `"2"` as 2 for a number, `"true"` as true for a boolean.
-fn coerce(v: &Value, ty: &str) -> Value {
+/// `v` read as `ty` where that is safe: `"2"` as 2 for a number, `"true"` as true for a boolean,
+/// `"a, b"` as a list for an array, one value as a list of one.
+fn coerce(v: &Value, ty: &str, items: Option<&str>) -> Value {
     match (ty, v) {
+        ("array", Value::String(s)) if matches!(items, Some("string" | "number" | "integer") | None) => {
+            let parts: Vec<&str> = s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+            let as_num = matches!(items, Some("number" | "integer"));
+            Value::Array(parts.iter().map(|p| if as_num { p.parse::<f64>().ok().map_or_else(|| json!(p), |n| json!(n)) } else { json!(p) }).collect())
+        }
+        ("array", Value::Number(_) | Value::Bool(_)) => json!([v]),
         ("number" | "integer", Value::String(s)) => {
             s.trim().parse::<f64>().ok().and_then(|n| serde_json::Number::from_f64(n).map(Value::Number)).unwrap_or_else(|| v.clone())
         }
@@ -244,6 +344,7 @@ fn coerce(v: &Value, ty: &str) -> Value {
             "false" | "no" | "0" | "off" => Value::Bool(false),
             _ => v.clone(),
         },
+        ("boolean", Value::Number(n)) => Value::Bool(n.as_f64().is_some_and(|f| f != 0.0)),
         ("string", Value::Number(n)) => Value::String(n.to_string()),
         _ => v.clone(),
     }
@@ -256,7 +357,7 @@ pub fn classify(msg: &str, tool: &str, args: &Value, commands: &[String]) -> Too
     // Stopped by `cancel` at a safe point (the command was undone).
     if let Some(what) = msg.strip_prefix("cancelled: ") {
         return ToolError::new(
-            "cancelled",
+            code::CANCELLED,
             format!("cancelled: {what}"),
             format!("the document is as it was before `{tool}`: call it again to do it"),
         );
@@ -265,7 +366,7 @@ pub fn classify(msg: &str, tool: &str, args: &Value, commands: &[String]) -> Too
     if let Some(id) = msg.strip_prefix("unknown command `").and_then(|r| r.split('`').next()) {
         let near = closest(id, commands.iter().map(String::as_str), 5);
         return ToolError::new(
-            "unknown_command",
+            code::NOT_FOUND,
             format!("no command `{id}`"),
             format!("use one of {} (list_commands {{\"query\": \"…\"}} lists them all)", list_or(&near, "list_commands")),
         )
@@ -276,22 +377,43 @@ pub fn classify(msg: &str, tool: &str, args: &Value, commands: &[String]) -> Too
         || lower.contains("authority is absent")
         || lower.contains("automation path rejected")
     {
-        let (code, next) = if lower.contains("write") {
-            ("path_refused", "save inside the write root: give a file name or a path under it (relative paths are resolved inside it)")
+        let next = if lower.contains("write") {
+            "save inside the write root: give a file name or a path under it (relative paths are resolved inside it)"
         } else {
-            ("path_refused", "open files from inside the read root (server_status shows the roots)")
+            "open files from inside the read root (server_status shows the roots)"
         };
-        return ToolError::new(code, msg, next);
+        let roots = wordcraft_engine::file_access::current();
+        let show = |p: Option<&std::path::Path>| p.map(|p| p.to_string_lossy().into_owned());
+        return ToolError::new(code::OUTSIDE_ROOT, msg, next)
+            .with("read_root", json!(roots.as_deref().and_then(|r| show(r.read_root()))))
+            .with("write_root", json!(roots.as_deref().and_then(|r| show(r.write_root()))));
+    }
+    if lower.contains("os error 32")
+        || lower.contains("os error 33")
+        || lower.contains("being used by another process")
+        || lower.contains("permission denied")
+        || lower.contains("access is denied")
+    {
+        let name = std::path::Path::new(path).file_name().map_or_else(|| "the file".to_string(), |n| n.to_string_lossy().into_owned());
+        return ToolError::new(
+            code::LOCKED,
+            msg,
+            format!("{name} is open in another program or read-only: close it there and retry, or save under another name"),
+        )
+        .with("retry_after_ms", json!(5000));
+    }
+    if lower.contains("no space left") || lower.contains("os error 28") || lower.contains("os error 112") || lower.contains("disk full") {
+        return ToolError::new(code::DISK_FULL, msg, "free space on the disk and save again; the document is still open");
     }
     if lower.contains("no such file") || lower.contains("os error 2") || lower.contains("not found") || lower.contains("cannot find") {
         let near = nearby_files(path);
         let next =
             if near.is_empty() { "check the path (server_status shows the roots)".to_string() } else { format!("did you mean {}?", near.join(", ")) };
-        return ToolError::new("not_found", msg, next).with("closest", json!(near));
+        return ToolError::new(code::NOT_FOUND, msg, next).with("closest", json!(near));
     }
     if let Some(n) = lower.strip_prefix("no page ") {
         return ToolError::new(
-            "out_of_range",
+            code::OUT_OF_RANGE,
             msg,
             format!("ask for an existing page (inspect_document or server_status gives the page count); page {} doesn't exist", n.trim()),
         );
@@ -303,29 +425,35 @@ pub fn classify(msg: &str, tool: &str, args: &Value, commands: &[String]) -> Too
         } else {
             format!("fix the arguments; tools/list shows what `{tool}` takes")
         };
-        return ToolError::new("bad_params", msg, next);
+        return ToolError::new(code::INVALID_ARGUMENT, msg, next);
     }
     if lower.starts_with("not available") {
         return ToolError::new(
-            "not_available",
+            code::NOT_AVAILABLE,
             msg,
             "the command can't run in the current state (selection, view or protection): change that first, or use another command",
         );
     }
     if lower.contains("needs the desktop app") {
         return ToolError::new(
-            "needs_app",
+            code::UNSUPPORTED,
             msg,
             "this tool drives the desktop app: start `wordcraft --control 7981` and `wordcraft-cli mcp --connect 127.0.0.1:7981`, or use render_page instead of screenshots",
         );
     }
+    if lower.contains("password") && (lower.contains("wrong") || lower.contains("incorrect") || lower.contains("invalid")) {
+        return ToolError::new(code::WRONG_PASSWORD, msg, "call again with the right `password`");
+    }
     if lower.contains("password") {
-        return ToolError::new("needs_password", msg, "call again with the document's `password`");
+        return ToolError::new(code::PASSWORD_REQUIRED, msg, "call again with the document's `password`");
+    }
+    if lower.contains("too large") || lower.contains("too big") || lower.contains("too many") {
+        return ToolError::new(code::TOO_LARGE, msg, "ask for less at once: a page range (pages: \"1-10\"), a lower dpi, or continue_from");
     }
     if lower.contains("panicked") {
-        return ToolError::new("internal", msg, "the document is unchanged; try another way to do this (the failure was logged)");
+        return ToolError::new(code::INTERNAL, msg, "the document is unchanged; try another way to do this (the failure was logged)");
     }
-    ToolError::new("failed", msg, "check the document with inspect_document, then retry with other arguments or another command")
+    ToolError::new(code::FAILED, msg, "check the document with inspect_document, then retry with other arguments or another command")
 }
 
 fn list_or(v: &[String], fallback: &str) -> String {
@@ -441,7 +569,11 @@ mod tests {
         assert_eq!(a, json!({"keepGoing": true, "page": 3.0, "path": "x"}));
         assert_eq!(w.len(), 3, "{w:?}");
         let e = normalise_args(&json!({}), &schema).unwrap_err();
-        assert_eq!(e.code, "bad_params");
+        assert_eq!(e.code, "invalid_argument");
+        // Synonyms, enumerations in any case, lists given as text, `background` as `async`.
+        let schema = json!({"properties": {"path": {"type": "string"}, "kind": {"type": "string", "enum": ["bar", "line"]}, "ids": {"type": "array", "items": {"type": "string"}}}});
+        let (a, _) = normalise_args(&json!({"file": "a.docx", "kind": "BAR", "ids": "x, y", "background": true}), &schema).unwrap();
+        assert_eq!(a, json!({"path": "a.docx", "kind": "bar", "ids": ["x", "y"], "async": true}));
         assert!(e.next_step.contains("`path`"), "{e:?}");
     }
 
@@ -466,13 +598,16 @@ mod tests {
     #[test]
     fn engine_errors_get_codes_and_next_steps() {
         let e = classify("unknown command `format.blod`", "execute", &json!({}), &["format.bold".into(), "format.italic".into()]);
-        assert_eq!(e.code, "unknown_command");
+        assert_eq!(e.code, "not_found");
         assert_eq!(e.extra["closest"][0], "format.bold");
         let e = classify("automation path rejected: outside the write root /w: /etc/x", "save_document", &json!({}), &[]);
-        assert_eq!(e.code, "path_refused");
+        assert_eq!(e.code, "outside_root");
         let e = classify("bad parameters: `rows` must be 1–63", "execute", &json!({"command": "insert.table"}), &[]);
-        assert_eq!(e.code, "bad_params");
+        assert_eq!(e.code, "invalid_argument");
         assert!(e.next_step.contains("insert.table"));
+        let e = classify("x.docx: No space left on device (os error 28)", "save_document", &json!({}), &[]);
+        assert_eq!(e.code, "disk_full");
+        assert!(code::ALL.contains(&e.code));
         assert!(!e.reason.is_empty() && !e.next_step.is_empty());
     }
 }

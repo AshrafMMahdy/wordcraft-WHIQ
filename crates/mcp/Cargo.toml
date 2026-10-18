@@ -14,6 +14,8 @@ wordcraft-engine = { workspace = true }
 wordcraft-docx = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-control-key = { workspace = true }
+# WHIQ parity pass: server_status reports the embedded craft-fonts faces.
+wordcraft-fonts = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 

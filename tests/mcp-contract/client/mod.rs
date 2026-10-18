@@ -206,8 +206,30 @@ impl Drop for Mcp {
     }
 }
 
-/// Every tool result carries `structuredContent` (an object); an error carries `code`,
-/// `reason` and `next_step`, all non-empty.
+/// The error codes every craft app answers with (CONTRACT-PARITY.md): no other code may appear.
+pub const CODES: &[&str] = &[
+    "busy",
+    "cancelled",
+    "disk_full",
+    "evicted",
+    "failed",
+    "internal",
+    "invalid_argument",
+    "invalid_request",
+    "locked",
+    "no_document",
+    "not_available",
+    "not_found",
+    "out_of_range",
+    "outside_root",
+    "password_required",
+    "too_large",
+    "unsupported",
+    "wrong_password",
+];
+
+/// Every tool result carries `structuredContent` (an object); an error carries `code` (one of
+/// [`CODES`]), `reason` and `next_step`, all non-empty.
 pub fn check_shape(name: &str, res: &Value) {
     assert!(res["structuredContent"].is_object(), "{name}: no structuredContent: {res}");
     assert!(res["content"].as_array().is_some_and(|c| !c.is_empty()), "{name}: no content: {res}");
@@ -216,5 +238,6 @@ pub fn check_shape(name: &str, res: &Value) {
         for k in ["code", "reason", "next_step"] {
             assert!(e[k].as_str().is_some_and(|s| !s.trim().is_empty()), "{name}: error without {k}: {res}");
         }
+        assert!(CODES.contains(&e["code"].as_str().unwrap_or("")), "{name}: `{}` is not a shared error code: {res}", e["code"]);
     }
 }

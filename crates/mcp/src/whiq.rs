@@ -53,9 +53,10 @@ const REPLACES: Ann = Ann { read_only: false, destructive: true, idempotent: tru
 fn ann(name: &str) -> Ann {
     match name {
         "list_commands" | "get_text" | "inspect_document" | "render_page" | "parity" | "screenshot" | "ui_inspect" | "server_status"
-        | "job_status" | "list_changes" | "find_anchor" | "roundtrip_check" => READ,
+        | "job_status" | "list_jobs" | "list_changes" | "find_anchor" | "roundtrip_check" => READ,
         // Stopping a call leaves the document as it was before it: asking twice is asking once.
-        "select_text" | "cancel" => STATE,
+        // Evicting auto-saves unsaved work first (nothing is lost) and leaves a blank document.
+        "select_text" | "cancel" | "evict" => STATE,
         // Opening or starting a document replaces the open one (auto-saved first when it has
         // unsaved changes): the same arguments give the same result.
         "new_document" | "open_document" | "import_markdown" | "close_document" => REPLACES,
@@ -85,9 +86,9 @@ fn b(desc: &str) -> Value {
 fn common_props(name: &str) -> Vec<(&'static str, Value)> {
     let mut v = vec![
         ("caller", s("Who is calling: the author of tracked changes and comments made by this call (default: --author)")),
-        ("background", b("Run as a job: answer at once with a job_id; job_status gives progress and the result")),
+        ("async", b("Run as a job: answer at once with a job_id; job_status gives progress and the result (also read as `background`)")),
         ("continue_from", n("Where to resume a trimmed result (its continue_from)")),
-        ("max_bytes", n("Largest result to return before trimming (default 100000)")),
+        ("max_bytes", n("Largest result to return before trimming (default --max-result-bytes)")),
     ];
     if matches!(name, "save_document" | "export_pdf" | "execute" | "batch") || name.starts_with("review") {
         v.push(("overwrite", b("Replace an existing file at the path. Without it the existing file is kept as OLD_<name> and the response says so")));
@@ -112,15 +113,29 @@ fn own_tools() -> Vec<Value> {
         def(
             "job_status",
             "Job status",
-            "Progress of a job (a call that took long or ran with background: true) and, once done, its result. Results stay available after the client times out.",
+            "Progress of a job (a call that took long, ran with async: true, or opened a big file) — status, progress 0..1, stage, steps and the stages passed — and, once done, its result (or error). Results stay available after the client times out. Without job_id: every job, like list_jobs.",
             json!({"job_id": s("The job_id a call returned")}),
-            &["job_id"],
+            &[],
+        ),
+        def(
+            "list_jobs",
+            "List jobs",
+            "Every job this server knows (running and finished, newest 64): job_id, tool, status, progress, stage, elapsed time.",
+            json!({}),
+            &[],
         ),
         def(
             "cancel",
             "Cancel",
-            "Stop the running call (or job `job_id`) at its next safe point. A stopped command leaves the document as it was before it (a review edit batch, a Markdown import, a PDF export: nothing changed, no file written); a stopped batch, page range or multi-paragraph type_text keeps the steps done before (each one whole) and says how far it got. The stopped call answers with code `cancelled` (the job's result, for a job). Answered even while the call runs.",
-            json!({"job_id": s("The job to stop (default: the running call)")}),
+            "Stop the running call (or job `job_id`) at its next safe point. The document is put back as it was before the call (a review edit batch, a batch of commands, a multi-paragraph type_text, a Markdown import: nothing of it stays; a PDF export writes no file); a page range being rendered answers with continue_from. The stopped call answers with code `cancelled` (job status `cancelled`, for a job). queued: true also drops the calls waiting behind it. Answered even while the call runs.",
+            json!({"job_id": s("The job to stop (default: the running call)"), "queued": b("Also drop the calls waiting behind the running one (each answers `cancelled`)")}),
+            &[],
+        ),
+        def(
+            "evict",
+            "Evict",
+            "For a supervisor: auto-save the open document's unsaved work to a recovered file and close it (a blank document takes its place). The next call that needs it answers `evicted` with the file to reopen.",
+            json!({"reason": s("Why (shown to the agent)")}),
             &[],
         ),
         def(
@@ -240,6 +255,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("export", "export_pdf"),
     ("pdf", "export_pdf"),
     ("job", "job_status"),
+    ("jobs", "list_jobs"),
+    ("stop", "cancel"),
     ("commands", "list_commands"),
     ("run", "execute"),
 ];
@@ -258,7 +275,7 @@ pub fn resolve_tool(name: &str, defs: &Value) -> Result<(String, Option<String>)
     }
     let near = closest(name, names.iter().copied(), 5);
     Err(ToolError::new(
-        "unknown_tool",
+        "not_found",
         format!("no tool `{name}`"),
         if near.is_empty() { "call tools/list for the tools".to_string() } else { format!("call one of: {}", near.join(", ")) },
     )
@@ -273,12 +290,14 @@ fn result_json(r: &ToolResult) -> Value {
 
 /// An error result in the contract's shape: the error as JSON text and as structured content.
 pub fn error_result(e: &ToolError, warnings: &[String]) -> Value {
-    let mut err = e.to_json();
+    let err = e.to_json();
+    let mut body = json!({"error": err});
+    let mut text = e.text();
     if !warnings.is_empty() {
-        err["warnings"] = json!(warnings);
+        body["warnings"] = json!(warnings);
+        text.push_str(&format!("\nwarnings: {}", warnings.join("; ")));
     }
-    let body = json!({"error": err});
-    json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default()}], "isError": true, "structuredContent": body})
+    json!({"content": [{"type": "text", "text": text}], "isError": true, "structuredContent": body})
 }
 
 /// A successful JSON result: `v` (an object; other values under `result`) as text and as
@@ -363,7 +382,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             };
             if !scale.is_finite() || !(0.1..=8.0).contains(&scale) {
                 return Err(ToolError::new(
-                    "bad_params",
+                    "invalid_argument",
                     format!("resolution {:.0} dpi is outside 7–576 dpi", scale * 72.0),
                     "ask for a dpi between 7 and 576 (96 is screen size)",
                 ));
@@ -461,7 +480,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             }
             if p.get("markdown").is_none() && p.get("path").is_none() {
                 return Err(ToolError::new(
-                    "bad_params",
+                    "invalid_argument",
                     "missing `markdown` or `path`",
                     "pass the Markdown text as `markdown`, or a .md file as `path`",
                 ));
@@ -501,7 +520,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                     ToolError::new("failed", format!("could not keep the unsaved changes: {e}"), "save_document first, or close with discard: true")
                 })?;
                 crate::recover::clear_marker(&dir);
-                out["recovered"] = json!(path.to_string_lossy());
+                out["recovered_path"] = json!(path.to_string_lossy());
                 warnings.push(format!("the unsaved changes were kept in {} (open_document on it to continue)", path.display()));
             }
             exec(b, "file.new", json!({"template": "blank"})).map_err(|e| contract::classify(&e, "close_document", a, &[]))?;
@@ -509,7 +528,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
         }
         "execute" => {
             let Some(c) = st("command") else {
-                return Err(ToolError::new("bad_params", "missing `command`", "pass {\"command\": \"<id>\", \"params\": {…}}"));
+                return Err(ToolError::new("invalid_argument", "missing `command`", "pass {\"command\": \"<id>\", \"params\": {…}}"));
             };
             exec_forgiving(b, c, a.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})), warnings).map(Out::Json)
         }
@@ -518,17 +537,25 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let list = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
             let total = list.len();
             let mut out = Vec::new();
+            // WHIQ parity pass: a cancelled call leaves the document as it was before the call.
+            b.begin_call();
             for (i, c) in list.into_iter().enumerate() {
                 progress(i as u64, total as u64, "batch commands");
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("").to_string();
-                // A safe point between commands: those before it ran, each whole.
+                // A safe point between commands: the whole batch is undone.
                 if wordcraft_engine::whiq_progress::cancel_requested() {
+                    let rolled = b.rollback_call();
                     return Err(ToolError::new(
                         "cancelled",
                         format!("cancelled before command {} of {total} (`{id}`)", i + 1),
-                        "the commands before it ran (see results); send the rest as a new batch to go on, or undo them with execute edit.undo",
+                        if rolled {
+                            "the document is as it was before the batch (nothing of it stays): send the batch again to do it"
+                        } else {
+                            "the commands before it ran (see results); send the rest as a new batch to go on"
+                        },
                     )
                     .with("results", json!(out))
+                    .with("rolled_back", json!(rolled))
                     .with("stopped_at", json!(i)));
                 }
                 match exec_forgiving(b, &id, c.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})), warnings) {
@@ -556,16 +583,23 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let t = st("text").unwrap_or("");
             let mut last = Value::Null;
             let lines = t.split('\n').count();
+            b.begin_call();
             for (i, line) in t.split('\n').enumerate() {
                 progress(i as u64, lines as u64, "typing paragraphs");
-                // A safe point between paragraphs: those before it are typed, each whole.
+                // A safe point between paragraphs: the whole call is undone.
                 if wordcraft_engine::whiq_progress::cancel_requested() {
+                    let rolled = b.rollback_call();
                     return Err(ToolError::new(
                         "cancelled",
                         format!("cancelled before paragraph {} of {lines}", i + 1),
-                        "the paragraphs before it are typed; send the rest of the text to go on",
+                        if rolled {
+                            "the document is as it was before the call (nothing was typed): call it again to type the text"
+                        } else {
+                            "the paragraphs before it are typed; send the rest of the text to go on"
+                        },
                     )
-                    .with("typed_paragraphs", json!(i)));
+                    .with("rolled_back", json!(rolled))
+                    .with("typed_paragraphs", json!(if rolled { 0 } else { i })));
                 }
                 if i > 0 {
                     last = exec(b, "text.newParagraph", json!({})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
@@ -688,6 +722,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
         wordcraft_engine::whiq_progress::phase(&name);
     }
     let (out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
+    b.end_call();
     if let (Some(_), Some(prev)) = (&caller, before) {
         let _ = exec(b, "file.setAuthor", json!({"name": prev}));
     }
@@ -695,9 +730,15 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
         .iter()
         .map(|(dest, old)| {
             warnings.push(format!("{} existed: it was kept as {} (pass overwrite: true to replace a file)", dest.display(), old.display()));
-            json!({"path": dest.to_string_lossy(), "kept_as": old.to_string_lossy()})
+            json!({"path": dest.to_string_lossy(), "previous": old.to_string_lossy()})
         })
         .collect();
+    let notice = (!kept_json.is_empty()).then(|| {
+        format!(
+            "an existing file was kept: {} (pass overwrite: true to replace instead)",
+            kept_json.iter().filter_map(|k| k["previous"].as_str()).collect::<Vec<_>>().join(", ")
+        )
+    });
     let max = args.get("max_bytes").and_then(Value::as_u64).map_or(limits.max_result_bytes, |m| (m as usize).clamp(1024, 4 << 20));
     let from = args.get("continue_from").and_then(Value::as_u64).unwrap_or(0) as usize;
     match out {
@@ -707,7 +748,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
                 if !v.is_object() {
                     v = json!({"result": v});
                 }
-                v["kept_previous"] = json!(kept_json);
+                v["previous_files_renamed"] = json!(kept_json);
+                v["notice"] = json!(notice);
             }
             json_result(v, &warnings)
         }
@@ -715,13 +757,17 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
             if !warnings.is_empty() {
                 summary["warnings"] = json!(warnings);
             }
+            if !kept_json.is_empty() {
+                summary["previous_files_renamed"] = json!(kept_json);
+                summary["notice"] = json!(notice);
+            }
             let mut content: Vec<Value> = images.into_iter().map(|d| json!({"type": "image", "data": d, "mimeType": "image/png"})).collect();
             content.push(json!({"type": "text", "text": summary.to_string()}));
             json!({"content": content, "isError": false, "structuredContent": summary})
         }
         Err(mut e) => {
             if !kept_json.is_empty() {
-                e = e.with("kept_previous", json!(kept_json));
+                e = e.with("previous_files_renamed", json!(kept_json));
             }
             error_result(&e, &warnings)
         }

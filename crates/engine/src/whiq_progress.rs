@@ -10,11 +10,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::CmdError;
 
 /// How far the running call is: `done` of `total` steps (0 when it can't count) of `phase`.
+/// WHIQ parity pass: also the stages passed so far (in order, the current one last) and the
+/// overall fraction done (0..1, never going back), the shape every craft app's `job_status`
+/// reports.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Progress {
     pub done: u64,
     pub total: u64,
     pub phase: String,
+    pub stages: Vec<String>,
+    pub overall: f64,
 }
 
 static PROGRESS: Mutex<Option<Progress>> = Mutex::new(None);
@@ -32,7 +37,16 @@ pub fn watch_this_thread() {
 /// The running call is at step `done` of `total` of `phase`.
 pub fn report(done: u64, total: u64, phase: &str) {
     if let Ok(mut p) = PROGRESS.lock() {
-        *p = Some(Progress { done, total: total.max(done), phase: phase.chars().take(200).collect() });
+        let phase: String = phase.chars().take(200).collect();
+        let total = total.max(done);
+        let (mut stages, before) = p.take().map(|q| (q.stages, q.overall)).unwrap_or_default();
+        if !phase.is_empty() && stages.last() != Some(&phase) && stages.len() < 64 {
+            stages.push(phase.clone());
+        }
+        // Counted steps say how far the whole call is (multi-stage commands count their stages
+        // as steps); the fraction never goes back, and 1 only comes with the end of the call.
+        let frac = if total > 0 { (done as f64 / total as f64).min(0.99) } else { 0.0 };
+        *p = Some(Progress { done, total, phase, stages, overall: before.max(frac) });
     }
 }
 
@@ -84,7 +98,11 @@ mod tests {
         reset();
         assert!(check("x").is_ok());
         report(2, 5, "pages");
-        assert_eq!(current(), Some(Progress { done: 2, total: 5, phase: "pages".into() }));
+        assert_eq!(current(), Some(Progress { done: 2, total: 5, phase: "pages".into(), stages: vec!["pages".into()], overall: 0.4 }));
+        // A later stage with fewer steps done never takes the fraction back.
+        report(0, 3, "writing");
+        let p = current().unwrap();
+        assert_eq!((p.stages.len(), p.overall), (2, 0.4));
         cancel();
         assert!(check("stopped before page 3").is_err_and(|e| e.to_string().starts_with("cancelled: stopped before page 3")));
         reset();

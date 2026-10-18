@@ -1,2 +1,9 @@
+# WHIQ parity pass: local builds embed the craft-fonts checkout next to this repository when it
+# exists (build.rs warns and continues without it), like GridCraft and DeckCraft. Releases pin
+# craft-fonts 43913056 and set CRAFT_FONTS_DIR explicitly, with CRAFT_FONTS_REQUIRED=1
+# (.github/workflows/whiq-release.yml, WHIQ-CHANGES.md "Parity pass").
+[env]
+CRAFT_FONTS_DIR = { value = "../craft-fonts", relative = true }
+
 [alias]
 xtask = "run --package xtask --"

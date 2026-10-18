@@ -32,8 +32,8 @@ USAGE:
   wordcraft-cli commands [--json]             list every command
   wordcraft-cli parity [--markdown]           feature-catalog parity
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
-                    [--job-after-ms N] [--max-result-bytes N] [--max-memory-mb N]
-                    [--checkpoint-edits N] [--checkpoint-secs N]
+                    [--job-after-ms N] [--busy-after-ms N] [--open-job-mb N] [--max-result-bytes N]
+                    [--max-memory-mb N] [--idle-evict-secs N] [--checkpoint-edits N] [--checkpoint-secs N]
                                               MCP server on stdio (headless, or bridged to the app).
                                               --automation-read-root / --automation-write-root confine
                                               the files the agent's commands read (open, insert text
@@ -42,10 +42,14 @@ USAGE:
                                               out grants none of its access. They apply to the headless
                                               server and are an error with --connect. Relative
                                               paths are inside the write root. A call running past
-                                              --job-after-ms (default 15000) becomes a job
-                                              (job_status); results over --max-result-bytes
-                                              (default 100000) are trimmed with continue_from; past
-                                              --max-memory-mb the document is auto-saved and closed.
+                                              --job-after-ms (default 15000), and opening a file of
+                                              --open-job-mb (default 20) or more, become a job
+                                              (job_status); a call arriving while another runs waits
+                                              --busy-after-ms (default 300) then answers busy;
+                                              results over --max-result-bytes (default 100000) are
+                                              trimmed with continue_from; past --max-memory-mb, or
+                                              after --idle-evict-secs without calls, the document is
+                                              auto-saved and closed (evicted).
                                               SIGTERM / SIGINT auto-save unsaved work to
                                               <name>.recovered-<stamp>.docx in the write root;
                                               unsaved work is checkpointed there every
@@ -272,6 +276,9 @@ const MCP_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--author", takes_value: true },
     // WHIQ: the "no dead stops" contract's limits.
     OptionSpec { name: "--job-after-ms", takes_value: true },
+    OptionSpec { name: "--busy-after-ms", takes_value: true },
+    OptionSpec { name: "--open-job-mb", takes_value: true },
+    OptionSpec { name: "--idle-evict-secs", takes_value: true },
     OptionSpec { name: "--max-result-bytes", takes_value: true },
     OptionSpec { name: "--max-memory-mb", takes_value: true },
     OptionSpec { name: "--checkpoint-edits", takes_value: true },
@@ -550,6 +557,21 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             if let Some(ms) = number("--job-after-ms")? {
                 options.job_after = std::time::Duration::from_millis(ms.clamp(10, 600_000));
             }
+            if let Some(ms) = number("--busy-after-ms")? {
+                options.busy_after = std::time::Duration::from_millis(ms.min(600_000));
+            }
+            if let Some(v) = arg_value(&rest, "--open-job-mb") {
+                let mb: f64 = v
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| m.is_finite() && *m >= 0.0)
+                    .ok_or_else(|| format!("mcp: --open-job-mb needs a number, got `{v}`"))?;
+                options.open_job_bytes = (mb * 1024.0 * 1024.0) as u64;
+            }
+            if let Some(s) = number("--idle-evict-secs")? {
+                options.idle_evict = (s > 0).then(|| std::time::Duration::from_secs(s.min(30 * 86_400)));
+            }
             if let Some(n) = number("--checkpoint-edits")? {
                 options.checkpoint_edits = n.min(1_000_000) as u32;
             }
@@ -573,7 +595,9 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             // Work an earlier server auto-saved here, for server_status from the first request on.
             if let Ok(mut g) = shared.lock() {
                 let dir = wordcraft_mcp::recover::recovery_dir(g.write_root.as_deref(), None);
-                g.recovered = wordcraft_mcp::recover::read_marker(&dir);
+                for f in wordcraft_mcp::recover::scan(&dir) {
+                    g.add_recovered(f);
+                }
             }
             // Relative paths are resolved inside the write root.
             if let Some(w) = shared.lock().ok().and_then(|g| g.write_root.clone()) {

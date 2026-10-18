@@ -27,18 +27,18 @@ fn text_of(m: &mut Mcp) -> String {
 fn errors_carry_code_reason_and_next_step() {
     let d = Dir::new("errors");
     let mut m = Mcp::start(&d.0, &[]);
-    let e = m.err("no_such_tool", json!({}), "unknown_tool");
+    let e = m.err("no_such_tool", json!({}), "not_found");
     assert!(e["next_step"].as_str().unwrap().contains("tools/list") || e["closest"].is_array(), "{e}");
-    let e = m.err("execute", json!({"command": "format.blod"}), "unknown_command");
+    let e = m.err("execute", json!({"command": "format.blod"}), "not_found");
     assert_eq!(e["closest"][0], "format.bold", "{e}");
-    let e = m.err("open_document", json!({}), "bad_params");
+    let e = m.err("open_document", json!({}), "invalid_argument");
     assert!(e["next_step"].as_str().unwrap().contains("`path`"), "{e}");
     std::fs::write(d.path("report.docx"), b"x").unwrap();
     let e = m.err("open_document", json!({"path": "reprot.docx"}), "not_found");
     assert!(e["closest"].as_array().unwrap().iter().any(|c| c.as_str().unwrap().ends_with("report.docx")), "{e}");
     let e = m.err("render_page", json!({"page": 9}), "out_of_range");
     assert!(e["next_step"].as_str().unwrap().contains("1–1"), "{e}");
-    let e = m.err("execute", json!({"command": "file.encrypt", "params": {"password": 5}}), "bad_params");
+    let e = m.err("execute", json!({"command": "file.encrypt", "params": {"password": 5}}), "invalid_argument");
     assert!(e["next_step"].as_str().unwrap().contains("file.encrypt"), "{e}");
     m.ok("type_text", json!({"text": "The quarterly report is ready."}));
     let e = m.err("select_text", json!({"text": "quartely reprot"}), "not_found");
@@ -46,6 +46,10 @@ fn errors_carry_code_reason_and_next_step() {
     // A JSON-RPC level failure carries the same shape in `data`.
     let r = m.request("nope/nope", json!({}));
     assert!(r["error"].is_object(), "{r}");
+    // The text block an agent reads first: `[code] reason` and the next step.
+    let r = m.call("render_page", json!({"page": 9}));
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("[out_of_range] ") && text.contains("\nnext_step: "), "{text}");
 }
 
 // §2 Nothing hangs: busy with a retry time, long work as a job whose result survives.
@@ -64,7 +68,7 @@ fn a_long_call_becomes_a_job_and_others_get_busy() {
     assert!(t0.elapsed() < Duration::from_millis(1500), "busy came at once");
     // server_status is answered while the call runs and shows it.
     let st = m.ok("server_status", json!({}));
-    assert_eq!(st["busy"]["tool"], "__sleep", "{st}");
+    assert_eq!(st["current_call"]["tool"], "__sleep", "{st}");
     // Past job_after_ms the long call answers with a job id.
     let started = m.reply(long);
     let job = started["result"]["structuredContent"].clone();
@@ -74,33 +78,64 @@ fn a_long_call_becomes_a_job_and_others_get_busy() {
     // Busy now names the job.
     let e = m.err("get_text", json!({}), "busy");
     assert_eq!(e["job_id"], jid.as_str());
-    // job_status: running, then done with the result, which stays available.
+    // job_status: running (with progress in the shared shape), then done with the result,
+    // which stays available.
     let st = m.ok("job_status", json!({"job_id": jid}));
     assert_eq!(st["status"], "running", "{st}");
+    for k in ["job_id", "tool", "elapsed_ms", "progress", "stage", "steps", "stages", "retry_after_ms", "next_step"] {
+        assert!(st.get(k).is_some(), "job_status lacks {k}: {st}");
+    }
     let done = loop {
         std::thread::sleep(Duration::from_millis(200));
-        let r = m.call("job_status", json!({"job_id": jid.to_uppercase()}));
-        if r["structuredContent"]["job"]["status"] == "done" {
+        let r = m.ok("job_status", json!({"job_id": jid.to_uppercase()}));
+        if r["status"] == "done" {
             break r;
         }
         assert!(t0.elapsed() < Duration::from_secs(20), "the job never finished");
     };
-    assert_eq!(done["structuredContent"]["slept_ms"], 2000, "{done}");
+    assert_eq!(done["result"]["slept_ms"], 2000, "{done}");
+    assert_eq!(done["progress"], 1.0, "{done}");
     let again = m.ok("job_status", json!({"job_id": jid}));
-    assert_eq!(again["slept_ms"], 2000, "the result survives being read");
+    assert_eq!(again["result"]["slept_ms"], 2000, "the result survives being read");
     assert_eq!(text_of(&mut m), "Before the job.");
-    // background: true makes any call a job at once.
-    let j = m.ok("get_text", json!({"background": true}));
-    let jid2 = j["job_id"].as_str().unwrap().to_string();
-    let r = loop {
-        let r = m.ok("job_status", json!({"job_id": jid2}));
-        if r["job"]["status"] == "done" {
-            break r;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(r["text"], "Before the job.");
-    m.err("job_status", json!({"job_id": "job-999"}), "job_not_found");
+    // async: true makes any call a job at once (`background`, the older name, too).
+    for flag in ["async", "background"] {
+        let j = m.ok("get_text", json!({flag: true}));
+        let jid2 = j["job_id"].as_str().unwrap().to_string();
+        let r = loop {
+            let r = m.ok("job_status", json!({"job_id": jid2}));
+            if r["status"] == "done" {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(r["result"]["text"], "Before the job.");
+    }
+    // Every job, through list_jobs and job_status without an id.
+    let all = m.ok("list_jobs", json!({}));
+    assert_eq!(all["jobs"].as_array().unwrap().len(), 3, "{all}");
+    assert_eq!(m.ok("job_status", json!({}))["jobs"], all["jobs"]);
+    let e = m.err("job_status", json!({"job_id": "job-999"}), "not_found");
+    assert!(e["closest"].is_array(), "{e}");
+}
+
+// §2 Opening a very large file is a job from the start (`--open-job-mb`); a call that waits behind
+// another is served once it ends (within `--busy-after-ms`), else answered busy.
+#[test]
+fn a_big_open_is_a_job_and_pipelined_calls_wait_their_turn() {
+    let d = Dir::new("bigopen");
+    let mut m = Mcp::start(&d.0, &["--open-job-mb", "0.001"]);
+    m.ok("type_text", json!({"text": "A document a little over a kilobyte. ".repeat(40)}));
+    m.ok("save_document", json!({"path": "big.docx"}));
+    let started = m.ok("open_document", json!({"path": "big.docx"}));
+    let jid = started["job_id"].as_str().expect("a job id at once").to_string();
+    let done = job_result(&mut m, &jid);
+    assert_eq!(done["structuredContent"]["status"], "done", "{done}");
+    // Pipelined: the second call waits for the first (it is short) instead of answering busy.
+    let a = m.send("tools/call", json!({"name": "__sleep", "arguments": {"ms": 100}}));
+    let b = m.send("tools/call", json!({"name": "get_text", "arguments": {}}));
+    assert_eq!(m.reply(a)["result"]["isError"], false);
+    assert_eq!(m.reply(b)["result"]["isError"], false, "served after the first call");
 }
 
 // §3 Work is never lost: SIGTERM auto-saves; the next server names the file.
@@ -117,16 +152,16 @@ fn sigterm_auto_saves_and_the_next_call_names_the_file() {
     let recovered: Vec<String> = d.names().into_iter().filter(|n| n.starts_with("draft.recovered-") && n.ends_with(".docx")).collect();
     assert_eq!(recovered.len(), 1, "{:?}", d.names());
     assert!(d.path(".wordcraft-recovered.json").is_file());
-    // A new server on the same root: the first call needing the document answers evicted.
+    // A new server on the same root lists it and names it on its first answer (once).
     let mut m = Mcp::start(&d.0, &[]);
     let st = m.ok("server_status", json!({}));
-    assert!(st["recovered"].to_string().contains(&recovered[0]), "{st}");
-    let e = m.err("type_text", json!({"text": "x"}), "evicted");
-    assert!(e["next_step"].as_str().unwrap().contains(&recovered[0]), "{e}");
+    assert!(st["recovered_files"].to_string().contains(&recovered[0]), "{st}");
+    let r = m.ok("get_text", json!({}));
+    assert!(r["recovered_files"].to_string().contains(&recovered[0]), "{r}");
+    assert_eq!(r["recovered_files"][0]["reason"], "found");
+    assert!(m.ok("get_text", json!({})).get("recovered_files").is_none(), "named once");
     m.ok("open_document", json!({"path": recovered[0]}));
     assert_eq!(text_of(&mut m), "Unsaved words");
-    // Told once.
-    m.ok("type_text", json!({"text": "!"}));
     assert!(!d.path(".wordcraft-recovered.json").exists());
 }
 
@@ -146,7 +181,8 @@ fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
     let d = Dir::new("cancel");
     let mut m = Mcp::start(&d.0, &[]);
     // Nothing running: nothing to stop.
-    assert_eq!(m.ok("cancel", json!({}))["cancelled"], false);
+    let c = m.ok("cancel", json!({}));
+    assert_eq!((c["cancelled"].as_bool(), c["status"].as_str()), (Some(false), Some("not_running")), "{c}");
     // Progress notifications for a call that asks for them, as it runs.
     let id = m.send("tools/call", json!({"name": "__sleep", "arguments": {"ms": 2500}, "_meta": {"progressToken": "tok-1"}}));
     let r = m.reply(id);
@@ -158,7 +194,7 @@ fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
     assert!(notes[0]["params"]["message"].as_str().unwrap().contains("__sleep"), "{:?}", notes[0]);
 
     // A long multi-paragraph type_text as a job: progress counts paragraphs; cancel stops it
-    // between paragraphs, those typed stay whole.
+    // between paragraphs and the document is as it was before the call.
     let lines: Vec<String> = (0..40_000).map(|i| format!("Line {i}")).collect();
     let id = m.send(
         "tools/call",
@@ -166,20 +202,34 @@ fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
     );
     let started = m.reply(id);
     let jid = started["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    let running = wait_for("progress", || {
+        let st = m.ok("job_status", json!({"job_id": jid}));
+        (st["steps"]["done"].as_u64().unwrap_or(0) > 0).then_some(st)
+    });
+    assert!(running["stages"].to_string().contains("typing paragraphs"), "{running}");
+    assert!(running["progress"].as_f64().unwrap() > 0.0, "{running}");
     let c = m.ok("cancel", json!({"job_id": jid}));
-    assert_eq!(c["cancelling"], true, "{c}");
+    assert_eq!((c["cancelled"].as_bool(), c["status"].as_str()), (Some(true), Some("cancelling")), "{c}");
     let done = job_result(&mut m, &jid);
+    assert_eq!(done["structuredContent"]["status"], "cancelled", "{done}");
     let e = &done["structuredContent"]["error"];
     assert_eq!(e["code"], "cancelled", "{done}");
-    let typed = e["typed_paragraphs"].as_u64().unwrap() as usize;
-    assert!(typed < 40_000, "{e}");
-    let text = text_of(&mut m);
-    let expected: Vec<&str> = lines.iter().take(typed).map(String::as_str).collect();
-    assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), typed, "{e}");
-    assert!(text.starts_with(&expected.join("\n").chars().take(200).collect::<String>()), "the paragraphs before it are whole");
-    // A finished job can't be cancelled.
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert_eq!(text_of(&mut m), "", "nothing of the stopped call stays");
+    // An ended job can't be cancelled.
     let again = m.ok("cancel", json!({"job_id": jid}));
-    assert_eq!(again["status"], "done", "{again}");
+    assert_eq!((again["cancelled"].as_bool(), again["status"].as_str()), (Some(false), Some("cancelled")), "{again}");
+    // A batch stopped part way is undone as a whole.
+    m.ok("type_text", json!({"text": "kept"}));
+    let cmds: Vec<Value> = (0..20_000).map(|_| json!({"command": "text.insert", "params": {"text": "x"}})).collect();
+    let id = m.send("tools/call", json!({"name": "batch", "arguments": {"commands": cmds, "async": true}}));
+    let jid = m.reply(id)["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    wait_for("the batch to start", || (m.ok("job_status", json!({"job_id": jid}))["steps"]["done"].as_u64().unwrap_or(0) > 0).then_some(()));
+    m.ok("cancel", json!({}));
+    let done = job_result(&mut m, &jid);
+    assert_eq!(done["structuredContent"]["error"]["code"], "cancelled", "{done}");
+    assert_eq!(text_of(&mut m), "kept");
+    m.ok("new_document", json!({}));
 
     // A review edit batch stopped part way changes nothing (all or nothing).
     m.ok("new_document", json!({}));
@@ -193,7 +243,7 @@ fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
     assert_eq!(text_of(&mut m), "alpha beta gamma delta");
     assert_eq!(m.ok("list_changes", json!({}))["comments"].as_array().map_or(0, Vec::len), 0, "nothing of the batch stayed");
     // An unknown job.
-    m.err("cancel", json!({"job_id": "job-99"}), "job_not_found");
+    m.err("cancel", json!({"job_id": "job-99"}), "not_found");
 }
 
 /// Wait (bounded) until `f` finds something.
@@ -228,9 +278,10 @@ fn a_hard_kill_loses_at_most_the_edits_since_the_last_checkpoint() {
     let ck = wait_for("the checkpoint", || d.names().into_iter().find(|n| n.starts_with("work.recovered-") && n.ends_with(".docx")));
     let st = wait_for("the checkpoint in server_status", || {
         let st = m.ok("server_status", json!({}));
-        st["checkpoints"]["last"]["path"].as_str().is_some_and(|p| p.ends_with(&ck)).then_some(st)
+        st["checkpoints"]["files"][0]["path"].as_str().is_some_and(|p| p.ends_with(&ck)).then_some(st)
     });
     assert_eq!(st["checkpoints"]["every_edits"], 3, "{st}");
+    assert_eq!(st["checkpoints"]["writes"], 1, "{st}");
     assert!(d.path(".wordcraft-recovered.json").is_file());
     assert_eq!(file_text(&d.path(&ck)), "one two three");
     // After the checkpoint: this edit is what a hard kill loses.
@@ -240,8 +291,8 @@ fn a_hard_kill_loses_at_most_the_edits_since_the_last_checkpoint() {
     let recovered: Vec<String> = d.names().into_iter().filter(|n| n.starts_with("work.recovered-")).collect();
     assert_eq!(recovered, std::slice::from_ref(&ck), "{:?}", d.names());
     let mut m = Mcp::start(&d.0, &[]);
-    let e = m.err("type_text", json!({"text": "x"}), "evicted");
-    assert!(e["next_step"].as_str().unwrap().contains(&ck), "{e}");
+    let st = m.ok("server_status", json!({}));
+    assert!(st["recovered_files"].to_string().contains(&ck), "the next server names it: {st}");
     m.ok("open_document", json!({"path": ck}));
     assert_eq!(text_of(&mut m), "one two three");
 }
@@ -290,7 +341,7 @@ fn a_panic_is_answered_and_the_work_auto_saved() {
     let mut m = Mcp::start(&d.0, &[]);
     m.ok("type_text", json!({"text": "Work before the failure"}));
     let e = m.err("__panic", json!({}), "internal");
-    let path = e["recovered"].as_str().unwrap().to_string();
+    let path = e["recovered_path"].as_str().unwrap().to_string();
     assert!(std::path::Path::new(&path).is_file(), "{e}");
     assert!(path.starts_with(&d.0.to_string_lossy().into_owned()), "inside the write root: {path}");
     assert_eq!(text_of(&mut m), "Work before the failure", "the server keeps answering");
@@ -305,12 +356,16 @@ fn memory_pressure_evicts_with_the_work_auto_saved() {
     let st = m.ok("server_status", json!({}));
     let rss = st["memory"]["rss_bytes"].as_u64().unwrap_or(0);
     assert!(rss > 1024 * 1024, "{st}");
-    assert!(st["memory"]["rss_source"].as_str().is_some_and(|s| !s.is_empty()), "{st}");
+    assert!(st["memory"]["source"].as_str().is_some_and(|s| !s.is_empty()), "{st}");
+    assert_eq!(st["memory"]["measured"], true, "{st}");
+    assert_eq!(st["memory"]["limit_bytes"], 1024 * 1024, "{st}");
     let r = m.ok("type_text", json!({"text": "Precious"}));
     assert!(r["warnings"].to_string().contains("evicted"), "{r}");
     let e = m.err("get_text", json!({}), "evicted");
-    let p = e["recovered"].as_str().unwrap().to_string();
+    let p = e["recovered_path"].as_str().unwrap().to_string();
     assert!(e["next_step"].as_str().unwrap().contains(&p), "{e}");
+    // Until a document is opened or started, every call that needs one says so.
+    m.err("get_text", json!({}), "evicted");
     let mut m2 = Mcp::start(&d.0, &[]);
     m2.ok("open_document", json!({"path": p}));
     assert_eq!(text_of(&mut m2), "Precious");
@@ -347,10 +402,28 @@ fn oversized_results_are_trimmed_with_continue_from() {
     assert!(t["text"].as_str().unwrap().starts_with("Paragraph number 0"));
     // server_status reports memory, the document, jobs, roots and version.
     let st = m.ok("server_status", json!({}));
-    for k in ["memory", "document", "jobs", "roots", "version", "recovered", "busy"] {
+    for k in [
+        "server",
+        "version",
+        "protocol",
+        "pid",
+        "uptime_ms",
+        "author",
+        "memory",
+        "fonts",
+        "roots",
+        "documents",
+        "current_call",
+        "jobs",
+        "recovered_files",
+        "evicted",
+        "checkpoints",
+        "limits",
+    ] {
         assert!(st.get(k).is_some(), "server_status lacks {k}: {st}");
     }
-    assert_eq!(st["document"]["paragraphs"], 400);
+    assert_eq!(st["documents"][0]["paragraphs"], 400);
+    assert!(st["fonts"]["faces"].is_number(), "{st}");
     assert_eq!(st["roots"]["write"], d.0.to_string_lossy().as_ref());
 }
 
@@ -384,11 +457,12 @@ fn saves_are_confined_atomic_and_never_silently_overwrite() {
     let mut m = Mcp::start(&d.0, &[]);
     m.ok("type_text", json!({"text": "Version one"}));
     let r = m.ok("save_document", json!({"path": "report.docx"}));
-    assert!(r.get("kept_previous").is_none());
+    assert!(r.get("previous_files_renamed").is_none());
     assert!(d.path("report.docx").is_file(), "a relative path is inside the write root");
     m.ok("type_text", json!({"text": " and two"}));
     let r = m.ok("save_document", json!({"path": "report.docx"}));
-    assert_eq!(r["kept_previous"][0]["kept_as"].as_str().map(|p| p.ends_with("OLD_report.docx")), Some(true), "{r}");
+    assert_eq!(r["previous_files_renamed"][0]["previous"].as_str().map(|p| p.ends_with("OLD_report.docx")), Some(true), "{r}");
+    assert!(r["notice"].as_str().unwrap().contains("OLD_report.docx"), "the response says so: {r}");
     assert!(r["warnings"].to_string().contains("OLD_report.docx"), "the response says so: {r}");
     // The kept file is the previous version.
     let mut m2 = Mcp::start(&d.0, &[]);
@@ -397,21 +471,22 @@ fn saves_are_confined_atomic_and_never_silently_overwrite() {
     drop(m2);
     // overwrite: true replaces.
     let r = m.ok("save_document", json!({"path": "report.docx", "overwrite": true}));
-    assert!(r.get("kept_previous").is_none(), "{r}");
+    assert!(r.get("previous_files_renamed").is_none(), "{r}");
     // Exports follow the same rule.
     m.ok("export_pdf", json!({"path": "report.pdf"}));
     let r = m.ok("export_pdf", json!({"path": "report.pdf"}));
-    assert!(r["kept_previous"].is_array(), "{r}");
+    assert!(r["previous_files_renamed"].is_array(), "{r}");
     // No temporary files are left behind.
     assert_eq!(d.names(), ["OLD_report.docx", "OLD_report.pdf", "report.docx", "report.pdf"]);
     // Outside the roots: refused, nothing written.
-    m.err("save_document", json!({"path": outside.s("x.docx")}), "path_refused");
-    m.err("save_document", json!({"path": "../x.docx"}), "path_refused");
-    m.err("open_document", json!({"path": outside.s("x.docx")}), "path_refused");
+    let e = m.err("save_document", json!({"path": outside.s("x.docx")}), "outside_root");
+    assert_eq!(e["write_root"], d.0.to_string_lossy().as_ref(), "{e}");
+    m.err("save_document", json!({"path": "../x.docx"}), "outside_root");
+    m.err("open_document", json!({"path": outside.s("x.docx")}), "outside_root");
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&outside.0, d.path("escape")).unwrap();
-        m.err("save_document", json!({"path": "escape/y.docx"}), "path_refused");
+        m.err("save_document", json!({"path": "escape/y.docx"}), "outside_root");
     }
     assert!(outside.names().is_empty());
 }
@@ -449,11 +524,22 @@ fn annotations_say_what_each_tool_does() {
     let d = Dir::new("annotations");
     let mut m = Mcp::start(&d.0, &[]);
     let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
-    let reads = ["list_commands", "get_text", "inspect_document", "render_page", "parity", "screenshot", "ui_inspect", "server_status", "job_status"];
+    let reads = [
+        "list_commands",
+        "get_text",
+        "inspect_document",
+        "render_page",
+        "parity",
+        "screenshot",
+        "ui_inspect",
+        "server_status",
+        "job_status",
+        "list_jobs",
+    ];
     for t in &tools {
         let name = t["name"].as_str().unwrap();
         let a = &t["annotations"];
-        for k in ["readOnlyHint", "destructiveHint", "idempotentHint"] {
+        for k in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
             assert!(a[k].is_boolean(), "{name} lacks {k}");
         }
         let ro = a["readOnlyHint"] == true;
@@ -483,6 +569,13 @@ fn annotations_say_what_each_tool_does() {
         assert_eq!(by(n)["destructiveHint"], true, "{n}");
     }
     assert_eq!(by("select_text")["destructiveHint"], false);
+    for n in ["cancel", "evict"] {
+        assert_eq!(
+            (by(n)["readOnlyHint"].as_bool(), by(n)["destructiveHint"].as_bool(), by(n)["idempotentHint"].as_bool()),
+            (Some(false), Some(false), Some(true)),
+            "{n}"
+        );
+    }
     assert_eq!(by("new_document")["idempotentHint"], true);
     assert_eq!(by("save_document")["idempotentHint"], false);
     // Every kind of result carries structuredContent: JSON, images, errors.
@@ -682,7 +775,7 @@ fn markdown_imports_the_platforms_document_shapes_with_a_theme() {
     m.ok("type_text", json!({"text": "Hello"}));
     let t = m.ok("apply_theme", json!({"theme": {"font": "Inter", "primary": "#880000"}}));
     assert!(t["applied"].as_array().unwrap().iter().any(|x| x == "body font"), "{t}");
-    m.err("import_markdown", json!({}), "bad_params");
+    m.err("import_markdown", json!({}), "invalid_argument");
 }
 
 /// Pages of a PDF (`/Type /Page` objects, not `/Pages`).
@@ -741,7 +834,7 @@ fn pages_render_to_png_and_pdf_by_range_with_and_without_markup() {
     assert_ne!(plain["content"][0]["data"], marked["content"][0]["data"], "markup shows the comment");
     assert_eq!(marked["structuredContent"]["markup"], true);
     m.err("render_page", json!({"pages": "4-9"}), "out_of_range");
-    m.err("render_page", json!({"page": 1, "dpi": 5000}), "bad_params");
+    m.err("render_page", json!({"page": 1, "dpi": 5000}), "invalid_argument");
     // PDF: all pages, a range, with and without markup.
     m.ok("export_pdf", json!({"path": "all.pdf"}));
     m.ok("export_pdf", json!({"path": "two.pdf", "pages": "2-3"}));
@@ -760,4 +853,31 @@ fn pages_render_to_png_and_pdf_by_range_with_and_without_markup() {
     let o = cli(&["convert", "doc.docx", "cli.pdf", "--pages", "1-2"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(pdf_pages(&std::fs::read(d.path("cli.pdf")).unwrap()), 2);
+}
+
+// §3 Idle eviction (`--idle-evict-secs`) and `evict` (for a supervisor): the work is auto-saved in
+// the write root, a call that needs the document answers `evicted` with the file until one is
+// opened, and server_status lists the eviction.
+#[test]
+fn idle_eviction_and_evict_auto_save_and_name_the_file() {
+    let d = Dir::new("idle");
+    let mut m = Mcp::start(&d.0, &["--idle-evict-secs", "1"]);
+    m.ok("type_text", json!({"text": "Idle work"}));
+    std::thread::sleep(Duration::from_millis(2600));
+    let e = m.err("get_text", json!({}), "evicted");
+    let p = e["recovered_path"].as_str().unwrap().to_string();
+    assert!(p.starts_with(&d.0.to_string_lossy().into_owned()) && p.contains(".recovered-"), "{e}");
+    let st = m.ok("server_status", json!({}));
+    assert_eq!(st["evicted"][0]["recovered_path"], p.as_str(), "{st}");
+    m.ok("open_document", json!({"path": p}));
+    assert_eq!(text_of(&mut m), "Idle work");
+    drop(m);
+    let mut m = Mcp::start(&d.0, &[]);
+    m.ok("type_text", json!({"text": "Supervised"}));
+    let r = m.ok("evict", json!({"reason": "the supervisor needs the memory"}));
+    let p = r["evicted"][0]["recovered_path"].as_str().unwrap().to_string();
+    let e = m.err("type_text", json!({"text": "x"}), "evicted");
+    assert_eq!(e["recovered_path"], p.as_str());
+    m.ok("open_document", json!({"path": p}));
+    assert_eq!(text_of(&mut m), "Supervised");
 }

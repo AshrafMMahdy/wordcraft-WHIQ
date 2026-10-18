@@ -55,9 +55,43 @@ impl Snapshot {
     }
 }
 
-/// `2026-10-17T19:30:12Z` → `20261017T193012Z`.
+/// `2026-10-17T19:30:12Z` → `20261017-193012` (UTC): the stamp every craft app puts in a
+/// recovered file's name, `<name>.recovered-<stamp>.<ext>` (CONTRACT-PARITY.md).
 pub fn stamp() -> String {
-    wordcraft_engine::cmd::now_iso().chars().filter(|c| !matches!(c, '-' | ':')).collect()
+    wordcraft_engine::cmd::now_iso().chars().filter(|c| !matches!(c, '-' | ':' | 'Z')).collect::<String>().replace('T', "-")
+}
+
+/// A recovered file as every craft app reports it (`recovered_files`): `{path, reason, original,
+/// at}`. `reason` is one of `checkpoint`, `signal`, `disconnect`, `panic`, `memory`, `idle`,
+/// `evict`, `close`, `found` (a file an earlier process left).
+pub fn entry(path: &Path, reason: &str, original: Option<&Path>) -> Value {
+    json!({
+        "path": path.to_string_lossy(),
+        "reason": reason,
+        "original": original.map(|p| p.to_string_lossy().into_owned()),
+        "at": wordcraft_engine::cmd::now_iso(),
+    })
+}
+
+/// Recovered files an earlier process left in `dir` (newest first, at most 50), as entries
+/// with reason `found`.
+pub fn scan(dir: &Path) -> Vec<Value> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<(std::time::SystemTime, Value)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.contains(".recovered-") || name.starts_with("OLD_") || name.starts_with('.') {
+                return None;
+            }
+            let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            let mut v = entry(&e.path(), "found", None);
+            v["at"] = Value::Null;
+            Some((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), v))
+        })
+        .collect();
+    found.sort_by_key(|x| std::cmp::Reverse(x.0));
+    found.into_iter().take(50).map(|(_, v)| v).collect()
 }
 
 /// Where recovered documents go: the write root, else the document's folder, else the working
@@ -217,16 +251,30 @@ fn proc_rss() -> Option<u64> {
     }
 }
 
-/// Where [`rss_bytes`] comes from on this platform (for `server_status`).
+/// The committed (virtual) size of this process as the operating system counts it: the pagefile
+/// usage on Windows, the virtual size on macOS and Linux.
+pub fn committed_bytes() -> Option<u64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        memory_stats::memory_stats().map(|m| m.virtual_mem as u64).filter(|b| *b > 0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// Where [`rss_bytes`] comes from on this platform (for `server_status`): the same words in
+/// every craft app.
 pub fn rss_source() -> &'static str {
     if cfg!(target_os = "windows") {
-        "GetProcessMemoryInfo working set"
+        "GetProcessMemoryInfo: WorkingSetSize (rss), PagefileUsage (committed)"
     } else if cfg!(target_os = "macos") {
-        "task_info resident size"
+        "task_info(MACH_TASK_BASIC_INFO): resident_size (rss), virtual_size (committed)"
     } else if cfg!(target_os = "linux") {
-        "/proc resident set size"
+        "/proc/self: resident set size (rss), virtual size (committed)"
     } else {
-        "operating system"
+        "memory-stats"
     }
 }
 

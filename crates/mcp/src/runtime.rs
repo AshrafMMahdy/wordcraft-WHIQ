@@ -2,22 +2,31 @@
 //!
 //! - a reader thread reads requests, a worker thread runs them on the document, and the main
 //!   thread answers: it never waits on the worker;
-//! - a call that needs the document while another runs answers `busy` with `retry_after_ms`;
-//! - a call still running after `job_after_ms` (or sent with `background: true`) becomes a job:
-//!   its answer is a `job_id` at once, `job_status` reports progress and keeps the result (it
-//!   survives the client timing out);
-//! - `server_status`, `job_status` and `cancel` are answered by the main thread at any time;
-//! - every running call reports progress (its phase, steps when it counts them, elapsed time) in
-//!   `job_status` and `server_status`, and as `notifications/progress` when the request carries a
-//!   `progressToken`; `cancel` stops it at its next safe point (`wordcraft_engine::whiq_progress`);
+//! - a call that needs the document while another runs waits at most `busy_after` (default
+//!   300 ms, for pipelined requests), then answers `busy` with `retry_after_ms`;
+//! - a call still running after `job_after` (or sent with `async: true`, or opening a file of
+//!   `open_job_bytes` or more) becomes a job: its answer is a `job_id` at once, `job_status`
+//!   reports progress and keeps the result (it survives the client timing out); a request the
+//!   client cancels (`notifications/cancelled`, which clients also send on their own timeouts)
+//!   becomes a job too;
+//! - `server_status`, `job_status`, `list_jobs` and `cancel` are answered by the main thread at
+//!   any time;
+//! - every running call reports progress (0..1, its stage, the steps of the stage and the
+//!   stages passed) in `job_status` and `server_status`, and as `notifications/progress` when the
+//!   request carries a `progressToken`; `cancel` stops it at its next safe point
+//!   (`wordcraft_engine::whiq_progress`);
 //! - on SIGTERM / SIGINT / SIGHUP (or Ctrl+C, closing the console on Windows), on the client
 //!   going away with unsaved changes, and on a panic, the open document is auto-saved to a
-//!   recovered file ([`crate::recover`]);
+//!   recovered file ([`crate::recover`]); after `idle_evict` without calls the document is
+//!   evicted (auto-saved and closed);
 //! - while there is unsaved work, it is checkpointed to that recovered file every
 //!   `checkpoint_edits` edits or `checkpoint_every` (in the background), so a kill that can't be
 //!   caught (SIGKILL, the OOM killer, `TerminateProcess` on Windows) loses at most that much.
+//!
+//! The shapes (`job_status`, `server_status`, `cancel`, recovered files, error codes) are the
+//! same in WordCraft, GridCraft and DeckCraft: CONTRACT-PARITY.md.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -26,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::contract::{ToolError, unique_match};
+use crate::contract::{ToolError, code, unique_match};
 use crate::recover::{self, Snapshot};
 use crate::server::Server;
 
@@ -35,8 +44,12 @@ use crate::server::Server;
 pub struct Shared {
     /// The open document after the last call.
     pub snapshot: Option<Snapshot>,
-    /// Recovered files made or found in this session.
+    /// Recovered files made or found in this session (`{path, reason, original, at}`).
     pub recovered: Vec<Value>,
+    /// Recovered files not yet named to the agent: the next tool answer names them, once.
+    pub unannounced: Vec<Value>,
+    /// Documents the server closed (eviction): `{name, reason, recovered_path, original_path}`.
+    pub evicted: Vec<Value>,
     pub read_root: Option<PathBuf>,
     pub write_root: Option<PathBuf>,
     pub author: Option<String>,
@@ -45,21 +58,50 @@ pub struct Shared {
     pub autosaved: Option<(u64, u64)>,
     /// The last checkpoint: its file, the document state it holds, when.
     pub checkpoint: Option<Value>,
+    /// Checkpoints written in this session.
+    pub checkpoint_writes: u64,
+    /// Edits not in a checkpoint yet.
+    pub pending_edits: u32,
+    /// Tool calls served, and `busy` answers given.
+    pub calls: u64,
+    pub busy_replies: u64,
+}
+
+impl Shared {
+    /// A recovered file the agent must hear about: kept for `server_status` and named once on
+    /// the next answer.
+    pub fn add_recovered(&mut self, entry: Value) {
+        let path = entry["path"].clone();
+        self.recovered.retain(|e| e["path"] != path);
+        self.unannounced.retain(|e| e["path"] != path);
+        self.recovered.push(entry.clone());
+        self.unannounced.push(entry);
+        let n = self.recovered.len();
+        if n > 500 {
+            self.recovered.drain(..n - 500);
+        }
+    }
 }
 
 pub type SharedState = Arc<Mutex<Shared>>;
 
-/// The running call's progress: its phase, the steps done of how many (when it counts them), and
-/// how long it has run.
-fn progress_json(f: &Inflight) -> Value {
-    let p = wordcraft_engine::whiq_progress::current().unwrap_or_default();
-    let phase = if p.phase.is_empty() { f.tool.clone() } else { p.phase };
-    let mut v = json!({"phase": phase, "elapsed_ms": f.started.elapsed().as_millis() as u64});
-    if p.total > 0 {
-        v["done"] = json!(p.done);
-        v["total"] = json!(p.total);
+/// The progress fields every craft app reports for a call or job: `progress` (0..1, never
+/// going back, 1 only once done), `stage`, `steps` `{done, total}` of the stage and the `stages`
+/// passed so far.
+fn progress_fields(p: Option<&wordcraft_engine::whiq_progress::Progress>, tool: &str, done: bool) -> Value {
+    let p = p.cloned().unwrap_or_default();
+    let stage = if p.phase.is_empty() { tool.to_string() } else { p.phase.clone() };
+    let mut stages = p.stages.clone();
+    if stages.is_empty() {
+        stages.push(stage.clone());
     }
-    v
+    let progress = if done { 1.0 } else { (p.overall.min(0.99) * 1000.0).round() / 1000.0 };
+    json!({
+        "progress": progress,
+        "stage": stage,
+        "steps": {"done": if done && p.total > 0 { p.total } else { p.done }, "total": p.total},
+        "stages": stages,
+    })
 }
 
 /// A `notifications/progress` for the running call when it carries a progress token and there is
@@ -89,17 +131,24 @@ fn progress_notification(f: &mut Inflight) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}))
 }
 
-/// Runtime settings (`wordcraft-cli mcp` flags).
+/// Runtime settings (`wordcraft-cli mcp` flags; the same names in every craft app).
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// A call still running after this long becomes a job.
+    /// `--job-after-ms`: a call still running after this long becomes a job.
     pub job_after: Duration,
+    /// `--busy-after-ms`: a call arriving while another runs waits this long for it, then
+    /// answers `busy`.
+    pub busy_after: Duration,
+    /// `--open-job-mb`: opening a file at least this big runs as a job from the start.
+    pub open_job_bytes: u64,
+    /// `--idle-evict-secs`: evict (auto-save and close) the document after this long without calls.
+    pub idle_evict: Option<Duration>,
     /// How long to let a running call finish when the client goes away.
     pub drain: Duration,
-    /// Checkpoint unsaved work after this many edits (0: not by edits).
+    /// `--checkpoint-edits`: checkpoint unsaved work after this many edits (0: not by edits).
     pub checkpoint_edits: u32,
-    /// Checkpoint unsaved work this long after its first edit since the last checkpoint (`None`:
-    /// not by time).
+    /// `--checkpoint-secs`: checkpoint unsaved work this long after its first edit since the last
+    /// checkpoint (`None`: not by time).
     pub checkpoint_every: Option<Duration>,
 }
 
@@ -107,6 +156,9 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             job_after: Duration::from_millis(15_000),
+            busy_after: Duration::from_millis(300),
+            open_job_bytes: 20 * 1024 * 1024,
+            idle_evict: None,
             drain: Duration::from_secs(30),
             checkpoint_edits: 20,
             checkpoint_every: Some(Duration::from_secs(60)),
@@ -155,6 +207,9 @@ impl Checkpoints {
             }
             self.seen = Some(rev);
         }
+        if let Ok(mut g) = shared.lock() {
+            g.pending_edits = self.edits;
+        }
         if !dirty {
             self.edits = 0;
             self.since = None;
@@ -193,6 +248,8 @@ impl Checkpoints {
                             "edits": edits,
                             "at": wordcraft_engine::cmd::now_iso(),
                         }));
+                        g.checkpoint_writes += 1;
+                        g.pending_edits = 0;
                     }
                 }
                 Ok(None) => {}
@@ -228,62 +285,202 @@ struct Inflight {
     sent_at: Option<Instant>,
     /// A cancel was asked for.
     cancelling: bool,
+    /// The runtime's own request (an idle eviction): its answer goes nowhere.
+    internal: bool,
 }
 
 impl Inflight {
     fn new(id: Value, tool: String, deadline: Option<Instant>, token: Option<Value>) -> Inflight {
-        Inflight { id, tool, started: Instant::now(), deadline, job: None, token, sent: 0.0, sent_at: None, cancelling: false }
+        Inflight { id, tool, started: Instant::now(), deadline, job: None, token, sent: 0.0, sent_at: None, cancelling: false, internal: false }
     }
+}
+
+/// A tool call waiting (at most `busy_after`) for the running one to finish.
+struct Waiting {
+    msg: Value,
+    id: Value,
+    /// The tool it calls.
+    name: String,
+    until: Instant,
 }
 
 struct Job {
     tool: String,
     started: Instant,
     finished: Option<Instant>,
+    /// The tool's result (`{content, isError, structuredContent}`) once done.
     result: Option<Value>,
+    /// The progress the call reached.
+    progress: Option<wordcraft_engine::whiq_progress::Progress>,
 }
 
-/// The status `server_status` answers.
-pub fn status_json(shared: &Shared, jobs: Vec<Value>, busy: Value, started: Instant, limits: &crate::whiq::Limits) -> Value {
-    status_json_with(shared, jobs, busy, started, limits, None)
+impl Job {
+    /// `running`, `done`, `failed` or `cancelled`.
+    fn status(&self) -> &'static str {
+        match &self.result {
+            None => "running",
+            Some(r) if r["isError"] == true => {
+                if r.pointer("/structuredContent/error/code") == Some(&json!(code::CANCELLED)) {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+            }
+            Some(_) => "done",
+        }
+    }
 }
 
-/// [`status_json`] with the runtime's checkpoint policy.
+fn job_elapsed(j: &Job) -> u64 {
+    j.finished.unwrap_or_else(Instant::now).duration_since(j.started).as_millis() as u64
+}
+
+fn retry_after(elapsed_ms: u64) -> u64 {
+    (elapsed_ms / 4).clamp(250, 5000)
+}
+
+/// One job in the shape every craft app reports (`job_status`, `list_jobs`, `server_status`):
+/// `{job_id, tool, status, elapsed_ms, progress, stage, steps, stages}`, with `retry_after_ms`
+/// while it runs and, with `full`, `result` or `error` once it ended.
+fn job_value(id: &str, j: &Job, inflight: &Option<Inflight>, full: bool) -> Value {
+    let status = j.status();
+    let running = inflight.as_ref().filter(|f| f.job.as_deref() == Some(id));
+    let live = running.and_then(|_| wordcraft_engine::whiq_progress::current());
+    let p = if status == "running" { live.as_ref() } else { j.progress.as_ref() };
+    let mut v = json!({"job_id": id, "tool": j.tool, "status": status, "elapsed_ms": job_elapsed(j)});
+    if let (Some(o), Value::Object(f)) = (v.as_object_mut(), progress_fields(p, &j.tool, status == "done")) {
+        o.extend(f);
+    }
+    match (status, &j.result) {
+        ("running", _) => {
+            let retry = retry_after(job_elapsed(j));
+            v["retry_after_ms"] = json!(retry);
+            v["cancelling"] = json!(running.is_some_and(|f| f.cancelling));
+            v["next_step"] = json!(format!("call job_status {{\"job_id\": \"{id}\"}} again in about {retry} ms"));
+        }
+        (_, Some(r)) if full => {
+            if r["isError"] == true {
+                v["error"] = r.pointer("/structuredContent/error").cloned().unwrap_or(Value::Null);
+                v["next_step"] = json!(if status == "cancelled" {
+                    "the job was cancelled at a safe point; the document is as it was before it"
+                } else {
+                    "the job failed; see error.next_step"
+                });
+            } else {
+                v["result"] = r.get("structuredContent").cloned().unwrap_or(Value::Null);
+                v["next_step"] = json!("the job is finished; its result is in `result`");
+            }
+        }
+        _ => {}
+    }
+    v
+}
+
+/// The `job_status` answer for a known job: the job in the shared shape as structured content;
+/// a finished job's own content blocks (pictures) come along.
+fn job_result(id: &str, j: &Job, inflight: &Option<Inflight>) -> Value {
+    let v = job_value(id, j, inflight, true);
+    let mut content: Vec<Value> = j
+        .result
+        .as_ref()
+        .and_then(|r| r["content"].as_array())
+        .map(|c| c.iter().filter(|b| b["type"] != "text").cloned().collect())
+        .unwrap_or_default();
+    content.push(json!({"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}));
+    json!({"content": content, "isError": false, "structuredContent": v})
+}
+
+/// The canonical job id `job-N` for what an agent passed (`3`, `JOB-3`, `job_3`).
+fn job_key(v: &Value) -> String {
+    let raw = match v {
+        Value::String(s) => s.trim().to_ascii_lowercase(),
+        other => other.to_string(),
+    };
+    let digits = raw.trim_start_matches("job").trim_start_matches(['-', '_', ' ']);
+    if digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty() { format!("job-{digits}") } else { raw }
+}
+
+/// The fonts this build embeds (craft-fonts), in the shape every craft app reports.
+pub fn fonts_json() -> Value {
+    let all = wordcraft_fonts::CRAFT_FONTS;
+    let mut families: Vec<&str> = Vec::new();
+    for f in all {
+        if !families.contains(&f.family) {
+            families.push(f.family);
+        }
+    }
+    let arabic = all.iter().find(|f| f.scripts.contains(&"Arab")).map(|f| f.family);
+    let latin = all.iter().find(|f| f.scripts.contains(&"Latn") && !f.scripts.contains(&"Jpan") && !f.scripts.contains(&"Hans")).map(|f| f.family);
+    json!({"source": "craft-fonts", "faces": all.len(), "families": families, "default": latin, "arabic": arabic})
+}
+
+/// The status `server_status` answers (the same shape in every craft app).
+pub fn status_json(shared: &Shared, jobs: Vec<Value>, current: Value, started: Instant, limits: &crate::whiq::Limits) -> Value {
+    status_json_with(shared, jobs, current, started, limits, &Options::default(), None)
+}
+
+/// [`status_json`] with the runtime's settings and idle time.
 fn status_json_with(
     shared: &Shared,
     jobs: Vec<Value>,
-    busy: Value,
+    current: Value,
     started: Instant,
     limits: &crate::whiq::Limits,
-    options: Option<&Options>,
+    options: &Options,
+    idle: Option<Duration>,
 ) -> Value {
-    let doc = shared.snapshot.as_ref().map(Snapshot::info);
+    let doc = shared.snapshot.as_ref().map(|s| {
+        let mut d = s.info();
+        d["active"] = json!(true);
+        d
+    });
     let doc_bytes = shared.snapshot.as_ref().map(|s| recover::doc_bytes(&s.doc));
+    let rss = recover::rss_bytes();
+    let checkpoint_files: Vec<Value> = shared.checkpoint.iter().cloned().collect();
     json!({
+        "server": "wordcraft",
         "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::server::PROTOCOL_VERSION,
         "pid": std::process::id(),
         "uptime_ms": started.elapsed().as_millis() as u64,
         "backend": shared.backend,
+        "author": shared.author,
         "memory": {
-            "rss_bytes": recover::rss_bytes(),
-            "rss_source": recover::rss_source(),
-            "document_bytes": doc_bytes,
+            "rss_bytes": rss,
+            "committed_bytes": recover::committed_bytes(),
             "limit_bytes": limits.max_memory_bytes,
+            "measured": rss.is_some(),
+            "source": recover::rss_source(),
+            "document_bytes": doc_bytes,
         },
-        "document": doc,
-        "busy": busy,
-        "jobs": jobs,
-        "recovered": shared.recovered,
+        "fonts": fonts_json(),
         "roots": {
             "read": shared.read_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "write": shared.write_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
         },
-        "author": shared.author,
-        "limits": {"max_result_bytes": limits.max_result_bytes, "max_image_bytes": limits.max_image_bytes},
+        "documents": doc.into_iter().collect::<Vec<_>>(),
+        "current_call": current,
+        "jobs": jobs,
+        "recovered_files": shared.recovered,
+        "evicted": shared.evicted,
         "checkpoints": {
-            "every_edits": options.map(|o| o.checkpoint_edits),
-            "every_ms": options.and_then(|o| o.checkpoint_every).map(|d| d.as_millis() as u64),
-            "last": shared.checkpoint,
+            "every_edits": options.checkpoint_edits,
+            "every_secs": options.checkpoint_every.map(|d| d.as_secs()).unwrap_or(0),
+            "pending_edits": shared.pending_edits,
+            "writes": shared.checkpoint_writes,
+            "files": checkpoint_files,
+        },
+        "idle_ms": idle.map(|d| d.as_millis() as u64),
+        "calls": shared.calls,
+        "busy_replies": shared.busy_replies,
+        "limits": {
+            "max_result_bytes": limits.max_result_bytes,
+            "max_image_bytes": limits.max_image_bytes,
+            "max_memory_mb": limits.max_memory_bytes.map(|b| b / (1024 * 1024)),
+            "busy_after_ms": options.busy_after.as_millis() as u64,
+            "job_after_ms": options.job_after.as_millis() as u64,
+            "open_job_bytes": options.open_job_bytes,
+            "idle_evict_secs": options.idle_evict.map(|d| d.as_secs()),
         },
     })
 }
@@ -301,7 +498,7 @@ fn autosave_shared(shared: &SharedState, reason: &str) -> Option<PathBuf> {
     match recover::autosave(&snap, &dir, reason) {
         Ok(p) => {
             if let Ok(mut g) = shared.lock() {
-                g.recovered.push(json!({"path": p.to_string_lossy(), "reason": reason}));
+                g.add_recovered(recover::entry(&p, reason, snap.path.as_deref()));
                 g.autosaved = Some(snap.rev);
             }
             Some(p)
@@ -327,14 +524,37 @@ fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+/// Recovered files not yet named to the agent go into this tool answer (`recovered_files`, once).
+fn announce(reply: &mut Value, shared: &SharedState) {
+    let Some(sc) = reply.pointer_mut("/result/structuredContent").and_then(Value::as_object_mut) else { return };
+    let Some(news) = shared.lock().ok().map(|mut g| std::mem::take(&mut g.unannounced)).filter(|n| !n.is_empty()) else { return };
+    let paths: Vec<String> = news.iter().filter_map(|e| e["path"].as_str().map(str::to_string)).collect();
+    sc.insert("recovered_files".into(), Value::Array(news));
+    let note = format!("work was auto-saved to recovered files: {} (open_document on one to continue that work)", paths.join(", "));
+    if let Some(content) = reply.pointer_mut("/result/content").and_then(Value::as_array_mut) {
+        content.push(json!({"type": "text", "text": note}));
+    }
+}
+
 /// The name a tool call asks for, if it is one the main thread answers.
 fn main_tool(name: &str) -> Option<&'static str> {
     match crate::contract::norm(name).as_str() {
         "status" => Some("server_status"),
         "job" => Some("job_status"),
+        "jobs" => Some("list_jobs"),
         "cancel" | "stop" | "abort" | "canceljob" | "cancelcall" => Some("cancel"),
-        _ => unique_match(name, ["server_status", "job_status"]),
+        _ => unique_match(name, ["server_status", "job_status", "list_jobs"]),
     }
+}
+
+/// Is this call an `open_document` of a file at least `bytes` big (a job from the start)?
+fn is_big_open(name: &str, args: &Value, bytes: u64) -> bool {
+    let tool = crate::whiq::resolve_tool(name, &crate::whiq::tool_definitions()).map(|(n, _)| n).unwrap_or_default();
+    if tool != "open_document" {
+        return false;
+    }
+    let path = ["path", "file", "filename", "file_path"].iter().find_map(|k| args.get(*k).and_then(Value::as_str)).unwrap_or("");
+    !path.is_empty() && std::fs::metadata(path).is_ok_and(|m| m.len() >= bytes)
 }
 
 /// Serve newline-delimited JSON-RPC from `input` to `output` until `input` closes. `make` builds
@@ -382,13 +602,17 @@ pub fn serve(
                     Err(p) => {
                         let what =
                             p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
-                        let saved = autosave_shared(&shared, "an internal error");
+                        let saved = autosave_shared(&shared, "panic");
                         // The answer names the file: no marker needed for a later server.
                         if let Some(dir) = saved.as_ref().and_then(|p| p.parent()) {
                             recover::clear_marker(dir);
                         }
+                        if let Ok(mut g) = shared.lock() {
+                            let named = saved.as_ref().map(|p| json!(p.to_string_lossy()));
+                            g.unannounced.retain(|e| Some(&e["path"]) != named.as_ref());
+                        }
                         let mut e = ToolError::new(
-                            "internal",
+                            code::INTERNAL,
                             format!("internal error: {what}"),
                             match &saved {
                                 Some(p) => format!(
@@ -399,7 +623,7 @@ pub fn serve(
                             },
                         );
                         if let Some(p) = &saved {
-                            e = e.with("recovered", json!(p.to_string_lossy()));
+                            e = e.with("recovered_path", json!(p.to_string_lossy()));
                         }
                         let id = msg.get("id").cloned().unwrap_or(Value::Null);
                         Some(rpc_result(id, crate::whiq::error_result(&e, &[])))
@@ -421,29 +645,75 @@ pub fn serve(
         });
     }
     let mut inflight: Option<Inflight> = None;
+    let mut waiting: VecDeque<Waiting> = VecDeque::new();
     let mut checkpoints = Checkpoints::default();
     let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
     let mut next_job = 1u64;
     let mut eof = false;
     let mut eof_at = None;
-    let busy_json = |inflight: &Option<Inflight>| -> Value {
-        match inflight {
-            Some(f) => json!({"tool": f.tool, "elapsed_ms": f.started.elapsed().as_millis() as u64, "job_id": f.job,
-                "progress": progress_json(f), "cancelling": f.cancelling}),
+    let mut last_activity = Instant::now();
+    let mut idle_done = false;
+    let current_json = |inflight: &Option<Inflight>| -> Value {
+        match inflight.as_ref().filter(|f| !f.internal) {
+            Some(f) => {
+                let mut v =
+                    json!({"tool": f.tool, "job_id": f.job, "elapsed_ms": f.started.elapsed().as_millis() as u64, "cancelling": f.cancelling});
+                if let (Some(o), Value::Object(p)) =
+                    (v.as_object_mut(), progress_fields(wordcraft_engine::whiq_progress::current().as_ref(), &f.tool, false))
+                {
+                    o.extend(p);
+                }
+                v
+            }
             None => Value::Null,
         }
     };
-    let jobs_json = |jobs: &BTreeMap<String, Job>| -> Vec<Value> {
-        jobs.iter()
-            .map(|(id, j)| {
-                json!({"job_id": id, "tool": j.tool, "status": if j.finished.is_some() { "done" } else { "running" },
-                    "elapsed_ms": j.finished.unwrap_or_else(Instant::now).duration_since(j.started).as_millis() as u64})
-            })
-            .collect()
+    let jobs_json = |jobs: &BTreeMap<String, Job>, inflight: &Option<Inflight>| -> Vec<Value> {
+        let mut v: Vec<(u64, Value)> =
+            jobs.iter().map(|(id, j)| (id.trim_start_matches("job-").parse().unwrap_or(0), job_value(id, j, inflight, false))).collect();
+        v.sort_by_key(|x| x.0);
+        v.into_iter().map(|x| x.1).collect()
     };
+    // A tool call goes to the worker: as a call, or as a job from the start.
+    macro_rules! dispatch {
+        ($msg:expr, $id:expr, $name:expr) => {{
+            let msg: Value = $msg;
+            let id: Value = $id;
+            let name: String = $name;
+            let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
+            let flag = |k: &str| match args.get(k) {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(s)) => matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"),
+                _ => false,
+            };
+            let as_job = flag("async") || flag("background") || is_big_open(&name, &args, options.open_job_bytes);
+            let now = Instant::now();
+            let token = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| t.is_string() || t.is_number());
+            let mut f = Inflight::new(id.clone(), name.clone(), Some(now + options.job_after), token);
+            wordcraft_engine::whiq_progress::reset();
+            if as_job {
+                let jid = format!("job-{next_job}");
+                next_job += 1;
+                jobs.insert(jid.clone(), Job { tool: name.clone(), started: now, finished: None, result: None, progress: None });
+                write_line(&mut output, &rpc_result(id, job_started(&jid, &name)))?;
+                f.job = Some(jid);
+                f.deadline = None;
+            }
+            if let Ok(mut g) = shared.lock() {
+                g.calls += 1;
+            }
+            last_activity = now;
+            idle_done = false;
+            let _ = work_tx.send(msg);
+            inflight = Some(f);
+        }};
+    }
     loop {
-        let wait =
+        let mut wait =
             inflight.as_ref().and_then(|f| f.deadline).map(|d| d.saturating_duration_since(Instant::now())).unwrap_or(Duration::from_millis(500));
+        if let Some(w) = waiting.front() {
+            wait = wait.min(w.until.saturating_duration_since(Instant::now()));
+        }
         // At least twice a second: progress notifications and checkpoints are due on the clock.
         let ev = match rx.recv_timeout(wait.clamp(Duration::from_millis(5), Duration::from_millis(500))) {
             Ok(ev) => Some(ev),
@@ -458,6 +728,20 @@ pub fn serve(
         if let Some(n) = inflight.as_mut().and_then(progress_notification) {
             write_line(&mut output, &n)?;
         }
+        // Calls that waited their time behind the running one: busy.
+        while waiting.front().is_some_and(|w| Instant::now() >= w.until) {
+            let Some(w) = waiting.pop_front() else { break };
+            let (tool, elapsed, job) = match &inflight {
+                Some(f) => (f.tool.clone(), f.started.elapsed().as_millis() as u64, f.job.clone()),
+                None => (String::from("a previous call"), 0, None),
+            };
+            let e =
+                ToolError::busy(retry_after(elapsed), &format!("`{tool}` (running for {elapsed} ms)"), job.as_deref()).with("running", json!(tool));
+            if let Ok(mut g) = shared.lock() {
+                g.busy_replies += 1;
+            }
+            write_line(&mut output, &rpc_result(w.id, crate::whiq::error_result(&e, &[])))?;
+        }
         match ev {
             Some(Event::Line(line)) => {
                 let line = line.trim().to_string();
@@ -467,22 +751,24 @@ pub fn serve(
                 let msg: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(e) => {
-                        let err = ToolError::new("parse_error", format!("parse error: {e}"), "send one JSON-RPC 2.0 message per line");
+                        let err = ToolError::new(code::INVALID_REQUEST, format!("parse error: {e}"), "send one JSON-RPC 2.0 message per line");
                         write_line(&mut output, &rpc_error(Value::Null, -32700, &err))?;
                         continue;
                     }
                 };
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                 let id = msg.get("id").cloned();
-                // Notifications and replies: cancellations make the running call a job (its result kept).
+                // Notifications and replies: a cancelled request becomes a job (its result kept).
                 if id.is_none() {
                     if method == "notifications/cancelled"
                         && let Some(f) = inflight.as_mut()
                         && f.job.is_none()
+                        && !f.internal
+                        && msg.pointer("/params/requestId").is_none_or(|r| *r == f.id)
                     {
                         let jid = format!("job-{next_job}");
                         next_job += 1;
-                        jobs.insert(jid.clone(), Job { tool: f.tool.clone(), started: f.started, finished: None, result: None });
+                        jobs.insert(jid.clone(), Job { tool: f.tool.clone(), started: f.started, finished: None, result: None, progress: None });
                         f.job = Some(jid);
                         f.deadline = None;
                     }
@@ -495,8 +781,22 @@ pub fn serve(
                 let quick = match method.as_str() {
                     "ping" => Some(json!({})),
                     "initialize" => {
-                        let describe = shared.lock().map(|g| g.backend.clone()).unwrap_or_default();
-                        Some(crate::server::initialize_result(msg.get("params").unwrap_or(&Value::Null), &describe))
+                        let (describe, found) = shared
+                            .lock()
+                            .map(|g| {
+                                (g.backend.clone(), g.recovered.iter().filter_map(|e| e["path"].as_str().map(str::to_string)).collect::<Vec<_>>())
+                            })
+                            .unwrap_or_default();
+                        let mut r = crate::server::initialize_result(msg.get("params").unwrap_or(&Value::Null), &describe);
+                        if !found.is_empty()
+                            && let Some(s) = r["instructions"].as_str()
+                        {
+                            r["instructions"] = json!(format!(
+                                "{s} Recovered files are waiting: {} (open_document on one to continue that work).",
+                                found.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                            ));
+                        }
+                        Some(r)
                     }
                     "tools/list" => Some(json!({"tools": crate::whiq::tool_definitions()})),
                     "resources/list" => Some(crate::server::resources_list()),
@@ -512,44 +812,67 @@ pub fn serve(
                     let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
                     if let Some(t) = main_tool(&name) {
                         let result = match t {
-                            "cancel" => cancel(&args, &mut inflight, &jobs),
+                            "cancel" => {
+                                let mut r = cancel(&args, &mut inflight, &jobs);
+                                if args.get("queued").is_some_and(|q| q == true || q == "true") {
+                                    let n = waiting.len();
+                                    for w in waiting.drain(..) {
+                                        let e = ToolError::new(
+                                            code::CANCELLED,
+                                            "dropped from the queue by cancel {queued: true}",
+                                            "send the call again if it is still wanted",
+                                        );
+                                        write_line(&mut output, &rpc_result(w.id, crate::whiq::error_result(&e, &[])))?;
+                                    }
+                                    r["structuredContent"]["dropped_from_queue"] = json!(n);
+                                    r["content"][0]["text"] = json!(serde_json::to_string_pretty(&r["structuredContent"]).unwrap_or_default());
+                                }
+                                r
+                            }
                             "server_status" => {
                                 let g = shared.lock().map_err(|_| std::io::Error::other("state poisoned"))?;
+                                let idle = inflight.is_none().then(|| last_activity.elapsed());
                                 crate::whiq::json_result(
-                                    status_json_with(&g, jobs_json(&jobs), busy_json(&inflight), started, &limits, Some(&options)),
+                                    status_json_with(&g, jobs_json(&jobs, &inflight), current_json(&inflight), started, &limits, &options, idle),
                                     &[],
                                 )
                             }
-                            _ => job_status(&args, &mut jobs, &inflight),
+                            "list_jobs" => crate::whiq::json_result(json!({"jobs": jobs_json(&jobs, &inflight)}), &[]),
+                            _ => match args.get("job_id").or_else(|| args.get("id")).or_else(|| args.get("job")) {
+                                None => crate::whiq::json_result(json!({"jobs": jobs_json(&jobs, &inflight)}), &[]),
+                                Some(want) => {
+                                    let key = job_key(want);
+                                    match jobs.get(&key) {
+                                        Some(j) => job_result(&key, j, &inflight),
+                                        None => no_such_job(&key, &jobs),
+                                    }
+                                }
+                            },
                         };
                         write_line(&mut output, &rpc_result(id, result))?;
                         continue;
                     }
-                    if let Some(f) = &inflight {
-                        let retry = match f.deadline {
-                            Some(d) => (d.saturating_duration_since(Instant::now()).as_millis() as u64 / 2).clamp(200, 2000),
-                            None => 1000,
-                        };
-                        let e =
-                            ToolError::busy(retry, &format!("`{}` (running for {} ms)", f.tool, f.started.elapsed().as_millis()), f.job.as_deref());
-                        write_line(&mut output, &rpc_result(id, crate::whiq::error_result(&e, &[])))?;
+                    if inflight.is_some() || !waiting.is_empty() {
+                        if options.busy_after.is_zero() {
+                            let f = inflight.as_ref();
+                            let elapsed = f.map_or(0, |f| f.started.elapsed().as_millis() as u64);
+                            let tool = f.map_or_else(|| "a queued call".to_string(), |f| f.tool.clone());
+                            let e = ToolError::busy(
+                                retry_after(elapsed),
+                                &format!("`{tool}` (running for {elapsed} ms)"),
+                                f.and_then(|f| f.job.as_deref()),
+                            )
+                            .with("running", json!(tool));
+                            if let Ok(mut g) = shared.lock() {
+                                g.busy_replies += 1;
+                            }
+                            write_line(&mut output, &rpc_result(id, crate::whiq::error_result(&e, &[])))?;
+                        } else {
+                            waiting.push_back(Waiting { msg, id, name, until: Instant::now() + options.busy_after });
+                        }
                         continue;
                     }
-                    let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
-                    let now = Instant::now();
-                    let token = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| t.is_string() || t.is_number());
-                    let mut f = Inflight::new(id.clone(), name.clone(), Some(now + options.job_after), token);
-                    wordcraft_engine::whiq_progress::reset();
-                    if background {
-                        let jid = format!("job-{next_job}");
-                        next_job += 1;
-                        jobs.insert(jid.clone(), Job { tool: name.clone(), started: now, finished: None, result: None });
-                        write_line(&mut output, &rpc_result(id, job_started(&jid, &name)))?;
-                        f.job = Some(jid);
-                        f.deadline = None;
-                    }
-                    let _ = work_tx.send(msg);
-                    inflight = Some(f);
+                    dispatch!(msg, id, name);
                     continue;
                 }
                 if inflight.is_some() {
@@ -563,15 +886,29 @@ pub fn serve(
             }
             Some(Event::Done { notify: true, .. }) => {}
             Some(Event::Done { reply, notify: false }) => {
+                last_activity = Instant::now();
                 if let Some(f) = inflight.take() {
+                    let progress = wordcraft_engine::whiq_progress::current();
                     match (&f.job, reply) {
+                        _ if f.internal => {}
                         (Some(jid), Some(r)) => {
                             if let Some(j) = jobs.get_mut(jid) {
                                 j.finished = Some(Instant::now());
-                                j.result = r.get("result").cloned().or_else(|| r.get("error").map(|e| json!({"error": e})));
+                                j.progress = progress;
+                                j.result = Some(r.get("result").cloned().unwrap_or_else(|| {
+                                    let e = ToolError::new(
+                                        code::FAILED,
+                                        r.pointer("/error/message").and_then(Value::as_str).unwrap_or("the request failed").to_string(),
+                                        "check the request",
+                                    );
+                                    crate::whiq::error_result(&e, &[])
+                                }));
                             }
                         }
-                        (None, Some(r)) => write_line(&mut output, &r)?,
+                        (None, Some(mut r)) => {
+                            announce(&mut r, &shared);
+                            write_line(&mut output, &r)?;
+                        }
                         _ => {}
                     }
                 }
@@ -580,24 +917,29 @@ pub fn serve(
                     let Some(oldest) = jobs.iter().find(|(_, j)| j.finished.is_some()).map(|(k, _)| k.clone()) else { break };
                     jobs.remove(&oldest);
                 }
+                // The next call that waited behind this one.
+                if let Some(w) = waiting.pop_front() {
+                    dispatch!(w.msg, w.id, w.name);
+                    continue;
+                }
                 if eof && inflight.is_none() {
                     checkpoints.finish();
-                    autosave_shared(&shared, "the client disconnected");
+                    autosave_shared(&shared, "disconnect");
                     return Ok(());
                 }
             }
             Some(Event::Eof) => {
                 eof = true;
                 eof_at = Some(Instant::now());
-                if inflight.is_none() {
+                if inflight.is_none() && waiting.is_empty() {
                     checkpoints.finish();
-                    autosave_shared(&shared, "the client disconnected");
+                    autosave_shared(&shared, "disconnect");
                     return Ok(());
                 }
             }
             Some(Event::Signal) => {
                 checkpoints.finish();
-                autosave_shared(&shared, "the server was stopped");
+                autosave_shared(&shared, "signal");
                 let _ = output.flush();
                 std::process::exit(0);
             }
@@ -605,18 +947,39 @@ pub fn serve(
                 // A call past its time becomes a job.
                 if let Some(f) = inflight.as_mut()
                     && f.job.is_none()
+                    && !f.internal
                     && f.deadline.is_some_and(|d| Instant::now() >= d)
                 {
                     let jid = format!("job-{next_job}");
                     next_job += 1;
-                    jobs.insert(jid.clone(), Job { tool: f.tool.clone(), started: f.started, finished: None, result: None });
+                    jobs.insert(jid.clone(), Job { tool: f.tool.clone(), started: f.started, finished: None, result: None, progress: None });
                     write_line(&mut output, &rpc_result(f.id.clone(), job_started(&jid, &f.tool)))?;
                     f.job = Some(jid);
                     f.deadline = None;
                 }
+                // Idle too long: the document is evicted (auto-saved and closed).
+                if let Some(idle) = options.idle_evict
+                    && inflight.is_none()
+                    && waiting.is_empty()
+                    && !idle_done
+                    && !eof
+                    && last_activity.elapsed() >= idle
+                {
+                    idle_done = true;
+                    let holds = shared.lock().ok().and_then(|g| g.snapshot.as_ref().map(|s| s.dirty || s.path.is_some())).unwrap_or(false);
+                    if holds {
+                        let reason = format!("the document was closed after {} s without calls", idle.as_secs());
+                        let mut f = Inflight::new(json!("__whiq_idle"), "evict".into(), None, None);
+                        f.internal = true;
+                        let _ = work_tx.send(
+                            json!({"jsonrpc": "2.0", "id": "__whiq_idle", "method": "whiq/evict", "params": {"reason": reason, "kind": "idle"}}),
+                        );
+                        inflight = Some(f);
+                    }
+                }
                 if eof && eof_at.is_some_and(|t| t.elapsed() > options.drain) {
                     checkpoints.finish();
-                    autosave_shared(&shared, "the client disconnected during a call");
+                    autosave_shared(&shared, "disconnect");
                     return Ok(());
                 }
             }
@@ -624,48 +987,58 @@ pub fn serve(
     }
 }
 
-/// `cancel`: ask the running call (or job `job_id`) to stop at its next safe point.
+/// `not_found` for an unknown job, with the closest ids.
+fn no_such_job(key: &str, jobs: &BTreeMap<String, Job>) -> Value {
+    let known: Vec<&str> = jobs.keys().map(String::as_str).collect();
+    let e = ToolError::new(
+        code::NOT_FOUND,
+        format!("no job `{key}`"),
+        if known.is_empty() {
+            "no jobs ran yet: call the tool again".to_string()
+        } else {
+            "use a job_id a call returned; list_jobs lists them".to_string()
+        },
+    )
+    .with("closest", json!(crate::contract::closest(key, known.iter().copied(), 5)));
+    crate::whiq::error_result(&e, &[])
+}
+
+/// `cancel`: ask the running call (or job `job_id`) to stop at its next safe point. The answer has
+/// the same shape in every craft app: `{cancelled, status, job_id, tool, next_step}`.
 fn cancel(args: &Value, inflight: &mut Option<Inflight>, jobs: &BTreeMap<String, Job>) -> Value {
-    let want = args.get("job_id").map(|v| match v {
-        Value::String(s) => s.trim().to_ascii_lowercase(),
-        other => other.to_string(),
-    });
-    if let Some(w) = &want {
-        let key = if w.starts_with("job-") { w.clone() } else { format!("job-{w}") };
-        let Some(j) = jobs.get(&key) else {
-            let known: Vec<&String> = jobs.keys().collect();
-            let e = ToolError::new(
-                "job_not_found",
-                format!("no job `{w}`"),
-                "server_status lists the jobs; cancel without job_id stops the running call",
-            )
-            .with("jobs", json!(known));
-            return crate::whiq::error_result(&e, &[]);
-        };
+    if let Some(want) = args.get("job_id").or_else(|| args.get("id")).or_else(|| args.get("job")) {
+        let key = job_key(want);
+        let Some(j) = jobs.get(&key) else { return no_such_job(&key, jobs) };
         if j.finished.is_some() {
             return crate::whiq::json_result(
-                json!({"cancelled": false, "job_id": key, "status": "done", "reason": "the job had finished", "next_step": format!("job_status {{\"job_id\": \"{key}\"}} gives its result")}),
+                json!({"cancelled": false, "status": j.status(), "job_id": key, "tool": j.tool,
+                    "next_step": format!("the job had ended; job_status {{\"job_id\": \"{key}\"}} gives its result")}),
                 &[],
             );
         }
         if inflight.as_ref().and_then(|f| f.job.as_deref()) != Some(key.as_str()) {
-            let e = ToolError::new("job_not_found", format!("job `{key}` isn't running"), "server_status shows the running call");
-            return crate::whiq::error_result(&e, &[]);
+            return crate::whiq::json_result(
+                json!({"cancelled": false, "status": "not_running", "job_id": key, "tool": j.tool, "next_step": "server_status shows the running call"}),
+                &[],
+            );
         }
     }
-    let Some(f) = inflight.as_mut() else {
-        return crate::whiq::json_result(json!({"cancelled": false, "reason": "no call is running", "next_step": "nothing to stop: carry on"}), &[]);
+    let Some(f) = inflight.as_mut().filter(|f| !f.internal) else {
+        return crate::whiq::json_result(
+            json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"}),
+            &[],
+        );
     };
     f.cancelling = true;
     wordcraft_engine::whiq_progress::cancel();
     let next = match &f.job {
-        Some(j) => format!(
-            "call job_status {{\"job_id\": \"{j}\"}}: once stopped, its result has code cancelled (a call that finishes first keeps its result)"
-        ),
+        Some(j) => {
+            format!("call job_status {{\"job_id\": \"{j}\"}}: once stopped, its status is cancelled (a call that finishes first keeps its result)")
+        }
         None => "the call answers with code cancelled when it stops (a call that finishes first keeps its result)".to_string(),
     };
     crate::whiq::json_result(
-        json!({"cancelling": true, "tool": f.tool, "job_id": f.job, "progress": progress_json(f), "next_step": next, "retry_after_ms": 500}),
+        json!({"cancelled": true, "status": "cancelling", "tool": f.tool, "job_id": f.job, "elapsed_ms": f.started.elapsed().as_millis() as u64, "next_step": next, "retry_after_ms": 500}),
         &[],
     )
 }
@@ -676,66 +1049,39 @@ fn job_started(jid: &str, tool: &str) -> Value {
             "job_id": jid,
             "status": "running",
             "tool": tool,
-            "next_step": format!("call job_status {{\"job_id\": \"{jid}\"}} until status is \"done\"; the result is kept for you"),
+            "next_step": format!("call job_status {{\"job_id\": \"{jid}\"}} until status is not \"running\"; the result is kept for you"),
             "retry_after_ms": 1000,
         }),
         &[],
     )
 }
 
-fn job_status(args: &Value, jobs: &mut BTreeMap<String, Job>, inflight: &Option<Inflight>) -> Value {
-    let want = args.get("job_id").map(|v| match v {
-        Value::String(s) => s.trim().to_ascii_lowercase(),
-        other => other.to_string(),
-    });
-    let Some(want) = want else {
-        let e = ToolError::new("bad_params", "missing `job_id`", "pass the job_id a call returned, e.g. {\"job_id\": \"job-1\"}");
-        return crate::whiq::error_result(&e, &[]);
-    };
-    let key = if want.starts_with("job-") { want.clone() } else { format!("job-{want}") };
-    let Some(j) = jobs.get(&key) else {
-        let known: Vec<&String> = jobs.keys().collect();
-        let e = ToolError::new(
-            "job_not_found",
-            format!("no job `{want}`"),
-            if known.is_empty() {
-                "no jobs ran yet: call the tool again".to_string()
-            } else {
-                format!("known jobs: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "))
-            },
-        )
-        .with("jobs", json!(known));
-        return crate::whiq::error_result(&e, &[]);
-    };
-    let elapsed = j.finished.unwrap_or_else(Instant::now).duration_since(j.started).as_millis() as u64;
-    match &j.result {
-        Some(result) => {
-            // The tool's own result, with the job's state added.
-            let mut r = result.clone();
-            let job = json!({"job_id": key, "status": "done", "tool": j.tool, "elapsed_ms": elapsed});
-            if let Some(sc) = r.get_mut("structuredContent").and_then(Value::as_object_mut) {
-                sc.insert("job".into(), job.clone());
-            } else if r.get("error").is_some() {
-                let e = ToolError::new("failed", "the job's call failed", "see `error`").with("error", r["error"].clone());
-                return crate::whiq::error_result(&e, &[]);
-            }
-            if let Some(content) = r.get_mut("content").and_then(Value::as_array_mut) {
-                content.push(json!({"type": "text", "text": json!({"job": job}).to_string()}));
-            }
-            r
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_ids_in_any_spelling() {
+        assert_eq!(job_key(&json!("job-3")), "job-3");
+        assert_eq!(job_key(&json!("JOB_3")), "job-3");
+        assert_eq!(job_key(&json!(3)), "job-3");
+        assert_eq!(job_key(&json!("3")), "job-3");
+        assert_eq!(retry_after(100), 250);
+    }
+
+    #[test]
+    fn a_finished_job_reports_the_shared_shape() {
+        let j = Job {
+            tool: "export_pdf".into(),
+            started: Instant::now(),
+            finished: Some(Instant::now()),
+            result: Some(crate::whiq::json_result(json!({"path": "x.pdf"}), &[])),
+            progress: None,
+        };
+        let v = job_value("job-1", &j, &None, true);
+        for k in ["job_id", "tool", "status", "elapsed_ms", "progress", "stage", "steps", "stages", "result", "next_step"] {
+            assert!(v.get(k).is_some(), "{k}: {v}");
         }
-        None => {
-            let running = inflight.as_ref().filter(|f| f.job.as_deref() == Some(key.as_str()));
-            crate::whiq::json_result(
-                json!({
-                    "job_id": key, "status": "running", "tool": j.tool, "elapsed_ms": elapsed,
-                    "progress": running.map_or(Value::Null, progress_json),
-                    "cancelling": running.is_some_and(|f| f.cancelling),
-                    "retry_after_ms": 1000,
-                    "next_step": "call job_status again after retry_after_ms",
-                }),
-                &[],
-            )
-        }
+        assert_eq!((v["status"].as_str(), v["progress"].as_f64()), (Some("done"), Some(1.0)));
     }
 }
