@@ -1,0 +1,172 @@
+name: whiq-release
+
+# WHIQ fork: the headless `wordcraft-cli` the White Hat IQ platform runs (MCP over stdio), built for
+# Linux x86_64 (musl, static: the host's glibc does not matter) and Windows x86_64 (static CRT),
+# with craft-fonts embedded at the one pin the three craft forks share. The contract tests run
+# against the built binary on both systems before anything is published; the release carries
+# the two archives, SHA256SUMS and engines.lock (the format of engines.lock.example, which the
+# platform's build script reads). No signing, no secrets: the workflow's own GITHUB_TOKEN
+# publishes. The upstream release.yml is untouched.
+#
+#   git tag whiq-v0.7.0 && git push whiq-fork whiq-v0.7.0     # build, test and publish
+#   (or Actions › whiq-release › Run workflow: build and test; give a tag to publish it)
+
+on:
+  push:
+    tags: ["whiq-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. whiq-v0.7.0 (empty: build and test only)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: whiq-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP: wordcraft
+  # The craft-fonts commit every craft fork pins (Latin presentation fonts, Noto Sans Arabic,
+  # Japanese and Chinese): WHIQ-CHANGES.md, "Parity pass".
+  CRAFT_FONTS_REF: 43913056ce82a3fdad0ef69f6b88d1dc922a8104
+  CRAFT_FONTS_REQUIRED: "1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            exe: ""
+          - platform: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out craft-fonts at the pin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+      - name: musl toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools poppler-utils
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: whiq-release-${{ matrix.target }}
+      - name: Release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then tag="${{ github.ref_name }}";
+          elif [ -n "${{ inputs.tag }}" ]; then tag="${{ inputs.tag }}";
+          else tag="whiq-dev-${GITHUB_SHA::7}"; fi
+          case "$tag" in whiq-v*|whiq-dev-*) ;; *) echo "::error::release tags start with whiq-v (got $tag)"; exit 1;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Build ${{ env.APP }}-cli
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          # A static C runtime on Windows: the .exe needs no Visual C++ redistributable.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked -p "$APP-cli" --target "${{ matrix.target }}"
+      - name: Contract tests against the built binary
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: |
+          # A path the Windows test process understands (Git Bash's own is /d/a/...).
+          ROOT="$PWD"; if [ "$RUNNER_OS" = "Windows" ]; then ROOT="$(pwd -W)"; fi
+          BIN="$ROOT/target/${{ matrix.target }}/release/$APP-cli${{ matrix.exe }}"
+          WORDCRAFT_CLI="$BIN" cargo test --release --locked -p "$APP-cli" --target "${{ matrix.target }}" --test mcp_contract
+      - name: Smoke script against the built binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          BIN="$PWD/target/${{ matrix.target }}/release/$APP-cli"
+          file "$BIN" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          tests/mcp-contract/smoke.sh "$BIN"
+      - name: Package
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          name="$APP-cli-$tag-${{ matrix.platform }}"
+          mkdir -p "dist/$name/licenses/fonts"
+          cp "target/${{ matrix.target }}/release/$APP-cli${{ matrix.exe }}" "dist/$name/"
+          cp LICENSE-APACHE LICENSE-MIT NOTICE ATTRIBUTION.md WHIQ-CHANGES.md CONTRACT-PARITY.md "dist/$name/"
+          # The embedded fonts' licences (OFL and others) travel with the binary that carries them.
+          (cd craft-fonts/fonts && for d in */; do for f in "$d"*.txt "$d"LICENSE*; do [ -f "$f" ] && mkdir -p "../../dist/$name/licenses/fonts/$d" && cp "$f" "../../dist/$name/licenses/fonts/$d"; done; done; true)
+          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, commit $GITHUB_SHA" > "dist/$name/BUILD.txt"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}-cli-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS and engines.lock
+        shell: bash
+        run: |
+          tag="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          cd dist
+          sha256sum "$APP-cli-$tag-linux-x86_64.tar.gz" "$APP-cli-$tag-windows-x86_64.zip" > SHA256SUMS
+          cat SHA256SUMS
+          # The platform's build script reads this (format: engines.lock.example).
+          python3 - "$APP" "$tag" > engines.lock <<'PY'
+          import json, sys
+          app, tag = sys.argv[1], sys.argv[2]
+          rows = [line.split() for line in open("SHA256SUMS")]
+          print(json.dumps([{"app": app, "tag": tag, "file": f, "sha256": h} for h, f in rows], indent=2))
+          PY
+          cat engines.lock
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          notes="Headless WordCraft ($APP-cli) for the White Hat IQ platform: MCP over stdio. Linux x86_64 (musl, static) and Windows x86_64. craft-fonts $CRAFT_FONTS_REF embedded. Contract: CONTRACT-PARITY.md and WHIQ-CHANGES.md in each archive. Checksums: SHA256SUMS; engines.lock for the platform build."
+          cd dist
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --clobber
+          else
+            gh release create "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --target "$GITHUB_SHA" --title "$APP-cli $tag" --notes "$notes"
+          fi

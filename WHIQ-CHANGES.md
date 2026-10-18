@@ -9,8 +9,9 @@ is tested. Upstream code is changed as little as possible (new modules carry the
 upstream lines are marked `WHIQ`), so upstream merges stay easy.
 
 Build: `cargo build --release -p wordcraft-cli` (set `CRAFT_FONTS_DIR` to a checkout of
-[storytold/craft-fonts](https://github.com/storytold/craft-fonts) at the release pin so the Arabic
-fallback face is embedded). Tests: `cargo test`; the contract suite alone:
+[storytold/craft-fonts](https://github.com/storytold/craft-fonts) at the pin the three craft forks
+share, 43913056, so the Arabic fallback face is embedded: "Parity pass" below). The shared
+contract surface, item by item for the three forks: `CONTRACT-PARITY.md`. Tests: `cargo test`; the contract suite alone:
 `cargo test -p wordcraft-cli --test mcp_contract`; end-to-end smoke of a built binary:
 `tests/mcp-contract/smoke.sh [path/to/wordcraft-cli]`.
 
@@ -173,6 +174,73 @@ To run them as here: `CRAFT_FONTS_DIR=<craft-fonts checkout>` for the Arabic fac
 `WORDCRAFT_REQUIRE_SCRIPT_FONTS=1`. Adding Noto Sans Myanmar to craft-fonts would make the
 checkout alone enough.
 
+## Parity pass (2026-10-18): one contract surface for the three craft forks
+
+WordCraft, GridCraft and DeckCraft were built independently against the same contract; this pass
+read the three MCP servers side by side and gave them one shared surface. **`CONTRACT-PARITY.md`**
+(the same file in the three repositories) is the table: every contract item, what each app did
+before, and the one shape all three answer with now. Where an earlier section of this file says
+otherwise (an error code, a field name, a flag, a default), the parity pass and
+`CONTRACT-PARITY.md` are what holds. Domain tools keep their names.
+
+| Change | Ported from | Where | Tested by (`tests/mcp-contract/contract.rs` unless noted) |
+|---|---|---|---|
+| Error codes from the shared set of 18 (`contract::code::ALL`): `unknown_tool`/`unknown_command`/`job_not_found` → `not_found`, `bad_params` → `invalid_argument`, `path_refused` → `outside_root` (with `read_root`/`write_root`), `needs_app` → `unsupported`, `needs_password` → `password_required` / `wrong_password`, `parse_error` → `invalid_request`; `locked`, `disk_full`, `too_large` classified; the error text block is `[code] reason` / `next_step: …`; `recovered` → `recovered_path`, `kept_previous` → `previous_files_renamed: [{path, previous}]` + `notice` | GC, DC | `crates/mcp/src/contract.rs`, `whiq.rs`, `whiq_review.rs`, `runtime.rs` | every call: `client::check_shape` checks the code is in the shared list; `errors_carry_code_reason_and_next_step`, `saves_are_confined_atomic_and_never_silently_overwrite` |
+| `job_status` in the shared shape (`status`, `progress` 0..1, `stage`, `steps`, `stages`, `retry_after_ms`, `result` or `error`; a finished job's pictures as content); `list_jobs`; `job_status` without an id lists the jobs; unknown job → `not_found` + `closest` | DC (stages), GC | `crates/mcp/src/runtime.rs` (`job_value`, `job_result`), `crates/engine/src/whiq_progress.rs` (`stages`, `overall`) | `a_long_call_becomes_a_job_and_others_get_busy`, `long_calls_report_progress_and_cancel_stops_them_cleanly`, `runtime::tests` |
+| `--busy-after-ms` (300): a call arriving while another runs waits in order for that long, then answers `busy` (with `running`, `job_id`); `--open-job-mb` (20, decimals): a big `open_document` is a job at once; `async: true` (`background` still read) | GC, DC | `runtime.rs` (`Waiting`, `dispatch!`, `is_big_open`), `apps/wordcraft-cli/src/main.rs` | `a_big_open_is_a_job_and_pipelined_calls_wait_their_turn`, `a_long_call_becomes_a_job_and_others_get_busy` |
+| `cancel` answers `{cancelled, status, job_id, tool, next_step}` (`not_running` when idle), takes `queued` (drops waiting calls); a cancelled `batch` or multi-paragraph `type_text` puts the document back as it was before the call (`rolled_back`), through `Backend::begin_call` / `rollback_call` (`Session::edit_snapshot` / `restore`) | GC (rollback), DC (`queued`) | `runtime.rs` (`cancel`), `whiq.rs`, `backend.rs`, `lib.rs` | `long_calls_report_progress_and_cancel_stops_them_cleanly` (a 40 000-paragraph job and a 20 000-command batch, each undone whole) |
+| Eviction: `--idle-evict-secs` and the `evict` tool (for a supervisor) join memory pressure; a call that needs the document answers `evicted` (`recovered_path`, `original_path`) until one is opened or started; `server_status.evicted` lists it | GC, DC | `server.rs` (`evict`, `whiq/evict`), `runtime.rs` | `idle_eviction_and_evict_auto_save_and_name_the_file`, `memory_pressure_evicts_with_the_work_auto_saved` |
+| Recovered files: `<name>.recovered-<YYYYMMDD-HHMMSS>.docx` (was `…T193012Z`); the write root is scanned at start and the files are named on the next answer (`recovered_files: [{path, reason, original, at}]`, once) instead of failing that call with `evicted`; the marker stays only for checkpoint bookkeeping; `initialize` names them too | GC, DC | `recover.rs` (`stamp`, `entry`, `scan`), `server.rs` (`with_shared`), `runtime.rs` (`announce`) | `sigterm_auto_saves_and_the_next_call_names_the_file`, `a_hard_kill_loses_at_most_the_edits_since_the_last_checkpoint` |
+| `server_status` in the shared shape: `documents`, `current_call`, `memory {rss_bytes, committed_bytes, limit_bytes, measured, source}`, `fonts {source, faces, families, default, arabic}`, `recovered_files`, `evicted`, `checkpoints {every_edits, every_secs, pending_edits, writes, files}`, `idle_ms`, `calls`, `busy_replies`, `limits` | GC (`fonts`), DC (`memory`, `current_call`) | `runtime.rs` (`status_json_with`, `fonts_json`), `recover.rs` (`committed_bytes`, `rss_source`) | `oversized_results_are_trimmed_with_continue_from`, `memory_pressure_evicts_with_the_work_auto_saved`, `smoke.sh` |
+| Forgiving inputs: argument synonyms (`file`→`path`, `job`→`job_id`, `offset`→`continue_from`…), enumerated values in any case, a list given as `"a, b"`, a number or boolean as a list of one | GC, DC | `contract.rs` (`ARG_SYNONYMS`, `coerce`) | `contract::tests::arguments_are_forgiving` |
+| A save names the caller (or `--author`) as the document's creator when it has none | GC, DC | `whiq.rs` (`call_tool`) | `tracked_changes_and_comments_carry_the_caller` |
+| Annotations: `list_jobs` read-only; `cancel` and `evict` not destructive, idempotent | — | `whiq.rs` (`ann`) | `annotations_say_what_each_tool_does` |
+| `.cargo/config.toml` points `CRAFT_FONTS_DIR` at `../craft-fonts` for local builds | GC, DC | `.cargo/config.toml` | — |
+| `whiq-release.yml` and `engines.lock.example` (below) | — | `.github/workflows/whiq-release.yml`, `engines.lock.example` | the workflow runs the contract suite and `smoke.sh` on the built binary |
+
+### Fonts: one craft-fonts pin for the three forks
+
+The three upstream `release.yml` files pin different craft-fonts commits (WordCraft 8dcdacd,
+GridCraft abb8331, DeckCraft 43913056); the WHIQ forks now pin one:
+**`43913056ce82a3fdad0ef69f6b88d1dc922a8104`**, the only one with the Latin presentation fonts
+GridCraft and DeckCraft require. WordCraft reads only `fonts/manifest.txt`, which is byte for byte
+the same at 43913056 as at 8dcdacd (Shippori Mincho, BIZ UDPGothic, BIZ UDMincho, Noto Sans CJK SC,
+Noto Sans Arabic), so the embedded faces are unchanged. Verified here: `cargo build --release -p
+wordcraft-cli` with `CRAFT_FONTS_REQUIRED=1` and `CRAFT_FONTS_DIR` at 43913056 succeeds, and its
+tests pass with it (Test status below). The upstream `release.yml` is not modified (it still
+says 8dcdacd for upstream's own releases).
+
+Release recipe (the WHIQ build):
+
+```sh
+git clone https://github.com/storytold/craft-fonts ../craft-fonts
+git -C ../craft-fonts fetch origin 43913056ce82a3fdad0ef69f6b88d1dc922a8104
+git -C ../craft-fonts checkout --detach 43913056ce82a3fdad0ef69f6b88d1dc922a8104
+CRAFT_FONTS_DIR=$PWD/../craft-fonts CRAFT_FONTS_REQUIRED=1 cargo build --release -p wordcraft-cli
+WORDCRAFT_CLI=$PWD/target/release/wordcraft-cli CRAFT_FONTS_DIR=$PWD/../craft-fonts cargo test --release -p wordcraft-cli --test mcp_contract
+tests/mcp-contract/smoke.sh target/release/wordcraft-cli
+```
+
+### Release workflow
+
+`.github/workflows/whiq-release.yml` (new; the upstream `release.yml` is untouched): on a tag
+`whiq-v*` (or Run workflow, with an optional tag to publish) it builds only `wordcraft-cli`, for
+`x86_64-unknown-linux-musl` (static: the host's glibc does not matter) on ubuntu-22.04 and
+`x86_64-pc-windows-msvc` (static C runtime) on windows-2022, with craft-fonts checked out at the
+pin and `CRAFT_FONTS_REQUIRED=1`; runs the contract suite against the built binary on both
+(`WORDCRAFT_CLI`), and `smoke.sh` plus a "statically linked" check on Linux; and publishes a GitHub
+release with `wordcraft-cli-<tag>-linux-x86_64.tar.gz`, `wordcraft-cli-<tag>-windows-x86_64.zip`
+(binary, licences, the embedded fonts' licences, `CONTRACT-PARITY.md`, `WHIQ-CHANGES.md`,
+`BUILD.txt`), `SHA256SUMS` and `engines.lock`. Actions are pinned by commit (checkout,
+rust-toolchain, rust-cache, as in upstream CI) or by major (upload/download-artifact); no
+signing; no secrets (the job's own `GITHUB_TOKEN` publishes). `engines.lock.example` at the root
+shows the JSON the platform's build script reads: a list of `{app, tag, file, sha256}`, one per
+archive; the release's `engines.lock` is that file with the real hashes.
+
+The musl build was run here: `cargo build --release --locked -p wordcraft-cli --target
+x86_64-unknown-linux-musl` gives a `static-pie linked` 84 MB binary; the contract suite (22/22,
+`WORDCRAFT_CLI` set to it) and `smoke.sh` pass on it.
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
@@ -188,3 +256,13 @@ fails because this machine has no GPU: `wordcraft-ui-egui objects::tests::a_drag
 (a wgpu adapter: "No adapter found"). `cargo build --release -p wordcraft-cli` (with
 `CRAFT_FONTS_REQUIRED=1`) succeeds; the contract suite passes 20/20 and `smoke.sh` passes on the
 release binary; `cargo xtask wasm` and `cargo xtask layers` pass.
+
+After the parity pass (2026-10-18), with craft-fonts at the shared pin **43913056**
+(`CRAFT_FONTS_DIR`, `CRAFT_FONTS_REQUIRED=1`), `WORDCRAFT_FONT_DIRS` (Noto Sans Myanmar) and
+`WORDCRAFT_REQUIRE_SCRIPT_FONTS=1`: `cargo build --release -p wordcraft-cli` succeeds;
+`cargo test --workspace --release --no-fail-fast` runs 2827 tests: 2824 pass, 2 are ignored
+upstream, and the same one fails for want of a GPU (`wordcraft-ui-egui
+objects::tests::a_dragged_shape_leaves_the_text_behind_it`, "No adapter found");
+`real_word_files_keep_what_the_fork_keeps` passes on the Apache POI Word files (130 .docx/.docm in `test-data/document`)
+(`WHIQ_REAL_DOCX_DIR`); the contract suite passes 22/22 against the release binary and against
+the musl binary; `smoke.sh` passes on both.
