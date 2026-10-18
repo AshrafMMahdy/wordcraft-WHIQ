@@ -16,9 +16,12 @@ wordcraft-render = { workspace = true }
 wordcraft-control-key = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-# WHIQ: SIGTERM / SIGINT / SIGHUP (and console close on Windows) auto-save the open document.
+
+# WHIQ: native only (the web build has no signals, processes or resident memory to read).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# SIGTERM / SIGINT / SIGHUP (and console close on Windows) auto-save the open document.
 # MIT/Apache-2.0, safe API (the platform calls are inside the crate).
 ctrlc = { version = "3.4", features = ["termination"] }
-# WHIQ: the process's resident memory on Linux, Windows (GetProcessMemoryInfo), macOS (task_info)
-# and FreeBSD, for eviction and server_status. MIT/Apache-2.0, safe API.
+# The process's resident memory on Linux, Windows (GetProcessMemoryInfo), macOS (task_info) and
+# FreeBSD, for eviction and server_status. MIT/Apache-2.0, safe API.
 memory-stats = { version = "1.2", default-features = false }

@@ -211,6 +211,8 @@ enum Event {
         reply: Option<Value>,
         notify: bool,
     },
+    /// SIGTERM / SIGINT / SIGHUP (native builds).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Signal,
 }
 
@@ -410,7 +412,8 @@ pub fn serve(
             }
         })?;
     }
-    // Signals: auto-save, then end.
+    // Signals: auto-save, then end (native builds: the web build has none).
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let tx = tx.clone();
         let _ = ctrlc::set_handler(move || {

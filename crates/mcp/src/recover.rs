@@ -193,7 +193,14 @@ pub fn clear_marker(dir: &Path) {
 /// on Windows (`GetProcessMemoryInfo`), the resident size on macOS (`task_info`), `VmRSS` on Linux.
 /// `None` only where the platform doesn't say (the web build).
 pub fn rss_bytes() -> Option<u64> {
-    memory_stats::memory_stats().map(|m| m.physical_mem as u64).filter(|b| *b > 0).or_else(proc_rss)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        memory_stats::memory_stats().map(|m| m.physical_mem as u64).filter(|b| *b > 0).or_else(proc_rss)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        proc_rss()
+    }
 }
 
 /// Linux's own count, should the call above fail.

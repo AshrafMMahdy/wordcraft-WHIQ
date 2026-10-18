@@ -221,7 +221,9 @@ pub fn with_overwrite<T>(policy: Overwrite, f: impl FnOnce() -> T) -> (T, Vec<(P
 
 /// Called by a save just before it replaces `dest`: under [`Overwrite::KeepOld`], an existing
 /// file there is kept as `OLD_<name>` (a hard link, or a copy where links aren't possible), never
-/// replaced. An error stops the save (the destination is left as it was).
+/// replaced. An error stops the save (the destination is left as it was). (The web build saves no
+/// files.)
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn keep_old(dest: &Path) -> std::io::Result<()> {
     if OVERWRITE.with(|o| o.get()) != Overwrite::KeepOld || !dest.is_file() {
         return Ok(());

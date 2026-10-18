@@ -147,6 +147,16 @@ macOS host, emulator or linker, so the counts were not observed running there.
 | Every call reports progress: its phase (the tool's name at least), steps done of how many where it counts them, elapsed time. Counted: `batch` (commands), `render_page` (pages), `type_text` with `paragraphs` (paragraphs), `review_edit` (operations), `export_pdf` (laying out, drawing, writing), `import_markdown` (building, headers/footers/contents), `roundtrip_check` (reading, saving and comparing). `job_status` and `server_status` (`busy.progress`) show it; a request carrying `_meta.progressToken` gets `notifications/progress` as it runs (a counted step, or once a second; the progress value only grows; `total` when known; a message with phase and time). The runtime's main loop now wakes at least twice a second during calls. | `crates/engine/src/whiq_progress.rs` (new: progress and the cancel flag, for the thread that runs calls), `crates/mcp/src/runtime.rs` (`progress_json`, `progress_notification`), `crates/mcp/src/whiq.rs`, `crates/engine/src/print.rs`, `cmd/whiq_review.rs`, `cmd/whiq_markdown.rs` | `long_calls_report_progress_and_cancel_stops_them_cleanly`; `whiq_progress::tests` |
 | `cancel` (answered by the main thread at any time): stops the running call, or job `job_id`, at its next safe point. A stopped engine command returns an error and the session puts the document back as it was before it: a review edit batch, a Markdown import, a PDF export (no file written) change nothing. Calls made of several commands stop between them and keep the steps done, each whole: `batch` (the results so far, `stopped_at`), `render_page` (`continue_from`), multi-paragraph `type_text` (`typed_paragraphs`). The stopped call answers with code `cancelled` (as the job's result for a job); a call that finishes before a safe point keeps its result; a finished job answers `status: done`; an unknown one `job_not_found`. Single quick commands (open, save, one `execute`) finish: their end is the safe point. | `crates/mcp/src/runtime.rs` (`cancel`), `crates/mcp/src/whiq.rs`, `crates/mcp/src/contract.rs` (`cancelled`) | same tests (a 40 000-paragraph `type_text` job stopped part way, its typed paragraphs whole; a 4000-operation `review_edit` job stopped with nothing changed; every engine safe point, deterministically) |
 
+## Round 2, 5. The web build
+
+`cargo xtask wasm` (`cargo check --target wasm32-unknown-unknown` for every crate the web build
+needs) failed on `wordcraft-mcp`: `ctrlc`, added in part 1, has no wasm32 platform layer. `ctrlc`
+and `memory-stats` are now native-only dependencies (`[target.'cfg(not(target_arch =
+"wasm32"))'.dependencies]`), the signal handler is native-only, and resident memory is `None` on
+the web; a wasm-only dead-code warning on `file_access::keep_old` (the web build saves no files) is
+allowed there. All 16 crates pass, with no warnings. (`crates/mcp/Cargo.toml`,
+`crates/mcp/src/runtime.rs`, `crates/mcp/src/recover.rs`, `crates/engine/src/file_access.rs`)
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
