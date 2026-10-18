@@ -511,6 +511,7 @@ fn tracked_changes_and_comments_carry_the_caller() {
     m.ok("save_document", json!({"path": "signed.docx", "caller": "Reviewer D"}));
     let props = m.ok("execute", json!({"command": "file.properties", "params": {}}));
     assert_eq!(props["lastModifiedBy"], "Reviewer D", "{props}");
+    assert_eq!(props["creator"], "Reviewer D", "a document with no author gets the caller (as in every craft app): {props}");
     // The default comes back after the call.
     m.ok("type_text", json!({"text": "!"}));
     let changes = m.ok("execute", json!({"command": "review.changes"}));

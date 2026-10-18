@@ -716,6 +716,16 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     {
         warnings.push(format!("caller `{c}` not used: {e}"));
     }
+    // A save names its author as the document's creator when it has none (as every craft app
+    // does); the last modifier is stamped by the save itself.
+    let saves = name == "save_document"
+        || (name == "execute" && args.get("command").and_then(Value::as_str).is_some_and(|c| c.to_ascii_lowercase().starts_with("file.save")));
+    if saves
+        && let Some(who) = caller.clone().or_else(|| b.author()).filter(|a| !a.trim().is_empty() && a != "WordCraft User")
+        && exec(b, "file.properties", json!({})).is_ok_and(|p| p["creator"].as_str().is_none_or(str::is_empty))
+    {
+        let _ = exec(b, "file.properties", json!({"author": who}));
+    }
     let policy = if args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
     // Every call reports at least what it is doing (tools with steps count them).
     if wordcraft_engine::whiq_progress::current().is_none() {
