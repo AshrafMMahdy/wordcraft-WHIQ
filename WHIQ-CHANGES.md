@@ -181,6 +181,10 @@ Changes, Find Anchor, Import Markdown, Apply Theme) are translated in every cata
 
 ## Test status (Linux sandbox, no GPU)
 
-See the end of this file's last round for the current run. The only test that needs what this
-machine lacks is `wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it` (a
-wgpu adapter: "No adapter found").
+After round 2, with `CRAFT_FONTS_DIR` (craft-fonts 8dcdacd), `WORDCRAFT_FONT_DIRS` (Noto Sans
+Myanmar), `WORDCRAFT_REQUIRE_SCRIPT_FONTS=1` and `WHIQ_REAL_DOCX_DIR` (114 Apache POI Word files):
+`cargo test --workspace --no-fail-fast` runs 2821 tests: 2820 pass, 2 are ignored upstream, and one
+fails because this machine has no GPU: `wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it`
+(a wgpu adapter: "No adapter found"). `cargo build --release -p wordcraft-cli` (with
+`CRAFT_FONTS_REQUIRED=1`) succeeds; the contract suite passes 20/20 and `smoke.sh` passes on the
+release binary; `cargo xtask wasm` and `cargo xtask layers` pass.
