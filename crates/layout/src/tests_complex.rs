@@ -64,14 +64,31 @@ fn myanmar_without_spaces_wraps_between_syllables() {
     assert!(pl.lines[0].c1 - pl.lines[0].c0 > 10);
 }
 
-/// A face with Myanmar letters (an installed system font), or `None` to skip.
+/// A face with Myanmar letters (an installed system font, or one in `WORDCRAFT_FONT_DIRS`) that
+/// shapes them as Myanmar, or `None` to skip. WHIQ: a face whose GSUB doesn't name `mym2`
+/// (GNU Unifont) is taken for a Zawgyi-encoded one and never reordered, so it doesn't count.
 fn myanmar_face() -> Option<wordcraft_fonts::FaceRef> {
-    wordcraft_fonts::FontDb::global().fallback_for('\u{1000}', 0).map(|f| wordcraft_fonts::FaceRef::of(&f)).filter(|f| f.has_layout_tables())
+    let db = wordcraft_fonts::FontDb::global();
+    let mut exclude = 0;
+    for _ in 0..8 {
+        let f = db.fallback_for('\u{1000}', exclude)?;
+        if f.has_layout_script(b"mym2") {
+            return Some(wordcraft_fonts::FaceRef::of(&f));
+        }
+        exclude = wordcraft_fonts::FaceRef::of(&f).id();
+    }
+    None
 }
 
 #[test]
 fn myanmar_prevowel_is_drawn_before_its_consonant() {
     let Some(face) = myanmar_face() else {
+        // WHIQ: a harness that provides the font (`WORDCRAFT_FONT_DIRS`) says so, and then a
+        // missing one is a failure, not a skip.
+        assert!(
+            std::env::var_os("WORDCRAFT_REQUIRE_SCRIPT_FONTS").is_none(),
+            "WORDCRAFT_REQUIRE_SCRIPT_FONTS is set but no Myanmar font (with `mym2`) is installed or in WORDCRAFT_FONT_DIRS"
+        );
         eprintln!("skipped: no Myanmar font with OpenType tables installed");
         return;
     };

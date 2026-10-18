@@ -287,10 +287,13 @@ fn split_clusters(
         let Some(r) = ranges.get(i) else { break };
         let n = ranges.get(i..).map_or(1, |rest| rest.iter().take_while(|x| *x == r).count()).max(1);
         let chars: Vec<(usize, char)> = text.get(r.clone()).map(|t| t.char_indices().map(|(k, c)| (r.start + k, c)).collect()).unwrap_or_default();
-        if n > 1 && chars.len() == n {
-            // Glyphs the character map knows take their characters; one left over (a letter's
-            // contextual form, which the map doesn't list) takes the one character left.
-            let mut used = vec![false; n];
+        // WHIQ: also when the font draws a letter as several glyphs (Noto Sans Arabic's beh: a
+        // body and a dot, neither in its character map) beside its marks.
+        if n > 1 && chars.len() > 1 && chars.len() <= n {
+            // Glyphs the character map knows take their characters; those left over (a letter's
+            // contextual form, or its pieces, which the map doesn't list) take the one character
+            // left.
+            let mut used = vec![false; chars.len()];
             let mut of: Vec<Option<usize>> = (i..i + n)
                 .map(|g| {
                     let c = rev.get(&glyphs.get(g)?.0)?;
@@ -299,9 +302,11 @@ fn split_clusters(
                     Some(k)
                 })
                 .collect();
-            let free: Vec<usize> = (0..n).filter(|k| !used.get(*k).copied().unwrap_or(true)).collect();
-            if let ([k], [slot]) = (free.as_slice(), of.iter_mut().filter(|o| o.is_none()).collect::<Vec<_>>().as_mut_slice()) {
-                **slot = Some(*k);
+            let free: Vec<usize> = (0..chars.len()).filter(|k| !used.get(*k).copied().unwrap_or(true)).collect();
+            if let [k] = free.as_slice() {
+                for slot in of.iter_mut().filter(|o| o.is_none()) {
+                    *slot = Some(*k);
+                }
             }
             let parts: Option<Vec<std::ops::Range<usize>>> = of
                 .iter()

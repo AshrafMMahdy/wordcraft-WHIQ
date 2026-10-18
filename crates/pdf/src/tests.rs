@@ -1413,6 +1413,25 @@ fn right_to_left_clusters_are_written_whole_left_to_right() {
     assert_eq!(visual_order(text, &glyphs, &ranges, &parts), [5, 4, 2, 3, 0, 1]);
 }
 
+/// WHIQ: a letter the font draws as several glyphs none of which its character map lists (Noto
+/// Sans Arabic's medial beh: a body and a dot) beside a mark it does list: the mark takes its
+/// character and the pieces share the letter, so the letter is read once (not "ببً").
+#[test]
+fn a_letter_in_pieces_beside_its_mark_is_read_once() {
+    let text = "\u{628}\u{64B}";
+    let glyphs = [(375, 6.0, 12.0), (317, 7.0, 10.0), (16, 6.5, 10.0)];
+    let ranges = [0..4, 0..4, 0..4];
+    let rev: std::collections::HashMap<u32, char> = [(375, '\u{64B}')].into_iter().collect();
+    let parts = split_clusters(text, &glyphs, &ranges, &rev);
+    assert_eq!(parts, [2..4, 0..2, 0..2]);
+    // The mark goes before the letter's pieces (a viewer reversing the word reads the letter
+    // first), and the pieces stay together.
+    assert_eq!(visual_order(text, &glyphs, &ranges, &parts), [0, 1, 2]);
+    // Two letters left over with no glyph the map knows: nothing to go by, the range is shared.
+    let parts = split_clusters("\u{644}\u{627}", &glyphs[1..], &[0..4, 0..4], &rev);
+    assert_eq!(parts, [0..4, 0..4]);
+}
+
 #[test]
 fn extreme_page_index_returns_an_error() {
     let d = Document::from_text("Hostile page selection");

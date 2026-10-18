@@ -456,3 +456,25 @@ fn font_list_previews_load_nothing_for_good() {
     assert_eq!(db.loaded_font_bytes(), used, "memory stays bounded across previews");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WHIQ: a generic face that covers a complex script (GNU Unifont has Myanmar letters but no
+/// `mym2` rules) is loaded before the script's own installed font: the script's font is loaded
+/// and chosen, so its syllables reorder. Needs both fonts (Noto Sans Myanmar through
+/// `WORDCRAFT_FONT_DIRS`); skipped without them.
+#[test]
+fn a_complex_script_prefers_its_own_installed_font_over_a_loaded_generic_one() {
+    let myanmar =
+        std::env::var_os("WORDCRAFT_FONT_DIRS").and_then(|d| std::env::split_paths(&d).find(|p| p.join("NotoSansMyanmar-Regular.ttf").is_file()));
+    let unifont = Path::new("/usr/share/fonts/opentype/unifont");
+    let (Some(dir), true) = (myanmar, unifont.join("unifont.otf").is_file()) else {
+        eprintln!("skipped: needs GNU Unifont and Noto Sans Myanmar (WORDCRAFT_FONT_DIRS)");
+        return;
+    };
+    let db = FontDb::with_font_dirs(vec![unifont.to_path_buf(), dir]);
+    let uni = db.face("Unifont", "Regular");
+    assert_eq!(uni.family, "Unifont");
+    assert!(uni.covers('\u{1000}') && !uni.has_layout_script(b"mym2"));
+    let f = db.fallback_for('\u{1000}', 0).unwrap();
+    assert_eq!(f.family, "Noto Sans Myanmar");
+    assert!(f.has_layout_script(b"mym2"));
+}

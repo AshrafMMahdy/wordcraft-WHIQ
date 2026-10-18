@@ -208,6 +208,14 @@ impl FontFace {
         use skrifa::raw::TableProvider;
         self.skrifa().is_some_and(|f| f.gsub().is_ok())
     }
+    /// WHIQ: does the face's GSUB name OpenType script `tag` (`mym2`, `dev2`…)? A shaper uses a
+    /// script's own rules only for a face that names it (a Myanmar font without `mym2` is taken
+    /// for a Zawgyi-encoded one and left in stored order).
+    pub fn has_layout_script(&self, tag: &[u8; 4]) -> bool {
+        use skrifa::raw::TableProvider;
+        let Some(gsub) = self.skrifa().and_then(|f| f.gsub().ok()) else { return false };
+        gsub.script_list().is_ok_and(|l| l.script_records().iter().any(|r| r.script_tag().to_be_bytes() == *tag))
+    }
     /// Units per em.
     pub fn units_per_em(&self) -> f64 {
         self.upem
@@ -707,6 +715,11 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     if cfg!(target_arch = "wasm32") {
         return dirs;
+    }
+    // WHIQ: extra font folders (a path list, like PATH), scanned first: fonts a headless server
+    // ships beside it, or a test harness's.
+    if let Some(extra) = std::env::var_os("WORDCRAFT_FONT_DIRS") {
+        dirs.extend(std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()));
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if cfg!(target_os = "macos") {
@@ -1444,10 +1457,37 @@ impl FontDb {
     /// The fallback face for `c`, and the number of loaded faces it was chosen from.
     fn search_fallback(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
         let (found, n) = self.loaded_fallback(c, exclude);
+        // WHIQ: a complex script's letter in a loaded face that isn't one of the script's own (GNU
+        // Unifont covers Myanmar but a shaper leaves it in stored order): an installed font of the
+        // script is loaded first, and wins the ranking.
+        if let Some(f) = &found
+            && crate::needs_layout_tables(c)
+            && crate::fallback_rank(c, &f.family) > crate::script_fallbacks(c).len()
+        {
+            return self.system_upgrade(c, exclude, (found.clone(), n));
+        }
         if found.is_some() {
             return (found, n);
         }
         self.system_search(c, exclude)
+    }
+
+    /// [`Self::search_fallback`]'s upgrade: load the script's own system fonts (once each) and
+    /// choose again; `current` when none is installed.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn system_upgrade(&self, c: char, exclude: u32, current: (Option<Arc<FontFace>>, usize)) -> (Option<Arc<FontFace>>, usize) {
+        let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
+        let before = self.read_faces().len();
+        self.load_script_fonts(c);
+        if self.read_faces().len() == before {
+            return current;
+        }
+        self.loaded_fallback(c, exclude)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn system_upgrade(&self, _c: char, _exclude: u32, current: (Option<Arc<FontFace>>, usize)) -> (Option<Arc<FontFace>>, usize) {
+        current
     }
 
     /// [`Self::search_fallback`] when no loaded face covers `c`: load a system font that does,
@@ -1571,6 +1611,28 @@ impl FontDb {
         let faces = self.read_faces();
         let rtl = chars.iter().any(|c| crate::is_rtl(*c) || arabic_block(*c));
         fallback_order(&faces, exclude, rtl).into_iter().find(|f| chars.iter().all(|c| f.covers(*c))).cloned()
+    }
+
+    /// WHIQ: load the cataloged families of `c`'s script ([`crate::script_fallbacks`]) not loaded or
+    /// tried yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_script_fonts(&self, c: char) {
+        {
+            let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+            if !sys.enabled {
+                return;
+            }
+        }
+        let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
+        for fam in crate::script_fallbacks(c) {
+            if self.is_loaded(fam) || !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+                continue;
+            }
+            if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).tried.insert(fam) {
+                continue;
+            }
+            self.load_cataloged(fam);
+        }
     }
 
     /// Load a system font covering `c` (preferred fallback families first, then any cataloged

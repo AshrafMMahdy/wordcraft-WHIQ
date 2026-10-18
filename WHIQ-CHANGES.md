@@ -157,6 +157,22 @@ the web; a wasm-only dead-code warning on `file_access::keep_old` (the web build
 allowed there. All 16 crates pass, with no warnings. (`crates/mcp/Cargo.toml`,
 `crates/mcp/src/runtime.rs`, `crates/mcp/src/recover.rs`, `crates/engine/src/file_access.rs`)
 
+## Round 2, 6. The font-dependent tests pass here
+
+Both tests were run with the craft-fonts checkout (`CRAFT_FONTS_DIR`, pin 8dcdacd: Japanese,
+Simplified Chinese and Arabic faces; upstream `main` adds only Thai since).
+
+| Change | Where | Tested by |
+|---|---|---|
+| **RTL PDF extraction** (`wordcraft-pdf tests::right_to_left_text_extracts_in_logical_order`) was a real bug, shown by craft-fonts' Noto Sans Arabic: it draws a medial beh as two glyphs (body and dot, neither in its character map) beside a tanween mark, a cluster of three glyphs for two characters, which the writer didn't split, so «مَرْحَبًا» extracted as «مَرْحَببًا». Glyphs the map knows now take their characters and, when one character is left, every unlisted glyph shares it: the letter is read once, after its mark is put back. | `crates/pdf/src/lib.rs` (`split_clusters`) | the test (passes with craft-fonts), `a_letter_in_pieces_beside_its_mark_is_read_once` (font-independent) |
+| **Myanmar** (`wordcraft-layout tests_complex::myanmar_prevowel_is_drawn_before_its_consonant`): craft-fonts has no Myanmar face, and the only one installed here is GNU Unifont, whose GSUB doesn't name `mym2`, so the shaper takes it for a Zawgyi-encoded font and leaves syllables in stored order (correctly). The test now counts only a face that names `mym2`; `FontFace::has_layout_script` reads that from GSUB. Font folders can be added with `WORDCRAFT_FONT_DIRS` (a path list, scanned first: a headless server's own fonts, or a test harness's), and `WORDCRAFT_REQUIRE_SCRIPT_FONTS=1` makes a missing font a failure instead of a skip. The harness here points `WORDCRAFT_FONT_DIRS` at Noto Sans Myanmar (OFL-1.1, from notofonts; kept outside the repository, as fonts must be) with the strict flag on: the test runs and passes. | `crates/fonts/src/fontdb.rs` (`has_layout_script`, `system_font_dirs`), `crates/layout/src/tests_complex.rs` | the test |
+| A product bug the full run showed: once a generic face covering a complex script is loaded (Unifont covers almost everything, so any test or document needing a rare character loads it), Myanmar text fell back to it, never to the script's own installed font, and rendered unreordered. For a complex-script character whose best loaded face is neither one of the script's families nor named after the script, the script's installed families are loaded first (once each) and win the ranking. | `crates/fonts/src/fontdb.rs` (`search_fallback`, `system_upgrade`, `load_script_fonts`) | `a_complex_script_prefers_its_own_installed_font_over_a_loaded_generic_one` |
+
+To run them as here: `CRAFT_FONTS_DIR=<craft-fonts checkout>` for the Arabic face,
+`WORDCRAFT_FONT_DIRS=<a folder with NotoSansMyanmar-Regular.ttf>` and
+`WORDCRAFT_REQUIRE_SCRIPT_FONTS=1`. Adding Noto Sans Myanmar to craft-fonts would make the
+checkout alone enough.
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
@@ -165,11 +181,6 @@ Changes, Find Anchor, Import Markdown, Apply Theme) are translated in every cata
 
 ## Test status (Linux sandbox, no GPU)
 
-`cargo test --no-fail-fast` on the whiq branch: every test passes except three that depend on the
-machine, not on this fork:
-
-- `wordcraft-layout tests_complex::myanmar_prevowel_is_drawn_before_its_consonant` and
-  `wordcraft-pdf tests::right_to_left_text_extracts_in_logical_order` fail the same way on upstream
-  `eae2421` here (the system's fallback font is GNU Unifont);
-- `wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it` needs a wgpu
-  adapter ("No adapter found").
+See the end of this file's last round for the current run. The only test that needs what this
+machine lacks is `wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it` (a
+wgpu adapter: "No adapter found").
