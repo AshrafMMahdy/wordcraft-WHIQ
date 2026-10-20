@@ -221,13 +221,51 @@ jobs:
           # A published asset is never replaced: the platform pins each by sha256 (engines.lock), and
           # a replaced file would fail every install's verify. A release made first on GitHub's
           # Releases page, with no files yet, gets them added.
+          #
+          # The files go up one at a time onto a draft, which is published once all are there. An
+          # upload can reach GitHub although its answer does not (whiq-v0.7.1: gh retried the 43 MB
+          # zip and got 422 "already exists", then deleted its draft): after a failed upload the
+          # file on the release is checked, kept when it is this file (size and sha256), and on a
+          # draft only (never published) a partial one is removed and the upload tried again.
+          draft=true
           if gh release view "$tag" >/dev/null 2>&1; then
+            draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
             n="$(gh release view "$tag" --json assets --jq '.assets | length')"
-            if [ "$n" != "0" ]; then
+            if [ "$draft" != "true" ] && [ "$n" != "0" ]; then
               echo "::error::release $tag already has $n file(s); a published release is never overwritten: publish a new tag"
               exit 1
             fi
-            gh release upload "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock
           else
-            gh release create "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --target "$commit" --title "$APP-cli $tag" --notes "$notes"
+            gh release create "$tag" --draft --target "$commit" --title "$APP-cli $tag" --notes "$notes"
           fi
+          rid="$(gh release view "$tag" --json databaseId --jq .databaseId)"
+          upload() {
+            local f="$1" want size try got aid state asize adigest
+            want="sha256:$(sha256sum "$f" | cut -d' ' -f1)"; size="$(stat -c %s "$f")"
+            for try in 1 2 3 4 5; do
+              got="$(gh api "repos/$GH_REPO/releases/$rid/assets" --paginate --jq ".[] | select(.name == \"$f\") | \"\(.id) \(.state) \(.size) \(.digest // \"-\")\"")" || got=""
+              if [ -n "$got" ]; then
+                read -r aid state asize adigest <<<"$got"
+                if [ "$state" = uploaded ] && [ "$asize" = "$size" ] && { [ "$adigest" = "-" ] || [ "$adigest" = "$want" ]; }; then
+                  echo "$f is on the release ($want)"; return 0
+                fi
+                if [ "$draft" != "true" ]; then
+                  echo "::error::$f on the published release $tag is not this file ($state, $asize bytes, $adigest); it is never replaced: publish a new tag"; return 1
+                fi
+                echo "removing an incomplete $f from the draft ($state, $asize bytes)"
+                gh api -X DELETE "repos/$GH_REPO/releases/assets/$aid"
+              fi
+              # Every upload is checked on the next turn; the fifth turn only checks.
+              [ "$try" = 5 ] && break
+              if ! gh release upload "$tag" "$f"; then
+                echo "upload of $f failed (attempt $try); checking what reached the release"
+                sleep $((try * 15))
+              fi
+            done
+            echo "::error::$f could not be uploaded"; return 1
+          }
+          for f in ./*.tar.gz ./*.zip SHA256SUMS engines.lock; do upload "${f#./}"; done
+          if [ "$draft" = "true" ]; then
+            gh release edit "$tag" --draft=false --target "$commit"
+          fi
+          gh release view "$tag" --json tagName,isDraft,assets --jq '{tag: .tagName, draft: .isDraft, assets: [.assets[] | {name, size, digest}]}'
