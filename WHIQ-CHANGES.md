@@ -271,6 +271,18 @@ tests: 2827 pass, 2 are ignored upstream, and the same one fails for want of a G
 `wasm` pass; `cargo build --release --locked -p wordcraft-cli` (`CRAFT_FONTS_REQUIRED=1`) succeeds,
 and against that binary the contract suite passes 24/24 and `smoke.sh` passes.
 
+## Document handles, and a release that publishes whole (2026-10-20, whiq-v0.7.1)
+
+A platform export (`import_markdown` → `save_document`) sent to the chat's wordcraft process
+replaced the document the user had open there, unsaved work included. Now each process holds
+several documents, as GridCraft and DeckCraft do.
+
+| Change | Where | Tested by (`tests/mcp-contract/contract.rs`) |
+|---|---|---|
+| `open_document`, `new_document` and `import_markdown` answer with `document: "doc-<n>"`. The document open before stays open beside the new one under its own handle (a blank, untouched one is reused), and a failed open leaves things as they were. Every document tool takes `document` (the handle, or its number) and acts on that document; the document active before comes back after the call. The opened one becomes active. `server_status.documents` lists every open document with its `document` handle, the active one first. `close_document {document?, discard?}` closes one document; another open one (or a blank one) becomes active. It refuses unsaved changes (`failed`) unless `discard: true`; it no longer auto-saves on close. An unknown handle is `not_found` with `open_documents` and `closest`; with `--connect` a handle is `not_available`. | `crates/mcp/src/lib.rs` (`Headless`: one `Session` per document), `backend.rs`, `whiq.rs` (`call_tool`, `OPENS_DOCUMENT`) | `document_handles_keep_an_export_apart_from_the_open_document` |
+| Every open document's unsaved work is kept. SIGTERM, the client hanging up, a panic, eviction (`evict`, idle, memory) and checkpoints cover each dirty document, each in its own `<name>.recovered-<stamp>.docx` (`evicted` lists them all; the `evicted` error carries `recovered_paths`). A document set aside is checkpointed as soon as it holds work no checkpoint has. | `recover.rs` (recovered files and saved states per document), `runtime.rs` (`autosave_shared`, `Checkpoints`), `server.rs` (`evict`) | same test (hang-up, `evict`); `a_hard_kill_keeps_a_checkpoint_of_every_open_document` |
+| `whiq-release.yml` publish: whiq-v0.7.1's first run failed on `HTTP 422 ReleaseAsset.name already exists` for the Windows zip. The run held only two archives, one per glob, so the cause was not a duplicate match. The zip's upload reached GitHub, but its answer did not; gh retried it and got 422, then deleted its draft, so no tag or release was left behind. Now the release is created as a draft without files, and each file is uploaded on its own. After any failed upload the file on the release is checked: it is kept when it is this file (size and sha256). On a draft only, an incomplete one is removed and uploaded again; on a published release a different file fails the run. The draft is published once every file is there. | `.github/workflows/whiq-release.yml` | the upload function run locally against a stubbed `gh` (upload failed but arrived; a partial file on the draft; a different file on a published release) |
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject

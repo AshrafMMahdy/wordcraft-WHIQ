@@ -33,6 +33,10 @@ pub struct Snapshot {
     pub words: usize,
     /// Changes whenever the document does (to skip republishing an unchanged snapshot).
     pub rev: (u64, u64),
+    /// WHIQ: the document's handle (`doc-3`).
+    pub handle: String,
+    /// WHIQ: the other open documents (most recently active first), with no `others` of their own.
+    pub others: Vec<Snapshot>,
 }
 
 impl Snapshot {
@@ -46,6 +50,7 @@ impl Snapshot {
 
     pub fn info(&self) -> Value {
         json!({
+            "document": self.handle,
             "name": self.stem(),
             "path": self.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "dirty": self.dirty,
@@ -106,11 +111,11 @@ pub fn recovery_dir(write_root: Option<&Path>, snap: Option<&Snapshot>) -> PathB
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// The recovered file of a document (by its id) that later saves of it reuse: the checkpoint file,
-/// or the file an auto-save wrote.
-static RECOVERY_FILE: Mutex<Option<(u64, PathBuf)>> = Mutex::new(None);
-/// The newest document state saved to a recovered file: (document id, revision).
-static SAVED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+/// The recovered file of each document (by its id) that later saves of it reuse: the checkpoint
+/// file, or the file an auto-save wrote.
+static RECOVERY_FILE: Mutex<Vec<(u64, PathBuf)>> = Mutex::new(Vec::new());
+/// The newest state of each document saved to a recovered file: (document id, revision).
+static SAVED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// One recovery save at a time (a checkpoint in the background, an auto-save on the way out).
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -130,11 +135,11 @@ pub fn checkpoint(snap: &Snapshot, dir: &Path) -> Result<Option<PathBuf>, String
 fn save_recovery(snap: &Snapshot, dir: &Path, reason: &str, checkpoint: bool) -> Result<Option<PathBuf>, String> {
     let _one = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (doc_id, rev) = snap.rev;
-    let saved = *SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    if checkpoint && saved.is_some_and(|(d, r)| d == doc_id && r >= rev) {
+    let saved = SAVED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(d, _)| *d == doc_id).map(|x| x.1);
+    if checkpoint && saved.is_some_and(|r| r >= rev) {
         return Ok(None);
     }
-    let reuse = RECOVERY_FILE.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|(d, _)| *d == doc_id).map(|(_, p)| p);
+    let reuse = recovery_file(doc_id);
     let path = match reuse {
         Some(p) => p,
         None => {
@@ -165,12 +170,19 @@ fn save_recovery(snap: &Snapshot, dir: &Path, reason: &str, checkpoint: bool) ->
         "checkpoint": checkpoint,
     });
     marker_put(dir, &path, Some(entry));
-    *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = Some((doc_id, rev));
-    *RECOVERY_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some((doc_id, path.clone()));
+    put(&SAVED, doc_id, rev);
+    put(&RECOVERY_FILE, doc_id, path.clone());
     if !checkpoint {
         eprintln!("wordcraft-cli: work auto-saved ({reason}) at {}", path.display());
     }
     Ok(Some(path))
+}
+
+/// Set document `doc_id`'s value in one of the per-document lists.
+fn put<T>(list: &Mutex<Vec<(u64, T)>>, doc_id: u64, v: T) {
+    let mut l = list.lock().unwrap_or_else(|e| e.into_inner());
+    l.retain(|(d, _)| *d != doc_id);
+    l.push((doc_id, v));
 }
 
 /// Replace the marker's entry for `path` with `entry` (or remove it); the marker goes when empty.
@@ -190,23 +202,20 @@ fn marker_put(dir: &Path, path: &Path, entry: Option<Value>) {
 /// to the agent) and its marker entry go. A file an auto-save wrote (and reported) stays.
 pub fn discard_checkpoint(doc_id: u64, dir: &Path) {
     let _one = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut slot = RECOVERY_FILE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((d, path)) = slot.clone() else { return };
-    if d != doc_id {
-        return;
-    }
+    let mut files = RECOVERY_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = files.iter().find(|(d, _)| *d == doc_id).map(|(_, p)| p.clone()) else { return };
     let p = path.to_string_lossy().into_owned();
     let entry = read_marker(dir).into_iter().find(|e| e["path"].as_str() == Some(&p));
     if entry.as_ref().is_some_and(|e| e["checkpoint"] == json!(true)) {
         let _ = std::fs::remove_file(&path);
         marker_put(dir, &path, None);
     }
-    *slot = None;
+    files.retain(|(d, _)| *d != doc_id);
 }
 
 /// The current checkpoint or recovered file of document `doc_id`, if any.
 pub fn recovery_file(doc_id: u64) -> Option<PathBuf> {
-    RECOVERY_FILE.lock().ok()?.clone().filter(|(d, _)| *d == doc_id).map(|(_, p)| p)
+    RECOVERY_FILE.lock().ok()?.iter().find(|(d, _)| *d == doc_id).map(|(_, p)| p.clone())
 }
 
 /// The recovered documents the marker in `dir` lists (empty without one).

@@ -308,9 +308,10 @@ impl Server {
                 (None, None) => "start again with new_document or open_document".to_string(),
             };
             let reason = n.get("reason").and_then(Value::as_str).unwrap_or("the document was closed").to_string();
-            let e = crate::contract::ToolError::new(crate::contract::code::EVICTED, format!("{reason}; the open document was closed"), next)
+            let e = crate::contract::ToolError::new(crate::contract::code::EVICTED, format!("{reason}; the open documents were closed"), next)
                 .with("recovered_path", json!(recovered))
-                .with("original_path", json!(original));
+                .with("original_path", json!(original))
+                .with("recovered_paths", n.get("recovered_paths").cloned().unwrap_or(json!([])));
             return crate::whiq::error_result(&e, &[]);
         }
         let mut r = crate::whiq::call_tool(self.backend.as_mut(), name, args, &self.limits);
@@ -333,45 +334,61 @@ impl Server {
         r
     }
 
-    /// Auto-save the open document's unsaved work and close it (a blank one takes its place):
-    /// memory pressure, the idle timeout, or the `evict` tool. `kind` is the recovered file's
-    /// reason (`memory`, `idle`, `evict`). Returns `{evicted: [...]}`.
+    /// Auto-save every open document's unsaved work, each to its own recovered file, and close
+    /// them all (a blank one takes their place): memory pressure, the idle timeout, or the `evict`
+    /// tool. `kind` is the recovered files' reason (`memory`, `idle`, `evict`). Returns
+    /// `{evicted: [...]}`, the active document first.
     fn evict(&mut self, reason: &str, kind: &str) -> Value {
         let Some(snap) = self.backend.snapshot() else { return json!({"evicted": []}) };
         let root = self.shared.lock().ok().and_then(|g| g.write_root.clone());
-        let recovered = if snap.dirty {
-            let dir = crate::recover::recovery_dir(root.as_deref(), Some(&snap));
-            match crate::recover::autosave(&snap, &dir, kind) {
-                Ok(p) => Some(p),
+        let docs: Vec<&crate::recover::Snapshot> = std::iter::once(&snap).chain(snap.others.iter()).collect();
+        let mut saved = Vec::new();
+        for d in &docs {
+            if !d.dirty {
+                saved.push(None);
+                continue;
+            }
+            let dir = crate::recover::recovery_dir(root.as_deref(), Some(d));
+            match crate::recover::autosave(d, &dir, kind) {
+                Ok(p) => saved.push(Some(p)),
                 Err(e) => {
-                    // Never discard: a document that cannot be saved stays open.
+                    // Never discard: documents that cannot be saved stay open.
                     eprintln!("wordcraft-cli: not evicting: auto-save failed: {e}");
-                    return json!({"evicted": [], "warnings": [format!("not evicted: the auto-save failed ({e})")]});
+                    return json!({"evicted": [], "warnings": [format!("not evicted: the auto-save of {} failed ({e})", d.stem())]});
                 }
             }
+        }
+        if self.backend.has_handles() {
+            self.backend.reset();
         } else {
-            None
-        };
-        let original = snap.path.as_ref().map(|p| p.to_string_lossy().into_owned());
-        let _ = self.backend.call("engine.execute", json!({"command": "file.new", "params": {"template": "blank"}}));
-        let ev = json!({
-            "name": snap.stem(),
-            "reason": reason,
-            "recovered_path": recovered.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            "original_path": original,
-        });
+            let _ = self.backend.call("engine.execute", json!({"command": "file.new", "params": {"template": "blank"}}));
+        }
+        let all: Vec<Value> = saved.iter().flatten().map(|p| json!(p.to_string_lossy())).collect();
+        let mut evs = Vec::new();
         if let Ok(mut g) = self.shared.lock() {
-            if let Some(p) = &recovered {
-                let e = crate::recover::entry(p, kind, snap.path.as_deref());
-                // The `evicted` answer names it: no separate announcement.
-                g.recovered.retain(|x| x["path"] != e["path"]);
-                g.recovered.push(e);
+            for (d, recovered) in docs.iter().zip(&saved) {
+                let ev = json!({
+                    "document": d.handle,
+                    "name": d.stem(),
+                    "reason": reason,
+                    "recovered_path": recovered.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    "original_path": d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                });
+                if let Some(p) = recovered {
+                    let e = crate::recover::entry(p, kind, d.path.as_deref());
+                    // The `evicted` answer names it: no separate announcement.
+                    g.recovered.retain(|x| x["path"] != e["path"]);
+                    g.recovered.push(e);
+                }
+                g.evicted.push(ev.clone());
+                evs.push(ev);
             }
-            g.evicted.push(ev.clone());
             g.snapshot = self.backend.snapshot();
         }
-        self.notice = Some(ev.clone());
-        json!({"evicted": [ev]})
+        let mut notice = evs.first().cloned().unwrap_or(json!({}));
+        notice["recovered_paths"] = json!(all);
+        self.notice = Some(notice);
+        json!({"evicted": evs})
     }
 
     /// Publish the open document for auto-saves and `server_status`; evict it when memory is past

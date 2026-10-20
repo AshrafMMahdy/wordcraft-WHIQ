@@ -28,10 +28,23 @@ pub const NEEDS_APP: &str = "needs the desktop app: start `wordcraft --control 7
 
 /// An in-process session.
 pub struct Headless {
+    /// The active document's session.
     pub session: Session,
     roots: Option<Arc<AutomationRoots>>,
     /// WHIQ parity pass: the document before the running multi-command call (for a cancel).
     before_call: Option<wordcraft_engine::EditSnapshot>,
+    /// WHIQ: the active document's handle number (`doc-<n>`).
+    handle: u64,
+    /// WHIQ: the other open documents, by handle number (the most recently active last).
+    parked: Vec<(u64, Session)>,
+    next_handle: u64,
+    /// WHIQ: the document an open set aside ([`Backend::open_slot`]), until the open succeeds.
+    set_aside: Option<u64>,
+}
+
+/// WHIQ: the handle a document is named by (`document: "doc-3"`).
+pub fn handle_of(n: u64) -> String {
+    format!("doc-{n}")
 }
 
 impl Headless {
@@ -40,6 +53,43 @@ impl Headless {
     pub fn with_automation_roots(mut self, roots: Option<Arc<AutomationRoots>>) -> Self {
         self.roots = roots;
         self
+    }
+
+    /// A new session for another document: the active one's author and options.
+    fn fresh_session(&self) -> Session {
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        s.author = self.session.author.clone();
+        s.initials = self.session.initials.clone();
+        s.prefs = self.session.prefs.clone();
+        s
+    }
+
+    /// Make the parked document `n` the active one (the active one is parked).
+    fn activate(&mut self, n: u64) -> bool {
+        if n == self.handle {
+            return true;
+        }
+        let Some(i) = self.parked.iter().position(|(h, _)| *h == n) else { return false };
+        let (h, s) = self.parked.remove(i);
+        let old = std::mem::replace(&mut self.session, s);
+        self.parked.push((std::mem::replace(&mut self.handle, h), old));
+        self.before_call = None;
+        true
+    }
+
+    fn snap(s: &Session, handle: u64) -> recover::Snapshot {
+        recover::Snapshot {
+            doc: s.doc.clone(),
+            path: s.path.clone(),
+            file_name: s.file_name.clone(),
+            dirty: s.dirty,
+            paragraphs: s.doc.paragraph_count(),
+            words: s.doc.word_count(),
+            // One key per document of the process (each session counts its documents from 1).
+            rev: ((handle << 40) | (s.document_id() & ((1 << 40) - 1)), s.rev()),
+            handle: handle_of(handle),
+            others: Vec::new(),
+        }
     }
 
     fn answer(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -80,7 +130,15 @@ impl Headless {
 
 impl Default for Headless {
     fn default() -> Self {
-        Headless { session: Session::new(wordcraft_doc::Document::new()), roots: None, before_call: None }
+        Headless {
+            session: Session::new(wordcraft_doc::Document::new()),
+            roots: None,
+            before_call: None,
+            handle: 1,
+            parked: Vec::new(),
+            next_handle: 2,
+            set_aside: None,
+        }
     }
 }
 
@@ -96,16 +154,77 @@ impl Backend for Headless {
         "headless session (no window)".into()
     }
     fn snapshot(&mut self) -> Option<recover::Snapshot> {
+        let mut snap = Self::snap(&self.session, self.handle);
+        snap.others = self.parked.iter().rev().map(|(h, s)| Self::snap(s, *h)).collect();
+        Some(snap)
+    }
+    fn has_handles(&self) -> bool {
+        true
+    }
+    fn active_document(&self) -> Option<String> {
+        Some(handle_of(self.handle))
+    }
+    fn select_document(&mut self, handle: &str) -> Result<(), Vec<String>> {
+        let want = handle.trim().to_ascii_lowercase();
+        let n = want.trim_start_matches("doc").trim_start_matches(['-', '_', ' ']).parse::<u64>().ok();
+        if n.is_some_and(|n| self.activate(n)) {
+            return Ok(());
+        }
+        let mut open: Vec<u64> = self.parked.iter().map(|(h, _)| *h).chain([self.handle]).collect();
+        open.sort_unstable();
+        Err(open.into_iter().map(handle_of).collect())
+    }
+    fn open_slot(&mut self) {
+        // A blank, untouched document is used as it is; anything else stays open beside the new one.
         let s = &self.session;
-        Some(recover::Snapshot {
-            doc: s.doc.clone(),
-            path: s.path.clone(),
-            file_name: s.file_name.clone(),
-            dirty: s.dirty,
-            paragraphs: s.doc.paragraph_count(),
-            words: s.doc.word_count(),
-            rev: (s.document_id(), s.rev()),
-        })
+        if s.path.is_none() && !s.dirty && s.doc.plain_text(wordcraft_doc::StoryRef::Body).trim().is_empty() {
+            self.set_aside = None;
+            return;
+        }
+        let fresh = self.fresh_session();
+        let old = std::mem::replace(&mut self.session, fresh);
+        let n = std::mem::replace(&mut self.handle, self.next_handle);
+        self.next_handle += 1;
+        self.parked.push((n, old));
+        self.set_aside = Some(n);
+        self.before_call = None;
+    }
+    fn end_open(&mut self, opened: bool) {
+        if let Some(n) = self.set_aside.take()
+            && !opened
+            && let Some(i) = self.parked.iter().position(|(h, _)| *h == n)
+        {
+            // The open failed: its new document goes, the one set aside comes back.
+            self.session = self.parked.remove(i).1;
+            self.handle = n;
+            self.next_handle -= 1;
+        }
+    }
+    fn close_active(&mut self, discard: bool) -> Result<(String, String), String> {
+        if self.session.dirty && !discard {
+            return Err("the document has unsaved changes: save_document it first, or pass discard: true to close it anyway".into());
+        }
+        let closed = handle_of(self.handle);
+        match self.parked.pop() {
+            Some((h, s)) => {
+                self.session = s;
+                self.handle = h;
+            }
+            None => {
+                self.session = self.fresh_session();
+                self.handle = self.next_handle;
+                self.next_handle += 1;
+            }
+        }
+        self.before_call = None;
+        Ok((closed, handle_of(self.handle)))
+    }
+    fn reset(&mut self) {
+        self.parked.clear();
+        self.session = self.fresh_session();
+        self.handle = self.next_handle;
+        self.next_handle += 1;
+        self.before_call = None;
     }
     fn author(&self) -> Option<String> {
         Some(self.session.author.clone())

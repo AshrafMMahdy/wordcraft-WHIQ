@@ -54,8 +54,8 @@ pub struct Shared {
     pub write_root: Option<PathBuf>,
     pub author: Option<String>,
     pub backend: String,
-    /// The document state last auto-saved (not saved twice).
-    pub autosaved: Option<(u64, u64)>,
+    /// The document states auto-saved (none is saved twice).
+    pub autosaved: Vec<(u64, u64)>,
     /// The last checkpoint: its file, the document state it holds, when.
     pub checkpoint: Option<Value>,
     /// Checkpoints written in this session.
@@ -177,6 +177,36 @@ struct Checkpoints {
     since: Option<Instant>,
     /// The checkpoint being written.
     running: Option<std::thread::JoinHandle<()>>,
+    /// WHIQ: the state of each other open document last checkpointed.
+    parked: Vec<(u64, u64)>,
+}
+
+/// Write a checkpoint of `snap` in the background.
+fn spawn_checkpoint(snap: Snapshot, root: Option<PathBuf>, edits: u32, shared: SharedState) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("mcp-checkpoint".into())
+        .spawn(move || {
+            let dir = recover::recovery_dir(root.as_deref(), Some(&snap));
+            match recover::checkpoint(&snap, &dir) {
+                Ok(Some(p)) => {
+                    if let Ok(mut g) = shared.lock() {
+                        g.checkpoint = Some(json!({
+                            "path": p.to_string_lossy(),
+                            "document": snap.rev.0,
+                            "handle": snap.handle,
+                            "revision": snap.rev.1,
+                            "edits": edits,
+                            "at": wordcraft_engine::cmd::now_iso(),
+                        }));
+                        g.checkpoint_writes += 1;
+                        g.pending_edits = 0;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("wordcraft-cli: could not write a checkpoint: {e}"),
+            }
+        })
+        .ok()
 }
 
 impl Checkpoints {
@@ -192,6 +222,25 @@ impl Checkpoints {
     fn tick(&mut self, shared: &SharedState, options: &Options) {
         if self.running.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
             self.finish();
+        }
+        // WHIQ: the other open documents change only when a call names them: one with unsaved
+        // work not in a checkpoint at its state is checkpointed at once; a saved one's goes.
+        if self.running.is_none() && (options.checkpoint_edits > 0 || options.checkpoint_every.is_some()) {
+            let (others, root) = shared
+                .lock()
+                .ok()
+                .map(|g| (g.snapshot.as_ref().map(|s| s.others.clone()).unwrap_or_default(), g.write_root.clone()))
+                .unwrap_or_default();
+            self.parked.retain(|(d, _)| others.iter().any(|o| o.rev.0 == *d));
+            for o in others.iter().filter(|o| !o.dirty) {
+                recover::discard_checkpoint(o.rev.0, &recover::recovery_dir(root.as_deref(), None));
+            }
+            if let Some(o) = others.into_iter().find(|o| o.dirty && !self.parked.contains(&o.rev)) {
+                self.parked.retain(|(d, _)| *d != o.rev.0);
+                self.parked.push(o.rev);
+                self.running = spawn_checkpoint(o, root, 0, shared.clone());
+                return;
+            }
         }
         let Some((rev, dirty, root)) = shared.lock().ok().and_then(|g| g.snapshot.as_ref().map(|s| (s.rev, s.dirty, g.write_root.clone()))) else {
             return;
@@ -232,31 +281,12 @@ impl Checkpoints {
         if !(by_edits || by_time) {
             return;
         }
-        let Some(snap) = shared.lock().ok().and_then(|g| g.snapshot.clone()) else { return };
-        let (edits, shared) = (self.edits, shared.clone());
+        let Some(mut snap) = shared.lock().ok().and_then(|g| g.snapshot.clone()) else { return };
+        snap.others.clear();
+        let edits = self.edits;
         self.edits = 0;
         self.since = None;
-        let spawned = std::thread::Builder::new().name("mcp-checkpoint".into()).spawn(move || {
-            let dir = recover::recovery_dir(root.as_deref(), Some(&snap));
-            match recover::checkpoint(&snap, &dir) {
-                Ok(Some(p)) => {
-                    if let Ok(mut g) = shared.lock() {
-                        g.checkpoint = Some(json!({
-                            "path": p.to_string_lossy(),
-                            "document": snap.rev.0,
-                            "revision": snap.rev.1,
-                            "edits": edits,
-                            "at": wordcraft_engine::cmd::now_iso(),
-                        }));
-                        g.checkpoint_writes += 1;
-                        g.pending_edits = 0;
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("wordcraft-cli: could not write a checkpoint: {e}"),
-            }
-        });
-        self.running = spawned.ok();
+        self.running = spawn_checkpoint(snap, root, edits, shared.clone());
     }
 }
 
@@ -429,11 +459,21 @@ fn status_json_with(
     options: &Options,
     idle: Option<Duration>,
 ) -> Value {
-    let doc = shared.snapshot.as_ref().map(|s| {
-        let mut d = s.info();
-        d["active"] = json!(true);
-        d
-    });
+    // Every open document with its `document` handle, the active one first.
+    let doc: Vec<Value> = shared
+        .snapshot
+        .as_ref()
+        .map(|s| {
+            std::iter::once((s, true))
+                .chain(s.others.iter().map(|o| (o, false)))
+                .map(|(d, active)| {
+                    let mut v = d.info();
+                    v["active"] = json!(active);
+                    v
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let doc_bytes = shared.snapshot.as_ref().map(|s| recover::doc_bytes(&s.doc));
     let rss = recover::rss_bytes();
     let checkpoint_files: Vec<Value> = shared.checkpoint.iter().cloned().collect();
@@ -458,7 +498,7 @@ fn status_json_with(
             "read": shared.read_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "write": shared.write_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
         },
-        "documents": doc.into_iter().collect::<Vec<_>>(),
+        "documents": doc,
         "current_call": current,
         "jobs": jobs,
         "recovered_files": shared.recovered,
@@ -486,29 +526,34 @@ fn status_json_with(
     })
 }
 
-/// Auto-save the last published document if it has unsaved changes.
+/// Auto-save every open document of the last published snapshot that has unsaved changes, each
+/// to its own recovered file. Returns the active document's file, when it was saved.
 fn autosave_shared(shared: &SharedState, reason: &str) -> Option<PathBuf> {
-    let (snap, root, done) = {
+    let (snap, root) = {
         let g = shared.lock().ok()?;
-        (g.snapshot.clone()?, g.write_root.clone(), g.autosaved)
+        (g.snapshot.clone()?, g.write_root.clone())
     };
-    if !snap.dirty || done == Some(snap.rev) {
-        return None;
-    }
-    let dir = recover::recovery_dir(root.as_deref(), Some(&snap));
-    match recover::autosave(&snap, &dir, reason) {
-        Ok(p) => {
-            if let Ok(mut g) = shared.lock() {
-                g.add_recovered(recover::entry(&p, reason, snap.path.as_deref()));
-                g.autosaved = Some(snap.rev);
+    let mut active = None;
+    for (i, s) in std::iter::once(&snap).chain(snap.others.iter()).enumerate() {
+        let done = shared.lock().is_ok_and(|g| g.autosaved.contains(&s.rev));
+        if !s.dirty || done {
+            continue;
+        }
+        let dir = recover::recovery_dir(root.as_deref(), Some(s));
+        match recover::autosave(s, &dir, reason) {
+            Ok(p) => {
+                if let Ok(mut g) = shared.lock() {
+                    g.add_recovered(recover::entry(&p, reason, s.path.as_deref()));
+                    g.autosaved.push(s.rev);
+                }
+                if i == 0 {
+                    active = Some(p);
+                }
             }
-            Some(p)
-        }
-        Err(e) => {
-            eprintln!("wordcraft-cli: could not auto-save the document: {e}");
-            None
+            Err(e) => eprintln!("wordcraft-cli: could not auto-save {}: {e}", s.stem()),
         }
     }
+    active
 }
 
 fn write_line(out: &mut impl Write, v: &Value) -> std::io::Result<()> {

@@ -209,7 +209,8 @@ fn long_calls_report_progress_and_cancel_stops_them_cleanly() {
     let jid = started["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
     let running = wait_for("progress", || {
         let st = m.ok("job_status", json!({"job_id": jid}));
-        (st["steps"]["done"].as_u64().unwrap_or(0) > 0).then_some(st)
+        // Progress is rounded to 0.001: a few paragraphs of 40 000 still read 0.
+        (st["steps"]["done"].as_u64().unwrap_or(0) > 0 && st["progress"].as_f64().unwrap_or(0.0) > 0.0).then_some(st)
     });
     assert!(running["stages"].to_string().contains("typing paragraphs"), "{running}");
     assert!(running["progress"].as_f64().unwrap() > 0.0, "{running}");
@@ -854,6 +855,80 @@ fn blocks_import_user_text_verbatim() {
     }
     assert!(all.contains(&serde_json::to_string(cell).unwrap()), "the cell as typed: {all}");
     m.err("import_markdown", json!({"blocks": [{"type": "chart"}]}), "invalid_argument");
+}
+
+// A hard kill: the documents set aside beside the active one are in checkpoints too.
+#[test]
+fn a_hard_kill_keeps_a_checkpoint_of_every_open_document() {
+    let d = Dir::new("checkpoint-all");
+    let mut m = Mcp::start(&d.0, &["--checkpoint-edits", "1", "--checkpoint-secs", "0"]);
+    m.ok("save_document", json!({"path": "first.docx"}));
+    m.ok("type_text", json!({"text": "first draft"}));
+    // An open sets the unsaved first document aside (it stays open) and edits a second one.
+    m.ok("import_markdown", json!({"markdown": "Second document."}));
+    m.ok("save_document", json!({"path": "second.docx"}));
+    m.ok("type_text", json!({"text": "More. "}));
+    let find = |prefix: &str| d.names().into_iter().find(|n| n.starts_with(prefix) && n.ends_with(".docx"));
+    let first = wait_for("the first document's checkpoint", || find("first.recovered-"));
+    let second = wait_for("the second document's checkpoint", || find("second.recovered-"));
+    m.child.kill().unwrap();
+    client::wait_exit(&mut m.child);
+    assert_eq!(file_text(&d.path(&first)), "first draft");
+    assert!(file_text(&d.path(&second)).contains("Second document."));
+}
+
+// Document handles: an export started in the process the user's document is open in never touches it.
+#[test]
+fn document_handles_keep_an_export_apart_from_the_open_document() {
+    let d = Dir::new("handles");
+    let mut m = Mcp::start(&d.0, &[]);
+    let user = m.ok("new_document", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("type_text", json!({"text": "The user's unsaved work."}));
+    let export = m.ok("import_markdown", json!({"markdown": "# Export\n\nBody.", "footer": "none"}))["document"].as_str().unwrap().to_string();
+    assert_ne!(export, user);
+    m.ok("save_document", json!({"path": "export.docx", "document": export}));
+    assert!(d.path("export.docx").is_file());
+    // The user's document is as it was, unsaved; a call naming it acts on it, the active one comes back.
+    assert_eq!(m.ok("get_text", json!({"document": user}))["text"], "The user's unsaved work.");
+    assert!(text_of(&mut m).contains("Export"), "the export is still the active document");
+    let st = m.ok("server_status", json!({}));
+    let docs = st["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 2, "{st}");
+    assert_eq!((docs[0]["document"].as_str(), docs[0]["active"].as_bool()), (Some(export.as_str()), Some(true)), "{st}");
+    assert!(docs.iter().any(|x| x["document"] == user.as_str() && x["dirty"] == true), "{st}");
+    // close_document: refused with unsaved changes; the saved export closes and the user's document is active.
+    m.err("close_document", json!({"document": user}), "failed");
+    let r = m.ok("close_document", json!({"document": export}));
+    assert_eq!(r["active_document"], user.as_str(), "{r}");
+    assert_eq!(text_of(&mut m), "The user's unsaved work.");
+    // An unknown handle names the open ones; a failed open leaves everything as it was.
+    let e = m.err("get_text", json!({"document": "doc-99"}), "not_found");
+    assert_eq!(e["open_documents"], json!([user]), "{e}");
+    m.err("open_document", json!({"path": "missing.docx"}), "not_found");
+    assert_eq!(m.ok("server_status", json!({}))["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(text_of(&mut m), "The user's unsaved work.");
+    // Every document with unsaved work is recovered when the client goes away, each to its own file.
+    m.ok("import_markdown", json!({"markdown": "Second export, not saved."}));
+    m.close();
+    let recovered: Vec<String> = d.names().into_iter().filter(|n| n.contains(".recovered-") && n.ends_with(".docx")).collect();
+    assert_eq!(recovered.len(), 2, "{:?}", d.names());
+    let mut texts = Vec::new();
+    for f in &recovered {
+        let mut m = Mcp::start(&d.0, &[]);
+        m.ok("open_document", json!({"path": f}));
+        texts.push(text_of(&mut m));
+    }
+    assert!(texts.iter().any(|t| t == "The user's unsaved work.") && texts.iter().any(|t| t.contains("Second export")), "{texts:?}");
+    // `evict` saves and closes every open document too.
+    let mut m = Mcp::start(&d.0, &[]);
+    let a = m.ok("new_document", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("type_text", json!({"text": "one"}));
+    let b = m.ok("new_document", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("type_text", json!({"text": "two"}));
+    let r = m.ok("evict", json!({}));
+    let ev = r["evicted"].as_array().unwrap();
+    assert_eq!(ev.len(), 2, "{r}");
+    assert!(ev.iter().all(|e| e["recovered_path"].is_string()) && ev[0]["document"] == b.as_str() && ev[1]["document"] == a.as_str(), "{r}");
 }
 
 /// Pages of a PDF (`/Type /Page` objects, not `/Pages`).

@@ -35,6 +35,31 @@ pub trait Backend: Send {
     }
     /// WHIQ parity pass: the call is over; forget what [`Backend::begin_call`] kept.
     fn end_call(&mut self) {}
+    /// WHIQ: whether documents have handles here (the headless server; a running app has none).
+    fn has_handles(&self) -> bool {
+        false
+    }
+    /// WHIQ: the handle of the active document (`None` when the backend has no handles).
+    fn active_document(&self) -> Option<String> {
+        None
+    }
+    /// WHIQ: make the document with this handle (`doc-3`, or `3`) the active one. `Err` lists the
+    /// handles that are open (empty when the backend has no handles).
+    fn select_document(&mut self, _handle: &str) -> Result<(), Vec<String>> {
+        Err(Vec::new())
+    }
+    /// WHIQ: before a call that opens or starts a document: the active document stays open
+    /// beside the new one (unless it is blank and untouched), under its own handle.
+    fn open_slot(&mut self) {}
+    /// WHIQ: after it: `opened: false` drops the new document and brings the one set aside back.
+    fn end_open(&mut self, _opened: bool) {}
+    /// WHIQ: close the active document (refused with unsaved changes unless `discard`); another
+    /// open one (or a blank one) becomes active. `Ok((closed, active))` handles.
+    fn close_active(&mut self, _discard: bool) -> Result<(String, String), String> {
+        Err("closing a document by handle needs the headless server".into())
+    }
+    /// WHIQ: close every document (eviction): a blank one takes their place.
+    fn reset(&mut self) {}
 }
 
 /// Looks up the control key for an address (`HOST:PORT`).

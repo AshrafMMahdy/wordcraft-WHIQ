@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use wordcraft_engine::file_access::{Overwrite, with_overwrite};
 
 use crate::backend::Backend;
-use crate::contract::{self, ToolError, closest, normalise_args, trim, unique_match};
+use crate::contract::{self, ToolError, closest, code, normalise_args, trim, unique_match};
 use crate::tools::{self, ToolResult};
 
 /// Limits a call works within (set from `wordcraft-cli mcp` flags).
@@ -100,6 +100,26 @@ fn b(desc: &str) -> Value {
     json!({"type": "boolean", "description": desc})
 }
 
+/// WHIQ: tools that open or start a document: the open one stays open beside it (unless blank and
+/// untouched), the new one becomes active, and the answer names its `document` handle.
+pub const OPENS_DOCUMENT: &[&str] = &["open_document", "new_document", "import_markdown"];
+
+/// WHIQ: tools that act on no document (no `document` argument).
+const NO_DOCUMENT: &[&str] = &[
+    "server_status",
+    "job_status",
+    "list_jobs",
+    "cancel",
+    "evict",
+    "list_commands",
+    "parity",
+    "screenshot",
+    "click",
+    "key",
+    "ui_inspect",
+    "roundtrip_check",
+];
+
 /// Arguments every tool takes.
 fn common_props(name: &str) -> Vec<(&'static str, Value)> {
     let mut v = vec![
@@ -108,6 +128,12 @@ fn common_props(name: &str) -> Vec<(&'static str, Value)> {
         ("continue_from", n("Where to resume a trimmed result (its continue_from)")),
         ("max_bytes", n("Largest result to return before trimming (default --max-result-bytes)")),
     ];
+    if !NO_DOCUMENT.contains(&name) && !OPENS_DOCUMENT.contains(&name) {
+        v.push((
+            "document",
+            s("The document to act on: the `document` handle open_document / new_document / import_markdown returned (default: the active one)"),
+        ));
+    }
     if matches!(name, "save_document" | "export_pdf" | "execute" | "batch") || name.starts_with("review") {
         v.push(("overwrite", b("Replace an existing file at the path. Without it the existing file is kept as OLD_<name> and the response says so")));
     }
@@ -217,8 +243,8 @@ fn own_tools() -> Vec<Value> {
         def(
             "close_document",
             "Close document",
-            "Close the open document and start a blank one. Unsaved changes are never discarded: they are auto-saved to a recovered file first (named in the response) unless discard: true.",
-            json!({"discard": b("Throw away unsaved changes instead of auto-saving them")}),
+            "Close an open document (by its `document` handle, default the active one) to free its memory; another open document (or a blank one) becomes active. A document with unsaved changes stays open unless discard: true. The other open documents are untouched.",
+            json!({"discard": b("Close even with unsaved changes (they are lost). Default false")}),
             &[],
         ),
     ]
@@ -532,6 +558,17 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             }
             Ok(Out::Json(v))
         }
+        "close_document" if b.has_handles() => {
+            let discard = a.get("discard").and_then(Value::as_bool).unwrap_or(false);
+            let (closed, active) = b.close_active(discard).map_err(|e| {
+                ToolError::new(
+                    code::FAILED,
+                    e,
+                    "save_document {\"document\": …} first (or pass discard: true to lose the changes); server_status lists the open documents",
+                )
+            })?;
+            Ok(Out::Json(json!({"closed": true, "document": closed, "active_document": active})))
+        }
         "close_document" => {
             let mut out = json!({"closed": true});
             if !a.get("discard").and_then(Value::as_bool).unwrap_or(false)
@@ -730,6 +767,38 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
         }
     };
     warnings.extend(w);
+    // WHIQ: `document` names the document a call acts on; the active one comes back after it.
+    let target = args.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| format!("doc-{n}"))));
+    let mut restore = None;
+    if let Some(h) = &target {
+        let before = b.active_document();
+        match b.select_document(h) {
+            Ok(()) => restore = before,
+            Err(_) if !b.has_handles() => {
+                let e = ToolError::new(
+                    code::NOT_AVAILABLE,
+                    "document handles exist in the headless server only",
+                    "leave out `document`: the call acts on the app's open document",
+                );
+                return error_result(&e, &warnings);
+            }
+            Err(open) => {
+                let e = ToolError::new(
+                    code::NOT_FOUND,
+                    format!("no open document has the handle `{h}` (closed, evicted or never opened)"),
+                    "use a handle from server_status `documents`, or open the file again with open_document",
+                )
+                .with("closest", json!(closest(h, open.iter().map(String::as_str), 3)))
+                .with("open_documents", json!(open));
+                return error_result(&e, &warnings);
+            }
+        }
+    }
+    // Before the caller's name is set: a new document starts with the server's own author.
+    let opens = OPENS_DOCUMENT.contains(&name.as_str());
+    if opens {
+        b.open_slot();
+    }
     // Who is calling: their name on tracked changes and comments made by this call.
     let caller = args.get("caller").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
     let before = caller.as_ref().and_then(|_| b.author());
@@ -754,10 +823,23 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     if wordcraft_engine::whiq_progress::current().is_none() {
         wordcraft_engine::whiq_progress::phase(&name);
     }
-    let (out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
+    let (mut out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
+    if opens {
+        b.end_open(out.is_ok());
+        if let (Ok(Out::Json(v)), Some(h)) = (&mut out, b.active_document()) {
+            if !v.is_object() {
+                *v = json!({"result": v.take()});
+            }
+            v["document"] = json!(h);
+        }
+    }
     b.end_call();
     if let (Some(_), Some(prev)) = (&caller, before) {
         let _ = exec(b, "file.setAuthor", json!({"name": prev}));
+    }
+    if let Some(prev) = restore.filter(|_| !opens && name != "close_document") {
+        // The document active before comes back (when it is still open).
+        let _ = b.select_document(&prev);
     }
     let kept_json: Vec<Value> = kept
         .iter()
