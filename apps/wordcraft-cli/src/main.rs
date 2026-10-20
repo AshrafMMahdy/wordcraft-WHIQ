@@ -34,6 +34,7 @@ USAGE:
   wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
                     [--job-after-ms N] [--busy-after-ms N] [--open-job-mb N] [--max-result-bytes N]
                     [--max-memory-mb N] [--idle-evict-secs N] [--checkpoint-edits N] [--checkpoint-secs N]
+                    [--automation-no-old-copies]
                                               MCP server on stdio (headless, or bridged to the app).
                                               --automation-read-root / --automation-write-root confine
                                               the files the agent's commands read (open, insert text
@@ -56,6 +57,10 @@ USAGE:
                                               --checkpoint-edits edits (default 20) or
                                               --checkpoint-secs (default 60; 0 turns either off),
                                               so a hard kill (SIGKILL, TerminateProcess) loses little.
+                                              A save over an existing file keeps it as OLD_<name>
+                                              unless the call passes overwrite: true;
+                                              --automation-no-old-copies turns OLD_ copies off
+                                              (saves replace files: the supervisor keeps backups).
   wordcraft-cli zotero <command> <file> [--cmd 'id={json}' …] [--save OUT] [--trace] [--port P]
                                               run a Zotero command on a document (Zotero must be
                                               running): addEditCitation, addEditBibliography,
@@ -283,6 +288,8 @@ const MCP_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--max-memory-mb", takes_value: true },
     OptionSpec { name: "--checkpoint-edits", takes_value: true },
     OptionSpec { name: "--checkpoint-secs", takes_value: true },
+    // WHIQ: the supervisor keeps the backups; saves replace files without OLD_ copies.
+    OptionSpec { name: "--automation-no-old-copies", takes_value: false },
 ];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
@@ -584,6 +591,7 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             }
             limits.max_memory_bytes = number("--max-memory-mb")?.map(|mb| mb.saturating_mul(1024 * 1024));
             limits.test_hooks = std::env::var("WORDCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1");
+            limits.keep_old = !rest.iter().any(|a| a == "--automation-no-old-copies");
             let shared = wordcraft_mcp::runtime::SharedState::default();
             if let Ok(mut g) = shared.lock() {
                 g.backend = backend.describe();

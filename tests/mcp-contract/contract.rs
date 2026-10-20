@@ -45,7 +45,12 @@ fn errors_carry_code_reason_and_next_step() {
     assert_eq!(e["closest"][0], "quarterly report", "{e}");
     // A JSON-RPC level failure carries the same shape in `data`.
     let r = m.request("nope/nope", json!({}));
-    assert!(r["error"].is_object(), "{r}");
+    assert_eq!(r["error"]["data"]["code"], "not_found", "{r}");
+    assert!(r["error"]["data"]["next_step"].is_string(), "{r}");
+    // So do the protocol errors the worker answers (a tools/call without a name).
+    let r = m.request("tools/call", json!({"arguments": {}}));
+    assert_eq!(r["error"]["data"]["code"], "invalid_argument", "{r}");
+    assert!(r["error"]["data"]["reason"].as_str().is_some_and(|s| s.contains("name")), "{r}");
     // The text block an agent reads first: `[code] reason` and the next step.
     let r = m.call("render_page", json!({"page": 9}));
     let text = r["content"][0]["text"].as_str().unwrap();
@@ -491,6 +496,28 @@ fn saves_are_confined_atomic_and_never_silently_overwrite() {
     assert!(outside.names().is_empty());
 }
 
+// §6 For a supervisor that keeps the backups itself: --automation-no-old-copies, no OLD_ files.
+#[test]
+fn old_copies_can_be_turned_off_for_a_supervisor() {
+    let d = Dir::new("no-old");
+    let mut m = Mcp::start(&d.0, &["--automation-no-old-copies"]);
+    assert_eq!(m.ok("server_status", json!({}))["limits"]["old_copies"], false);
+    m.ok("type_text", json!({"text": "Version one"}));
+    m.ok("save_document", json!({"path": "report.docx"}));
+    m.ok("export_pdf", json!({"path": "report.pdf"}));
+    m.ok("type_text", json!({"text": " and two"}));
+    for (tool, path) in [("save_document", "report.docx"), ("export_pdf", "report.pdf")] {
+        let r = m.ok(tool, json!({"path": path}));
+        assert!(r.get("previous_files_renamed").is_none() && r.get("notice").is_none(), "{r}");
+    }
+    assert_eq!(d.names(), ["report.docx", "report.pdf"], "replaced in place, no OLD_ copies");
+    drop(m);
+    let mut m = Mcp::start(&d.0, &[]);
+    m.ok("open_document", json!({"path": "report.docx"}));
+    assert_eq!(text_of(&mut m), "Version one and two");
+    assert_eq!(m.ok("server_status", json!({}))["limits"]["old_copies"], true, "on by default");
+}
+
 // §7 Caller identity: --author by default, `caller` per call, on tracked changes and comments.
 #[test]
 fn tracked_changes_and_comments_carry_the_caller() {
@@ -579,6 +606,19 @@ fn annotations_say_what_each_tool_does() {
     }
     assert_eq!(by("new_document")["idempotentHint"], true);
     assert_eq!(by("save_document")["idempotentHint"], false);
+    // `_meta["whiq/files"]`: the arguments naming files a call reads, and whether it opens the document.
+    let files = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["_meta"]["whiq/files"].clone();
+    assert_eq!(files("open_document"), json!({"read": ["path"], "opens": true}));
+    assert_eq!(files("import_markdown"), json!({"read": ["path"], "opens": true}));
+    assert_eq!(files("new_document"), json!({"read": [], "opens": true}));
+    assert_eq!(files("roundtrip_check"), json!({"read": ["path"], "opens": false}));
+    assert_eq!(files("compare_documents"), json!({"read": ["revised", "original"], "opens": false}));
+    assert!(files("save_document").is_null() && files("export_pdf").is_null(), "a save's path is written, not read");
+    for t in &tools {
+        for k in t["_meta"]["whiq/files"]["read"].as_array().into_iter().flatten() {
+            assert!(t["inputSchema"]["properties"][k.as_str().unwrap()].is_object(), "{}: `{k}` is in its schema", t["name"]);
+        }
+    }
     // Every kind of result carries structuredContent: JSON, images, errors.
     let img = m.call("render_page", json!({"page": 1, "dpi": 36}));
     assert_eq!(img["content"][0]["type"], "image");
@@ -777,6 +817,43 @@ fn markdown_imports_the_platforms_document_shapes_with_a_theme() {
     let t = m.ok("apply_theme", json!({"theme": {"font": "Inter", "primary": "#880000"}}));
     assert!(t["applied"].as_array().unwrap().iter().any(|x| x == "body font"), "{t}");
     m.err("import_markdown", json!({}), "invalid_argument");
+}
+
+// Literal import: `blocks` carry user text into the saved .docx exactly as typed (no Markdown read).
+#[test]
+fn blocks_import_user_text_verbatim() {
+    let d = Dir::new("blocks");
+    let mut m = Mcp::start(&d.0, &[]);
+    let note = "   indented *not bold*\nsecond line `x` \\pagebreak [TOC]\n\tTab & <tag> # 1. - + &amp; \\*";
+    let cell = "  a\nb | c";
+    let r = m.ok(
+        "import_markdown",
+        json!({"title": "Site diary", "blocks": [
+            {"type": "heading", "level": 1, "text": "Notes [x](http://e.com)"},
+            {"text": note},
+            {"type": "page_break"},
+            {"type": "table", "rows": [["date", "note"], ["2026-10-20", cell]]},
+            {"runs": [{"text": "  Signed: ", "bold": true}, "_A. Name_"]},
+        ]}),
+    );
+    assert_eq!((r["tables"].as_u64(), r["pageBreaks"].as_u64(), r["cover"].as_bool()), (Some(1), Some(1), Some(true)), "{r}");
+    m.ok("save_document", json!({"path": "diary.docx"}));
+    let body = &parts(&d.path("diary.docx"))["word/document.xml"];
+    assert!(body.contains(">   indented *not bold*<"), "leading spaces kept in the file: {body}");
+    assert!(body.contains("<w:br"), "a line break is a break");
+    assert!(body.contains("Tab &amp; &lt;tag&gt; # 1. - + &amp;amp; \\*"), "every character as typed");
+    assert!(body.contains("<w:tblHeader"), "the first row is a header row");
+    drop(m);
+    let mut m = Mcp::start(&d.0, &[]);
+    m.ok("open_document", json!({"path": "diary.docx"}));
+    let doc = m.ok("inspect_document", json!({}));
+    let all = doc.to_string();
+    let texts: Vec<&str> = doc["blocks"].as_array().unwrap().iter().filter_map(|b| b["text"].as_str()).collect();
+    for want in ["Notes [x](http://e.com)", note, "  Signed: _A. Name_"] {
+        assert!(texts.contains(&want), "{want:?} in {texts:?}");
+    }
+    assert!(all.contains(&serde_json::to_string(cell).unwrap()), "the cell as typed: {all}");
+    m.err("import_markdown", json!({"blocks": [{"type": "chart"}]}), "invalid_argument");
 }
 
 /// Pages of a PDF (`/Type /Page` objects, not `/Pages`).

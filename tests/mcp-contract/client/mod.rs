@@ -245,10 +245,10 @@ pub fn check_shape(name: &str, res: &Value) {
 /// The canonical path in the form the server reports it: on Windows, canonicalize gives the verbatim `\\?\C:\...` form, while
 /// the server (and the person reading its answers) uses the plain `C:\...` path to the same folder. A UNC path keeps its prefix.
 pub fn plain_path(p: PathBuf) -> PathBuf {
-    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        if !rest.starts_with(r"UNC\") {
-            return PathBuf::from(rest);
-        }
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && !rest.starts_with(r"UNC\")
+    {
+        return PathBuf::from(rest);
     }
     p
 }

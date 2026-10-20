@@ -72,7 +72,19 @@ fn response(id: Value, result: Value) -> Value {
 }
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+    let message = message.into();
+    // WHIQ: protocol errors carry the contract's code / reason / next step in `data` too (as in
+    // every craft app), never the message alone.
+    use crate::contract::code as c;
+    let (kind, next) = match code {
+        PARSE_ERROR | INVALID_REQUEST => (c::INVALID_REQUEST, "send one JSON-RPC 2.0 object per line"),
+        METHOD_NOT_FOUND => (c::NOT_FOUND, "use initialize, tools/list, tools/call, resources/list, resources/read or ping"),
+        RESOURCE_NOT_FOUND => (c::NOT_FOUND, "resources/list names the resources"),
+        INVALID_PARAMS => (c::INVALID_ARGUMENT, "check the request's params"),
+        _ => (c::INTERNAL, "send the request again"),
+    };
+    let data = crate::contract::ToolError::new(kind, message.clone(), next).to_json();
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
 }
 
 impl Server {

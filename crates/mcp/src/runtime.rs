@@ -481,6 +481,7 @@ fn status_json_with(
             "job_after_ms": options.job_after.as_millis() as u64,
             "open_job_bytes": options.open_job_bytes,
             "idle_evict_secs": options.idle_evict.map(|d| d.as_secs()),
+            "old_copies": limits.keep_old,
         },
     })
 }

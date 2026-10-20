@@ -30,11 +30,14 @@ pub struct Limits {
     /// Above this much memory (resident, or the document's own estimate where the platform
     /// doesn't tell), the open document is auto-saved and closed after the call (evicted).
     pub max_memory_bytes: Option<u64>,
+    /// A save over an existing file keeps it as `OLD_<name>` unless the call passes `overwrite:
+    /// true`. Off (`--automation-no-old-copies`): saves replace files, a supervisor keeps backups.
+    pub keep_old: bool,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_result_bytes: 100_000, max_image_bytes: 16 * 1024 * 1024, test_hooks: false, max_memory_bytes: None }
+        Limits { max_result_bytes: 100_000, max_image_bytes: 16 * 1024 * 1024, test_hooks: false, max_memory_bytes: None, keep_old: true }
     }
 }
 
@@ -70,6 +73,21 @@ fn ann(name: &str) -> Ann {
         // Anything else edits the document and can delete or replace content.
         _ => CHANGES,
     }
+}
+
+/// The files a tool reads, for a supervisor that stages them (`_meta["whiq/files"]`): `read`
+/// lists the arguments that name existing files the call reads; `opens` says the call opens or
+/// starts the document the server works on (replacing the open one), which is the file of the
+/// first `read` argument when one is given. Tools that read no file have no entry.
+fn files_meta(name: &str) -> Option<Value> {
+    let (read, opens): (&[&str], bool) = match name {
+        "open_document" | "import_markdown" => (&["path"], true),
+        "new_document" => (&[], true),
+        "roundtrip_check" => (&["path"], false),
+        "compare_documents" => (&["revised", "original"], false),
+        _ => return None,
+    };
+    Some(json!({"read": read, "opens": opens}))
 }
 
 fn s(desc: &str) -> Value {
@@ -165,10 +183,11 @@ fn own_tools() -> Vec<Value> {
         def(
             "import_markdown",
             "Import Markdown",
-            "Start a document from Markdown with the platform's shapes: headings 1–4, tables (header row shaded, bold, repeated), pictures by path, callouts (> [!NOTE], !!! tip, :::warning), numbered and bulleted lists, code blocks, page breaks (\\pagebreak, <!-- pagebreak -->), a table of contents ([TOC]), a cover block (front matter title, subtitle, date, author), headers and footers with page numbers ({page} of {pages}). The theme (fonts, colours, logo) is applied as one style batch. Replaces the open document.",
+            "Start a document from Markdown with the platform's shapes: headings 1–4, tables (header row shaded, bold, repeated), pictures by path, callouts (> [!NOTE], !!! tip, :::warning), numbered and bulleted lists, code blocks, page breaks (\\pagebreak, <!-- pagebreak -->), a table of contents ([TOC]), a cover block (front matter title, subtitle, date, author), headers and footers with page numbers ({page} of {pages}). The theme (fonts, colours, logo) is applied as one style batch. Replaces the open document. For user text that must stay exactly as typed, pass `blocks` instead of Markdown: their text is literal (no Markdown is read; leading spaces, line breaks and every character are kept).",
             json!({
                 "markdown": s("The Markdown text"),
                 "path": s("A .md file instead (pictures are read relative to it)"),
+                "blocks": {"type": "array", "items": {"type": "object"}, "description": "Instead of Markdown, the document as blocks whose text is taken literally (\\n is a line break): {type: \"paragraph\", text, style?: name, heading?: 1-6} or {runs: [{text, bold?, italic?, underline?, strike?, color?, size?, font?}]}; {type: \"heading\", level, text}; {type: \"table\", rows: [[cell text or {text, runs}]], header?: true (the first row: shaded, bold, repeated)}; {type: \"page_break\"}; a string is a paragraph"},
                 "theme": {"type": "object", "description": "{fonts: {body, heading}, colors: {text, primary, accent, tableHeader, tableHeaderText}, logo: path, size: pt}"},
                 "toc": b("Add a table of contents at the top (also: a [TOC] line)"),
                 "cover": b("Cover block from title/subtitle/date/author (default when there is a title)"),
@@ -236,6 +255,9 @@ pub fn tool_definitions() -> Value {
         }
         let a = ann(&name);
         t["annotations"] = json!({"title": title, "readOnlyHint": a.read_only, "destructiveHint": a.destructive, "idempotentHint": a.idempotent, "openWorldHint": false});
+        if let Some(files) = files_meta(&name) {
+            t["_meta"] = json!({"whiq/files": files});
+        }
     }
     Value::Array(out)
 }
@@ -478,11 +500,11 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             for k in crate::contract::COMMON_ARGS {
                 p.remove(*k);
             }
-            if p.get("markdown").is_none() && p.get("path").is_none() {
+            if p.get("markdown").is_none() && p.get("path").is_none() && p.get("blocks").is_none() {
                 return Err(ToolError::new(
                     "invalid_argument",
-                    "missing `markdown` or `path`",
-                    "pass the Markdown text as `markdown`, or a .md file as `path`",
+                    "missing `markdown`, `path` or `blocks`",
+                    "pass the Markdown text as `markdown`, a .md file as `path`, or literal text as `blocks` ([{\"text\": \"…\"}])",
                 ));
             }
             exec(b, "file.importMarkdown", Value::Object(p)).map(Out::Json).map_err(|e| contract::classify(&e, "import_markdown", a, &[]))
@@ -726,7 +748,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     {
         let _ = exec(b, "file.properties", json!({"author": who}));
     }
-    let policy = if args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
+    let policy =
+        if !limits.keep_old || args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
     // Every call reports at least what it is doing (tools with steps count them).
     if wordcraft_engine::whiq_progress::current().is_none() {
         wordcraft_engine::whiq_progress::phase(&name);

@@ -19,6 +19,11 @@
 //! - table header rows shaded (theme colour), bold, repeated on each page; code blocks shaded;
 //! - paragraphs that start with Arabic or Hebrew letters are right to left.
 //!
+//! Instead of Markdown, `blocks` gives the document as structured blocks whose text is taken
+//! literally (user text, verbatim: no Markdown is read, leading spaces and line breaks stay):
+//! paragraphs with an optional style or heading level, runs, tables of cells, page breaks. The
+//! cover, header, footer, contents and theme apply to them as to Markdown.
+//!
 //! `styles.applyTheme` applies a theme to any document as one style batch: body and heading
 //! fonts, text, heading and accent colours, table header colours, and a logo in the header.
 
@@ -28,10 +33,11 @@ use serde_json::{Value, json};
 use wordcraft_doc::para::InlineObject;
 use wordcraft_doc::props::{Align, Border, BorderStyle, Borders, CharProps, Rgb, TextColor};
 use wordcraft_doc::{Block, Blocks, Document, Paragraph, PartKind, Pos, StoryRef, para_block};
+use wordcraft_formats::model::{Cell as FCell, FBlock, FTable, Flow, Fmt, Kind as FKind, Para as FPara};
 
 use crate::{CmdError, CmdResult, CommandSpec, Selection, Session, p};
 
-const IMPORT_PARAMS: &str = r#"{"markdown"?: string, "path"?: string (a .md file; images are read relative to it), "theme"?: Theme, "toc"?: bool, "cover"?: bool (default: when front matter has a title), "header"?: string, "footer"?: string ("none" for none; {page} {pages} {title} {date}), "title"?, "subtitle"?, "date"?, "author"?} with Theme = {"fonts"?: {"body"?, "heading"?}, "colors"?: {"text"?, "primary"?, "accent"?, "tableHeader"?, "tableHeaderText"?}, "logo"?: path, "size"?: pt}"#;
+const IMPORT_PARAMS: &str = r#"{"markdown"?: string, "path"?: string (a .md file; images are read relative to it), "blocks"?: [Block] (instead of Markdown: text taken literally), "theme"?: Theme, "toc"?: bool, "cover"?: bool (default: when front matter has a title), "header"?: string, "footer"?: string ("none" for none; {page} {pages} {title} {date}), "title"?, "subtitle"?, "date"?, "author"?} with Theme = {"fonts"?: {"body"?, "heading"?}, "colors"?: {"text"?, "primary"?, "accent"?, "tableHeader"?, "tableHeaderText"?}, "logo"?: path, "size"?: pt}, Block = string (a paragraph) | {"type": "paragraph", "text"?: string, "runs"?: [string | {"text", "bold"?, "italic"?, "underline"?, "strike"?, "color"?, "size"?, "font"?}], "style"?: name, "heading"?: 1-6, "bold"?…} | {"type": "heading", "level"?: 1-6, "text"} | {"type": "table", "rows": [[string | paragraph]], "header"?: bool (default true: the first row)} | {"type": "page_break"}"#;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -462,15 +468,144 @@ fn hf_paragraph(text: &str, title: &str, date: &str, align: Align) -> Paragraph 
     p
 }
 
+/// Text a block gives (a number or boolean as written).
+fn literal_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(t) => Some(t.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// Character formatting a run (or a paragraph's `text`) asks for.
+fn literal_fmt(v: &Value) -> Fmt {
+    let on = |k: &str| p::bool(v, k).unwrap_or(false);
+    Fmt {
+        bold: on("bold"),
+        italic: on("italic"),
+        underline: on("underline"),
+        strike: on("strike"),
+        color: p::str(v, "color").and_then(|c| Rgb::parse(c.trim().trim_start_matches('#'))),
+        size: p::f32(v, "size"),
+        font: p::str(v, "font").map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// A paragraph from a string or `{text, runs, …}`, every character as given.
+fn literal_para(v: &Value, at: &str) -> Result<FPara, CmdError> {
+    let mut out = FPara::default();
+    let bad = |what: &str| CmdError::Params(format!("{at}: {what}"));
+    match v {
+        Value::Object(_) => {
+            if let Some(t) = v.get("text").filter(|t| !t.is_null()) {
+                out.push_text(&literal_text(t).ok_or_else(|| bad("`text` is a string"))?, &literal_fmt(v));
+            }
+            for (k, r) in v.get("runs").and_then(Value::as_array).into_iter().flatten().enumerate() {
+                let (t, f) = match r {
+                    Value::Object(_) => (r.get("text").and_then(literal_text), literal_fmt(r)),
+                    _ => (literal_text(r), Fmt::default()),
+                };
+                out.push_text(&t.ok_or_else(|| bad(&format!("runs[{k}] is a string or {{\"text\": …}}")))?, &f);
+            }
+        }
+        Value::Null => {}
+        _ => out.push_text(&literal_text(v).ok_or_else(|| bad("a paragraph is a string or {\"text\": …}"))?, &Fmt::default()),
+    }
+    Ok(out)
+}
+
+/// `blocks` as a flow, every string taken literally: no Markdown is read; leading spaces, tabs,
+/// line breaks (`\n`) and every other character stay as given (carriage returns and the other
+/// control characters a Word file can't hold are left out). Also each top-level block's `style`,
+/// and how many page breaks there are.
+fn literal_flow(blocks: &[Value]) -> Result<(Flow, Vec<Option<String>>, usize), CmdError> {
+    let mut flow = Flow::default();
+    let mut styles = Vec::new();
+    let mut page_break = false;
+    let mut breaks = 0;
+    for (i, b) in blocks.iter().enumerate() {
+        let at = format!("blocks[{i}]");
+        let kind = match p::str(b, "type") {
+            Some(t) => t.to_ascii_lowercase().replace(['_', '-', ' '], ""),
+            None if b.get("rows").is_some() => "table".into(),
+            None if p::bool(b, "page_break") == Some(true) && b.get("text").is_none() && b.get("runs").is_none() => "pagebreak".into(),
+            None => "paragraph".into(),
+        };
+        match kind.as_str() {
+            "pagebreak" | "newpage" | "break" => {
+                // A second break in a row: a page of its own.
+                if std::mem::replace(&mut page_break, true) {
+                    flow.blocks.push(FBlock::Para(FPara { page_break: true, ..Default::default() }));
+                    styles.push(None);
+                }
+                breaks += 1;
+            }
+            "table" => {
+                let header = p::bool(b, "header").unwrap_or(true);
+                let rows = b.get("rows").and_then(Value::as_array);
+                let rows = rows.ok_or_else(|| CmdError::Params(format!("{at}: a table needs `rows`: a list of rows, each a list of cells")))?;
+                let mut t = FTable::default();
+                for (r, row) in rows.iter().enumerate() {
+                    let cells = row.as_array().ok_or_else(|| CmdError::Params(format!("{at}.rows[{r}] is a list of cells")))?;
+                    let mut out = Vec::with_capacity(cells.len());
+                    for (c, cell) in cells.iter().enumerate() {
+                        let q = literal_para(cell, &format!("{at}.rows[{r}][{c}]"))?;
+                        out.push(FCell { blocks: vec![FBlock::Para(q)], header: header && r == 0, ..Default::default() });
+                    }
+                    t.rows.push(out);
+                }
+                // A table without cells shows nothing (and the flow keeps one block per block).
+                if t.rows.iter().all(Vec::is_empty) {
+                    continue;
+                }
+                if std::mem::take(&mut page_break) {
+                    // A table right after a break: the break goes in a paragraph of its own.
+                    let mut br = FPara::default();
+                    br.push_text("\u{000C}", &Fmt::default());
+                    flow.blocks.push(FBlock::Para(br));
+                    styles.push(None);
+                }
+                flow.blocks.push(FBlock::Table(t));
+                styles.push(None);
+            }
+            "paragraph" | "para" | "p" | "text" | "heading" | "h" => {
+                let mut q = literal_para(b, &at)?;
+                let level = p::u64(b, "heading").or_else(|| p::u64(b, "level")).or_else(|| matches!(kind.as_str(), "heading" | "h").then_some(1));
+                if let Some(n) = level {
+                    q.kind = FKind::Heading(n.clamp(1, 6) as u8);
+                }
+                q.page_break = std::mem::take(&mut page_break);
+                flow.blocks.push(FBlock::Para(q));
+                styles.push(p::str(b, "style").map(str::to_string));
+            }
+            other => return Err(CmdError::Params(format!("{at}: no block type `{other}` (paragraph, heading, table or page_break)"))),
+        }
+    }
+    if page_break {
+        flow.blocks.push(FBlock::Para(FPara { page_break: true, ..Default::default() }));
+        styles.push(None);
+    }
+    Ok((flow, styles, breaks))
+}
+
 fn import(s: &mut Session, v: &Value) -> CmdResult {
+    let blocks = match v.get("blocks") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(list)) => Some(list),
+        Some(_) => return Err(CmdError::Params("`blocks` is a list of blocks".into())),
+    };
     let (source, base) = match (p::str(v, "markdown").or_else(|| p::str(v, "text")), p::str(v, "path")) {
+        _ if blocks.is_some() => (String::new(), std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))),
         (Some(m), _) => (m.to_string(), std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))),
         (None, Some(path)) => {
             let bytes = crate::io::read_file(path).map_err(CmdError::Failed)?;
             let base = std::path::Path::new(path).parent().map(std::path::Path::to_path_buf).unwrap_or_default();
             (crate::io::decode_text(&bytes), base)
         }
-        (None, None) => return Err(CmdError::Params("`markdown` (the text) or `path` (a .md file) is required".into())),
+        (None, None) => {
+            return Err(CmdError::Params("`markdown` (the text), `path` (a .md file) or `blocks` (literal text, structured) is required".into()));
+        }
     };
     let (fm, body) = front_matter(&source);
     let get = |k: &str| -> Option<String> { p::str(v, k).map(str::to_string).or_else(|| fm.iter().find(|(x, _)| x == k).map(|(_, y)| y.clone())) };
@@ -489,9 +624,33 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
         theme.logo.or(fm_theme.logo).map(|l| if std::path::Path::new(&l).is_absolute() { l } else { base.join(&l).to_string_lossy().into_owned() });
     let mut notes = Vec::new();
     let mut images = 0usize;
-    let text = preprocess(body, &base, &mut notes, &mut images);
     let page = crate::io::region_page(&s.region());
-    let mut doc = wordcraft_formats::markdown::import_on(&text, &page);
+    let mut literal_breaks = 0;
+    let mut doc = match blocks {
+        Some(list) => {
+            if p::str(v, "markdown").or_else(|| p::str(v, "text")).or_else(|| p::str(v, "path")).is_some() {
+                notes.push("`markdown` and `path` were left out: `blocks` gives the document".to_string());
+            }
+            let (flow, styles, n) = literal_flow(list)?;
+            literal_breaks = n;
+            let mut doc = wordcraft_formats::model::to_doc_in(&flow, page.clone());
+            // One document block per flow block: each takes its style by name or id.
+            for (b, style) in doc.body.iter_mut().zip(&styles) {
+                let Some(name) = style else { continue };
+                match doc.styles.find(name).map(|st| st.id.clone()) {
+                    Some(id) => {
+                        if let Block::Para(p) = Arc::make_mut(b) {
+                            p.props.style = Some(id);
+                            p.touch();
+                        }
+                    }
+                    None => notes.push(format!("no style `{name}`: the paragraph kept its own")),
+                }
+            }
+            doc
+        }
+        None => wordcraft_formats::markdown::import_on(&preprocess(body, &base, &mut notes, &mut images), &page),
+    };
     let title = get("title").unwrap_or_default();
     let subtitle = get("subtitle").unwrap_or_default();
     let date = get("date").unwrap_or_default();
@@ -500,10 +659,11 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
     // Markers → page breaks, callouts, the TOC's place.
     let mut out: Blocks = Vec::with_capacity(doc.body.len() + 8);
     let mut callout: Option<(Rgb, Rgb)> = None;
-    let (mut breaks, mut callouts, mut toc_at) = (0usize, 0usize, None::<usize>);
+    let (mut breaks, mut callouts, mut toc_at) = (literal_breaks, 0usize, None::<usize>);
     let mut break_next = false;
     for b in std::mem::take(&mut doc.body) {
-        let mark = b.as_para().and_then(|p| parse_marker(&p.plain_text()));
+        // Literal blocks carry no markers: their text is the user's, whatever it holds.
+        let mark = b.as_para().filter(|_| blocks.is_none()).and_then(|p| parse_marker(&p.plain_text()));
         match mark.as_ref().map(|(k, a)| (k.as_str(), a.as_str())) {
             Some(("pagebreak", _)) => {
                 breaks += 1;
@@ -590,7 +750,8 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
     for b in out.iter_mut() {
         if let Block::Table(t) = Arc::make_mut(b) {
             tables += 1;
-            if let Some(row) = t.rows.first_mut() {
+            // Literal tables have a header row unless they said `header: false`.
+            if let Some(row) = t.rows.first_mut().filter(|r| blocks.is_none() || r.props.header) {
                 row.props.header = true;
                 for cell in row.cells.iter_mut() {
                     cell.props.shading = Some(fill);
@@ -850,6 +1011,66 @@ mod tests {
         let (s, r) = import_md("Before ![A chart](no/such/file.png) after.");
         assert!(r["warnings"][0].as_str().unwrap().contains("no/such/file.png"), "{r}");
         assert!(s.doc.plain_text(StoryRef::Body).contains("A chart"));
+    }
+
+    #[test]
+    fn blocks_keep_user_text_exactly() {
+        let note = "  two leading spaces\n\tand a tab; *not* `code`\n# no heading, \\pagebreak, [TOC], <b>&amp;</b>, \\*, ١٢٣";
+        let mut s = Session::new(Document::new());
+        let r = s
+            .run(
+                "file.importMarkdown",
+                &json!({"blocks": [
+                    {"type": "heading", "level": 2, "text": "# Site *diary*"},
+                    {"text": note},
+                    {"runs": [{"text": "  bold ", "bold": true}, "plain_\\*"], "style": "Quote"},
+                    {"type": "page_break"},
+                    {"type": "table", "rows": [["| a |", "*b*"], ["  c\nd", {"text": "e", "italic": true}]]},
+                    {"type": "table", "header": false, "rows": [["x"]]},
+                    {"text": "\u{E0FF}WHIQ:pagebreak:\u{E0FF}"},
+                    {"text": "x", "style": "No Such Style"},
+                    "a bare string",
+                ], "footer": "none"}),
+            )
+            .unwrap();
+        assert_eq!((r["tables"].as_u64(), r["pageBreaks"].as_u64(), r["callouts"].as_u64()), (Some(2), Some(1), Some(0)), "{r}");
+        assert!(r["warnings"].to_string().contains("No Such Style"), "{r}");
+        let paras: Vec<&Paragraph> = s.doc.body.iter().filter_map(|b| b.as_para()).collect();
+        assert_eq!((paras[0].plain_text().as_str(), paras[0].props.style.as_deref()), ("# Site *diary*", Some("Heading2")));
+        assert_eq!(paras[1].plain_text(), note, "every character, leading spaces and line breaks as given");
+        assert_eq!((paras[2].plain_text().as_str(), paras[2].props.style.as_deref()), ("  bold plain_\\*", Some("Quote")));
+        assert_eq!(paras[2].runs[0].props.bold, Some(true));
+        assert_eq!(paras[3].plain_text(), "\u{000C}", "the break before a table is a paragraph of its own");
+        assert_eq!(paras[4].plain_text(), "\u{E0FF}WHIQ:pagebreak:\u{E0FF}", "no marker is read in literal text");
+        assert_eq!(paras[6].plain_text(), "a bare string");
+        let tables: Vec<&wordcraft_doc::Table> = s
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match &**b {
+                Block::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let cell = |t: &wordcraft_doc::Table, r: usize, c: usize| tables_text(&t.rows[r].cells[c].blocks);
+        assert_eq!((cell(tables[0], 0, 0), cell(tables[0], 1, 0)), ("| a |".to_string(), "  c\nd".to_string()));
+        assert!(tables[0].rows[0].props.header && tables[0].rows[0].cells[0].props.shading.is_some(), "a header row, shaded");
+        assert!(!tables[1].rows[0].props.header && tables[1].rows[0].cells[0].props.shading.is_none(), "header: false");
+        assert!(!s.doc.plain_text(StoryRef::Body).contains("WHIQ:callout"));
+        // Mistakes name the block.
+        for (bad, want) in [
+            (json!({"blocks": [{"type": "chart"}]}), "blocks[0]"),
+            (json!({"blocks": ["ok", {"type": "table", "rows": [5]}]}), "blocks[1].rows[0]"),
+            (json!({"blocks": [{"runs": [{"bold": true}]}]}), "runs[0]"),
+            (json!({"blocks": "text"}), "`blocks`"),
+        ] {
+            let e = Session::new(Document::new()).run("file.importMarkdown", &bad).unwrap_err().to_string();
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+    }
+
+    fn tables_text(blocks: &Blocks) -> String {
+        blocks.iter().filter_map(|b| b.as_para()).map(Paragraph::plain_text).collect::<Vec<_>>().join("\n")
     }
 
     #[test]

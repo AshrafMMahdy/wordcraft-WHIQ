@@ -241,6 +241,28 @@ The musl build was run here: `cargo build --release --locked -p wordcraft-cli --
 x86_64-unknown-linux-musl` gives a `static-pie linked` 84 MB binary; the contract suite (22/22,
 `WORDCRAFT_CLI` set to it) and `smoke.sh` pass on it.
 
+## Platform pass (2026-10-20): literal text, OLD_ off, protocol errors, file arguments
+
+Four gaps the platform worked around (escaping every ASCII punctuation mark of user text for
+`import_markdown`, injecting `overwrite: true` into every save, parsing `[code] reason` text, and
+guessing document arguments from tool names) are closed in the engine.
+
+| Change | Where | Tested by |
+|---|---|---|
+| `import_markdown` / `file.importMarkdown` take `blocks` instead of Markdown: the document as structured blocks whose text is taken literally — no Markdown is read, leading spaces, tabs, line breaks (`\n`) and every other character stay as given (carriage returns and the other control characters a Word file can't hold are left out). A block is a string (a paragraph), `{type: "paragraph", text?, runs?: [string \| {text, bold?, italic?, underline?, strike?, color?, size?, font?}], style?: name or id, heading?: 1-6}`, `{type: "heading", level, text}`, `{type: "table", rows: [[cell]], header?: true}` (a cell is a string or a paragraph; the first row is the header row, shaded, bold and repeated, unless `header: false`) or `{type: "page_break"}`. The cover, header, footer, contents and theme apply as to Markdown; no marker is read in the text; an unknown style is a warning; a malformed block is `invalid_argument` naming it (`blocks[3].rows[0]`). The blocks go through the formats crate's flow model (`wordcraft_formats::model::to_doc_in`), as Markdown does. | `crates/engine/src/cmd/whiq_markdown.rs` (`literal_flow`), `crates/mcp/src/whiq.rs` | `whiq_markdown::tests::blocks_keep_user_text_exactly`; `blocks_import_user_text_verbatim` (contract suite: the saved `.docx` keeps leading spaces, breaks and every character, and reads back the same) |
+| `--automation-no-old-copies`: saves and exports replace files, with no `OLD_` copy and no `previous_files_renamed` (the platform keeps the backups); `server_status.limits.old_copies` says which. Without the flag nothing changes. | `apps/wordcraft-cli/src/main.rs`, `crates/mcp/src/whiq.rs` (`Limits::keep_old`), `runtime.rs` | `old_copies_can_be_turned_off_for_a_supervisor` |
+| Protocol errors the worker answers (an unknown method, `tools/call` without a name, `resources/read`, an invalid message) carried only `message`; they now carry `{code, reason, next_step}` in `error.data` like the runtime's. Every tool error already had `isError` with `structuredContent.error`. | `crates/mcp/src/server.rs` (`error`) | `errors_carry_code_reason_and_next_step` |
+| `tools/list` names the files a tool reads: `_meta: {"whiq/files": {"read": [argument names], "opens": bool}}` on `open_document` and `import_markdown` (`path`, opens), `new_document` (opens), `roundtrip_check` (`path`) and `compare_documents` (`revised`, `original`). `read` are the arguments naming existing files the call reads; `opens` that the call opens or starts the document (the file of the first `read` argument when given). | `crates/mcp/src/whiq.rs` (`files_meta`) | `annotations_say_what_each_tool_does` |
+
+Also: a `collapsible_if` that Rust 1.97's clippy reports in the contract client (`plain_path`) is collapsed.
+
+Test status (Linux x86_64, craft-fonts 43913056): `cargo test --workspace --no-fail-fast` runs 2830
+tests: 2827 pass, 2 are ignored upstream, and the same one fails for want of a GPU
+(`wordcraft-ui-egui objects::tests::a_dragged_shape_leaves_the_text_behind_it`); `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo fmt --check`, `cargo xtask layers`, `assets` and
+`wasm` pass; `cargo build --release --locked -p wordcraft-cli` (`CRAFT_FONTS_REQUIRED=1`) succeeds,
+and against that binary the contract suite passes 24/24 and `smoke.sh` passes.
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
