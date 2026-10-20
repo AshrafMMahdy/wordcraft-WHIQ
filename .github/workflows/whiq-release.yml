@@ -8,6 +8,10 @@ name: whiq-release
 # platform's build script reads). No signing, no secrets: the workflow's own GITHUB_TOKEN
 # publishes. The upstream release.yml is untouched.
 #
+# Hardened (2026-10-20, as the P6 clone's and GridCraft's): a published asset is never replaced (the
+# platform pins each by sha256 in engines.lock), a dispatch naming a tag that already exists builds
+# that tag, and the archives are reproducible (the same commit gives the same archive bytes).
+#
 #   git tag whiq-v0.7.0 && git push whiq-fork whiq-v0.7.0     # build, test and publish
 #   (or Actions › whiq-release › Run workflow: build and test; give a tag to publish it)
 
@@ -38,8 +42,30 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # What is built: a tag that already exists is built from the tag itself (a re-run never builds a
+  # later commit under an old tag); a new tag from the commit the run was dispatched on, and the
+  # release then creates the tag there.
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if [ "${{ github.ref_type }}" != "tag" ] && [ -n "${{ inputs.tag }}" ] && gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"; echo "building the existing tag $tag"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"; echo "building $GITHUB_SHA"
+          fi
+
   build:
     name: build (${{ matrix.platform }})
+    needs: plan
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -56,6 +82,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
       - name: Check out craft-fonts at the pin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,7 +107,7 @@ jobs:
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then tag="${{ github.ref_name }}";
           elif [ -n "${{ inputs.tag }}" ]; then tag="${{ inputs.tag }}";
-          else tag="whiq-dev-${GITHUB_SHA::7}"; fi
+          else tag="whiq-dev-$(git rev-parse --short=7 HEAD)"; fi
           case "$tag" in whiq-v*|whiq-dev-*) ;; *) echo "::error::release tags start with whiq-v (got $tag)"; exit 1;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Build ${{ env.APP }}-cli
@@ -116,12 +144,32 @@ jobs:
           cp LICENSE-APACHE LICENSE-MIT NOTICE ATTRIBUTION.md WHIQ-CHANGES.md CONTRACT-PARITY.md "dist/$name/"
           # The embedded fonts' licences (OFL and others) travel with the binary that carries them.
           (cd craft-fonts/fonts && for d in */; do for f in "$d"*.txt "$d"LICENSE*; do [ -f "$f" ] && mkdir -p "../../dist/$name/licenses/fonts/$d" && cp "$f" "../../dist/$name/licenses/fonts/$d"; done; done; true)
-          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, commit $GITHUB_SHA" > "dist/$name/BUILD.txt"
+          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, commit $(git rev-parse HEAD)" > "dist/$name/BUILD.txt"
+          # Reproducible: the same files give the same archive bytes (names sorted, every time the
+          # commit's, no owners, no gzip stamp; the zip with fixed dates and modes).
+          epoch="$(git log -1 --format=%ct)"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
-            pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
+            # Inline (not a file in the tree): an existing tag built from an older commit has no such file.
+            PY="$(command -v python3 || command -v python)"
+            "$PY" - "$name" "$name.zip" "$epoch" <<'PY'
+          import os, sys, time, zipfile
+          src, out, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          stamp = time.gmtime(max(epoch, 315532800))[:6]  # zip dates start in 1980
+          files = []
+          for root, dirs, names in os.walk(src):
+              files += [os.path.join(root, n) for n in names]
+          with zipfile.ZipFile(out, "w") as z:
+              for f in sorted(files, key=lambda p: p.replace(os.sep, "/")):
+                  info = zipfile.ZipInfo(f.replace(os.sep, "/"), date_time=stamp)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.create_system = 3  # the same header on every runner
+                  info.external_attr = (0o100755 if f.endswith(".exe") else 0o100644) << 16
+                  with open(f, "rb") as fh:
+                      z.writestr(info, fh.read(), compresslevel=9)
+          PY
           else
-            tar -czf "$name.tar.gz" "$name"
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf - "$name" | gzip -n > "$name.tar.gz"
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -133,10 +181,14 @@ jobs:
 
   release:
     name: publish
-    needs: build
+    needs: [plan, build]
     if: github.ref_type == 'tag' || inputs.tag != ''
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          path: src
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -164,9 +216,18 @@ jobs:
         run: |
           tag="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
           notes="Headless WordCraft ($APP-cli) for the White Hat IQ platform: MCP over stdio. Linux x86_64 (musl, static) and Windows x86_64. craft-fonts $CRAFT_FONTS_REF embedded. Contract: CONTRACT-PARITY.md and WHIQ-CHANGES.md in each archive. Checksums: SHA256SUMS; engines.lock for the platform build."
+          commit="$(git -C src rev-parse HEAD)"
           cd dist
+          # A published asset is never replaced: the platform pins each by sha256 (engines.lock), and
+          # a replaced file would fail every install's verify. A release made first on GitHub's
+          # Releases page, with no files yet, gets them added.
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --clobber
+            n="$(gh release view "$tag" --json assets --jq '.assets | length')"
+            if [ "$n" != "0" ]; then
+              echo "::error::release $tag already has $n file(s); a published release is never overwritten: publish a new tag"
+              exit 1
+            fi
+            gh release upload "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock
           else
-            gh release create "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --target "$GITHUB_SHA" --title "$APP-cli $tag" --notes "$notes"
+            gh release create "$tag" ./*.tar.gz ./*.zip SHA256SUMS engines.lock --target "$commit" --title "$APP-cli $tag" --notes "$notes"
           fi

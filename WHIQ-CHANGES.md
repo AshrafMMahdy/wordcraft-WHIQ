@@ -223,6 +223,14 @@ tests/mcp-contract/smoke.sh target/release/wordcraft-cli
 
 ### Release workflow
 
+Hardened (2026-10-20, as GridCraft's 13025be and the P6 clone's de992a2): a published asset is never
+replaced (no `--clobber`: a re-run on a tag whose release already has files fails clearly; a release
+made empty on the Releases page still gets its files); a `plan` job resolves the ref (a dispatch
+naming a tag that already exists builds that tag, a new tag the dispatched commit), every checkout
+uses it, and the release `--target` and `BUILD.txt` name `git rev-parse HEAD`; the archives are
+reproducible (tar sorted, the commit's mtime, owners 0/0, `gzip -n`; the Windows zip written by an
+inline Python `zipfile` with sorted entries and fixed dates and modes).
+
 `.github/workflows/whiq-release.yml` (new; the upstream `release.yml` is untouched): on a tag
 `whiq-v*` (or Run workflow, with an optional tag to publish) it builds only `wordcraft-cli`, for
 `x86_64-unknown-linux-musl` (static: the host's glibc does not matter) on ubuntu-22.04 and
