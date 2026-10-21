@@ -377,6 +377,58 @@ fn memory_pressure_evicts_with_the_work_auto_saved() {
     assert_eq!(text_of(&mut m2), "Precious");
 }
 
+// WHIQ §3: a save is never lost to an eviction: the save that comes after one writes the
+// auto-saved work where it was asked, byte for byte.
+#[test]
+fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
+    let d = Dir::new("evict-save");
+    let mut m = Mcp::start(&d.0, &["--max-memory-mb", "1"]);
+    let r = m.ok("type_text", json!({"text": "Saved after the eviction"}));
+    assert!(r["warnings"].to_string().contains("evicted"), "{r}");
+    let e = m.err("get_text", json!({}), "evicted");
+    let rec = e["recovered_path"].as_str().unwrap().to_string();
+    let out = d.0.join("after-eviction.docx");
+    let s = m.ok("save_document", json!({"path": out.to_string_lossy()}));
+    let name = std::path::Path::new(&rec).file_name().unwrap().to_string_lossy().into_owned();
+    assert!(s["saved_from"].as_str().unwrap().ends_with(&name), "{s}");
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&rec).unwrap());
+    let mut m2 = Mcp::start(&d.0, &[]);
+    m2.ok("open_document", json!({"path": out.to_string_lossy()}));
+    assert_eq!(text_of(&mut m2), "Saved after the eviction");
+}
+
+// WHIQ: every block of a long document is reachable through inspect_document's continuation
+// (the engine answered the first 2,000 and no more), and export_text writes the whole text.
+#[test]
+fn inspect_document_reaches_every_block_and_export_text_writes_it_all() {
+    let d = Dir::new("long");
+    let mut m = Mcp::start(&d.0, &[]);
+    let lines: Vec<String> = (0..2600).map(|i| format!("Paragraph {i}.")).collect();
+    m.ok("type_text", json!({"text": lines.join("\n"), "paragraphs": true}));
+    let mut seen = 0usize;
+    let mut from = 0u64;
+    let mut last = String::new();
+    for _ in 0..200 {
+        let r = m.ok("inspect_document", json!({"continue_from": from}));
+        let blocks = r["blocks"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "{r}");
+        assert_eq!(blocks[0]["index"].as_u64().unwrap(), from, "the continuation is absolute");
+        seen += blocks.len();
+        last = blocks.last().unwrap()["text"].as_str().unwrap_or("").to_string();
+        match r["continue_from"].as_u64() {
+            Some(n) => from = n,
+            None => break,
+        }
+    }
+    assert_eq!(seen, 2600);
+    assert_eq!(last, "Paragraph 2599.");
+    let out = d.0.join("all.txt");
+    let t = m.ok("export_text", json!({"path": out.to_string_lossy()}));
+    assert_eq!(t["path"], json!(out.to_string_lossy()));
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.starts_with("Paragraph 0.") && text.trim_end().ends_with("Paragraph 2599."), "{}", &text[..40]);
+}
+
 // §4 Oversized results are trimmed with a marker and a way to continue; server_status reports.
 #[test]
 fn oversized_results_are_trimmed_with_continue_from() {

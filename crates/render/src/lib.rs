@@ -157,6 +157,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// WHIQ: drop every decoded picture and drawing the caches hold (a host under memory pressure
+/// sheds them before it closes a document).
+pub fn release_caches() {
+    let mut i = lock(images());
+    i.map.clear();
+    i.bytes = 0;
+    drop(i);
+    let mut v = lock(vectors());
+    v.map.clear();
+    v.bytes = 0;
+}
+
 fn images() -> &'static Mutex<MediaCache<Option<Arc<Pixmap>>>> {
     static C: std::sync::OnceLock<Mutex<MediaCache<Option<Arc<Pixmap>>>>> = std::sync::OnceLock::new();
     C.get_or_init(|| Mutex::new(MediaCache { map: HashMap::new(), bytes: 0 }))

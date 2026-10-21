@@ -169,6 +169,43 @@ pub struct LayoutOptions {
     pub outline: Option<outline::OutlineView>,
     /// What the spelling check skips, and whether grammar is marked too (File › Options › Proofing).
     pub proof: ProofOptions,
+    /// WHIQ: keep only some pages' contents ([`PageWindow`]); `None` keeps every page.
+    pub window: Option<PageWindow>,
+}
+
+/// WHIQ: lay a long document out in little memory. Pages outside `first..=last` (0-based) keep
+/// their size, number and section but give their lines back as soon as they are finished, and
+/// the paragraph cache is emptied with them, so a 1,280-page document is paginated holding a few
+/// pages at a time (to count its pages, or to draw page 900). With `stop`, pagination stops once
+/// page `last` is finished: the pages after it are not laid out at all. A stopped layout's page
+/// totals (`NUMPAGES`) are not known; callers stop only when the document shows none
+/// ([`shows_page_totals`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageWindow {
+    pub first: usize,
+    pub last: usize,
+    pub stop: bool,
+}
+
+impl PageWindow {
+    /// Count the pages only: no page keeps its contents.
+    pub const COUNT: PageWindow = PageWindow { first: usize::MAX, last: 0, stop: false };
+    pub fn keeps(&self, page: usize) -> bool {
+        (self.first..=self.last).contains(&page)
+    }
+}
+
+/// WHIQ: does the document show page totals anywhere (`NUMPAGES`, `SECTIONPAGES`)? Such a
+/// document is paginated to its end even for one page.
+pub fn shows_page_totals(doc: &Document) -> bool {
+    let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(doc.parts.keys().map(|id| StoryRef::Part(*id))).collect();
+    stories.into_iter().any(|story| {
+        doc.para_paths(story).iter().filter_map(|path| doc.para(story, path)).any(|p| {
+            p.objects
+                .iter()
+                .any(|o| matches!(o, InlineObject::Field { instr, .. } if matches!(fields::field_name(instr).as_str(), "NUMPAGES" | "SECTIONPAGES")))
+        })
+    })
 }
 
 /// File › Options › Proofing choices that change the squiggles.
@@ -2133,7 +2170,9 @@ fn layout_pass(
         })
         .collect();
     let mut prev_turn = TextDirection::Horizontal;
-    for (si, (end, sect)) in sections.iter().enumerate() {
+    // WHIQ: pages before this one have been checked against the window.
+    let mut trimmed = 0usize;
+    'sections: for (si, (end, sect)) in sections.iter().enumerate() {
         let turn = if reflow { TextDirection::Horizontal } else { sect.text_direction };
         let sect: &SectionProps = match turned.get(si) {
             Some(Some(t)) => t,
@@ -2243,6 +2282,28 @@ fn layout_pass(
                 from = Some((block, snap));
             }
             block += 1;
+            // WHIQ: finished pages outside the window give their lines back (the last two pages
+            // can still change: notes carried, columns balanced).
+            if let Some(w) = opts.window {
+                let done = pb.pages.len().saturating_sub(2);
+                let mut freed = false;
+                while trimmed < done {
+                    if !w.keeps(trimmed)
+                        && let Some(p) = pb.pages.get_mut(trimmed)
+                    {
+                        freed |= !p.items.is_empty();
+                        p.items = Vec::new();
+                    }
+                    trimmed += 1;
+                }
+                if freed {
+                    ctx.cache.paras.clear();
+                    ctx.cache.measures.clear();
+                }
+                if w.stop && pb.pages.len() > w.last.saturating_add(2) {
+                    break 'sections;
+                }
+            }
         }
         if let Some((first, snap)) = from {
             boxes_discarded += balance_columns(&mut ctx, &mut pb, (first, block), &snap, body_top);
@@ -2310,6 +2371,16 @@ fn layout_pass(
             ctx.fields.bookmark_pages = Arc::new(marks);
         }
         headers_footers(&mut ctx, &mut pages, &sections);
+        // WHIQ: pages outside the window keep no header or footer either.
+        if let Some(w) = opts.window {
+            for (i, p) in pages.iter_mut().enumerate() {
+                if !w.keeps(i) {
+                    p.items = Vec::new();
+                    p.header = Vec::new();
+                    p.footer = Vec::new();
+                }
+            }
+        }
         if doc.settings.mirror_margins {
             mirror_even_pages(&mut pages, &sections);
         }
@@ -4126,6 +4197,8 @@ pub fn now_ms() -> f64 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_window;
 #[cfg(test)]
 mod tests_bidi;
 #[cfg(test)]

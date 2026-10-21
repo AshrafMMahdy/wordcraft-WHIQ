@@ -348,11 +348,26 @@ pub fn open_path_with(path: &std::path::Path, password: Option<&str>) -> Result<
 pub fn open_path_in(path: &std::path::Path, password: Option<&str>, region: &wordcraft_geom::Region) -> Result<(Document, bool), String> {
     crate::file_access::check_read(&path.to_string_lossy())?;
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.len() > 2 << 30 {
-        return Err(format!("{}: file is larger than 2 GB", path.display()));
+    let name = path.to_string_lossy();
+    // WHIQ: a .docx package is read straight from its file (never whole into memory; each part
+    // inflated when needed). Everything else is read as bytes, within the memory budget.
+    if matches!(ext_of(&name).as_str(), "docx" | "docm" | "dotx" | "dotm") && head_is_zip(path) {
+        let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut doc = wordcraft_docx::read_reader(Box::new(std::io::BufReader::with_capacity(1 << 16, f))).map_err(|e| e.to_string())?;
+        opened(&mut doc);
+        load_embedded_fonts(&doc);
+        return Ok((doc, false));
+    }
+    let budget = wordcraft_doc::memory::budget();
+    if meta.len() > budget {
+        return Err(format!(
+            "{}: the file is {} MB and this kind of file is read whole into memory, past this process's {} MB (--max-memory-mb). Save it as .docx (which WordCraft reads part by part), or raise the engine's memory limit",
+            path.display(),
+            meta.len() >> 20,
+            budget >> 20
+        ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let name = path.to_string_lossy();
     if matches!(ext_of(&name).as_str(), "html" | "htm" | "xhtml") {
         // Pictures referenced by a relative path load from beside the HTML file.
         let images = LocalImages::new(path.parent().unwrap_or(std::path::Path::new("")));
@@ -363,6 +378,14 @@ pub fn open_path_in(path: &std::path::Path, password: Option<&str>, region: &wor
         return Ok((doc, false));
     }
     open_bytes_in(&name, &bytes, password, region)
+}
+
+/// Does the file start like a zip (a package, not an encrypted compound file)?
+#[cfg(not(target_arch = "wasm32"))]
+fn head_is_zip(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head == *b"PK\x03\x04"
 }
 
 /// The pictures an HTML file names by a path relative to its folder.
@@ -549,6 +572,14 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
     crate::file_access::check_write(path)?;
     // Like a document save: the old file is replaced only once the new bytes are fully written.
     safe_save::write(std::path::Path::new(path), bytes).map_err(|e| format!("{path}: {e}"))
+}
+
+/// WHIQ: [`write_file`] with the bytes written by `fill` straight into the temporary file (a file
+/// copied as a stream): the same root check, atomic replace and `OLD_` policy.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_file_with(path: &str, fill: &mut dyn FnMut(&mut std::fs::File) -> std::io::Result<()>) -> Result<(), String> {
+    crate::file_access::check_write(path)?;
+    safe_save::write_with(std::path::Path::new(path), fill).map_err(|e| format!("{path}: {e}"))
 }
 
 #[cfg(target_arch = "wasm32")]

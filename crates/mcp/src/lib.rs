@@ -107,20 +107,27 @@ impl Headless {
                 let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 8.0) as f32;
                 // WHIQ: `markup` picks the printed page with or without Print Markup (as a PDF
                 // export does); without it, the page as the editing view lays it out.
-                let (l, opts) = match params.get("markup").and_then(Value::as_bool) {
+                // WHIQ: a printed page is laid out holding only itself in memory: the pages before
+                // it are paginated and given back as they finish, the pages after it are not laid
+                // out at all (unless the document shows page totals). Only that page is drawn.
+                let (l, opts, pages) = match params.get("markup").and_then(Value::as_bool) {
                     Some(markup) => {
                         let mut o = wordcraft_render::RenderOptions::default();
                         o.display.dim_header = false;
-                        (self.session.export_layout_with(markup), o)
+                        let w = wordcraft_engine::layout::PageWindow { first: page, last: page, stop: true };
+                        let l = Arc::new(self.session.export_layout_window(markup, w));
+                        (l, o, self.session.page_count(markup))
                     }
-                    None => (self.session.layout(), Default::default()),
+                    None => {
+                        let l = self.session.layout();
+                        let n = l.pages.len();
+                        (l, Default::default(), n)
+                    }
                 };
-                let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page + 1))?;
+                let pg = l.pages.get(page).ok_or_else(|| format!("no page {} (the document has {pages})", page + 1))?;
                 let img = wordcraft_render::render_page(&self.session.doc, pg, scale, &opts);
                 let png = img.to_png();
-                Ok(
-                    json!({"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": img.width, "height": img.height, "pages": l.pages.len()}),
-                )
+                Ok(json!({"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": img.width, "height": img.height, "pages": pages}))
             }
             m if m.starts_with("ui.") => Err(format!("`{m}` {NEEDS_APP}")),
             other => self.session.run(other, &params).map_err(|e| e.to_string()),
@@ -143,6 +150,13 @@ impl Default for Headless {
 }
 
 impl Backend for Headless {
+    fn release_caches(&mut self) {
+        self.session.relayout();
+        for (_, s) in self.parked.iter_mut() {
+            s.relayout();
+        }
+        wordcraft_render::release_caches();
+    }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let roots = self.roots.clone();
         file_access::confine(roots.as_ref(), || self.answer(method, params))

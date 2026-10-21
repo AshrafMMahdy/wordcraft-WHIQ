@@ -297,6 +297,14 @@ impl Server {
             }
             _ => {}
         }
+        // WHIQ: a save is never lost to an eviction: the closed document's auto-saved copy (or
+        // its unchanged original) is written where the save asks, byte for byte, unopened.
+        if let Some(n) = self.notice.clone()
+            && !WITHOUT_DOCUMENT.contains(&canonical.as_str())
+            && let Some(r) = self.save_evicted(&canonical, args, &n)
+        {
+            return r;
+        }
         if let Some(n) = &self.notice
             && !WITHOUT_DOCUMENT.contains(&canonical.as_str())
         {
@@ -391,13 +399,78 @@ impl Server {
         json!({"evicted": evs})
     }
 
+    /// WHIQ: `save_document` (or `execute` `file.save` / `file.saveAs`) after the document was
+    /// closed: its auto-saved copy (or unchanged original) is copied to the path asked. `None`
+    /// when the call is no such save or asks for another format (that needs the document open
+    /// again, and the `evicted` answer says so).
+    fn save_evicted(&mut self, canonical: &str, args: &Value, n: &Value) -> Option<Value> {
+        let params = match canonical {
+            "save_document" => args.clone(),
+            "execute" if args.get("command").and_then(Value::as_str).is_some_and(|c| matches!(c, "file.save" | "file.saveAs")) => {
+                args.get("params").cloned().unwrap_or(Value::Null)
+            }
+            _ => return None,
+        };
+        let recovered = n.get("recovered_path").and_then(Value::as_str).map(str::to_string);
+        let original = n.get("original_path").and_then(Value::as_str).map(str::to_string);
+        let source = recovered.clone().or_else(|| original.clone())?;
+        let target = params.get("path").and_then(Value::as_str).map(str::to_string).or_else(|| original.clone())?;
+        let ext = |p: &str| std::path::Path::new(p).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if ext(&source) != ext(&target) || ext(&source) != "docx" || params.get("format").and_then(Value::as_str).is_some_and(|f| f != "docx") {
+            return None;
+        }
+        let keep = self.limits.keep_old && args.get("overwrite").and_then(Value::as_bool) != Some(true);
+        let policy = if keep { wordcraft_engine::file_access::Overwrite::KeepOld } else { wordcraft_engine::file_access::Overwrite::Replace };
+        let same = std::fs::canonicalize(&source).ok().zip(std::fs::canonicalize(&target).ok()).is_some_and(|(a, b)| a == b);
+        let copy = || -> Result<u64, String> {
+            if same {
+                return std::fs::metadata(&source).map(|m| m.len()).map_err(|e| format!("{source}: {e}"));
+            }
+            let mut src = std::fs::File::open(&source).map_err(|e| format!("{source}: {e}"))?;
+            let mut bytes = 0;
+            wordcraft_engine::io::write_file_with(&target, &mut |f| {
+                bytes = std::io::copy(&mut src, f)?;
+                Ok(())
+            })?;
+            Ok(bytes)
+        };
+        // The roots in force are the process's (the CLI confines it at start).
+        let (r, kept) = wordcraft_engine::file_access::with_overwrite(policy, copy);
+        let abs = |p: &str| std::path::absolute(p).map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string());
+        Some(match r {
+            Ok(bytes) => {
+                let reason = n.get("reason").and_then(Value::as_str).unwrap_or("the document was closed");
+                let mut v = json!({
+                    "path": abs(&target),
+                    "bytes": bytes,
+                    "saved_from": abs(&source),
+                    "evicted": {"reason": reason, "recovered_path": recovered, "original_path": original},
+                    "next_step": format!("saved. The document had been closed by the server ({reason}); the save wrote its work from {source}. Call open_document {{\"path\": \"{}\"}} to edit it further", abs(&target)),
+                });
+                if !kept.is_empty() {
+                    v["previous_files_renamed"] = json!(kept.iter().map(|(d, o)| json!({"path": d.to_string_lossy(), "previous": o.to_string_lossy()})).collect::<Vec<_>>());
+                }
+                crate::whiq::json_result(v, &[])
+            }
+            Err(e) => crate::whiq::error_result(
+                &crate::contract::ToolError::new(crate::contract::code::FAILED, e, "check the path and the write root, or open the recovered file and save it"),
+                &[],
+            ),
+        })
+    }
+
     /// Publish the open document for auto-saves and `server_status`; evict it when memory is past
     /// the limit (auto-saved first). Returns a note for the call's result when it was evicted.
     fn publish(&mut self, may_evict: bool) -> Option<String> {
         let snap = self.backend.snapshot()?;
-        let used = crate::recover::rss_bytes().unwrap_or_else(|| crate::recover::doc_bytes(&snap.doc));
+        let mut used = crate::recover::rss_bytes().unwrap_or_else(|| crate::recover::doc_bytes(&snap.doc));
         // Only a document that holds something is evicted (a blank, untouched one frees nothing).
         let holds = snap.dirty || snap.path.is_some();
+        // WHIQ: layouts and decoded pictures go first; the document only if that is not enough.
+        if self.limits.max_memory_bytes.is_some_and(|limit| may_evict && holds && used > limit) {
+            self.backend.release_caches();
+            used = crate::recover::rss_bytes().unwrap_or(used);
+        }
         let over = self.limits.max_memory_bytes.filter(|limit| may_evict && holds && used > *limit);
         let author = self.backend.author();
         let Some(limit) = over else {

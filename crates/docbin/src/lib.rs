@@ -41,14 +41,24 @@ use piece::{PieceTable, PrmRef};
 use sprm::Prl;
 use table::ParaOut;
 
-/// Largest stream we materialise (bytes); the engine already caps whole files at 2 GB.
+/// Largest stream we materialise (bytes) at the smallest memory budget. WHIQ: the working limit
+/// ([`max_stream`]) is the whole memory budget when that is more.
 const MAX_STREAM: u64 = 1 << 30;
+
+fn max_stream() -> u64 {
+    wordcraft_doc::memory::share(MAX_STREAM, 1)
+}
 /// Most header/footer parts we create (matches the docx reader's cap).
 const MAX_PARTS: usize = 50_000;
 /// Hard ceiling on characters materialised across every story walk of one document (body,
 /// headers, notes, text boxes), whatever the file's size. The working budget is tied to the
 /// WordDocument stream (see [`read`]); this caps even a maximal stream.
 const MAX_TOTAL_CHARS: u64 = 64 << 20;
+
+/// WHIQ: the ceiling grows with the memory budget (a character costs a few bytes in the model).
+fn max_total_chars() -> u64 {
+    wordcraft_doc::memory::share(MAX_TOTAL_CHARS, 16)
+}
 /// `sprmCPicLocation`: the fc of a picture in the Data stream.
 const C_PIC_LOCATION: u16 = 0x6A03;
 /// `sprmPIlvl` / `sprmPIlfo`: the paragraph's list level and list.
@@ -101,8 +111,12 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocbinError> {
 pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Document, DocbinError> {
     let mut comp = cfb::CompoundFile::open(std::io::Cursor::new(bytes)).map_err(|e| DocbinError::Container(e.to_string()))?;
     let mut word = stream(&mut comp, "WordDocument").ok_or_else(|| DocbinError::NotWord("no WordDocument stream".into()))?;
-    if word.len() as u64 > MAX_STREAM {
-        return Err(DocbinError::Limit(format!("WordDocument stream is {} bytes", word.len())));
+    if word.len() as u64 > max_stream() {
+        return Err(DocbinError::Limit(format!(
+            "the WordDocument stream is {} MB, more than this process reads into memory ({} MB); open it in Word and save it as .docx",
+            word.len() >> 20,
+            max_stream() >> 20
+        )));
     }
     let enc = fib::peek_encryption(&word);
     // The FIB names the Table stream (0Table or 1Table); fall back to whichever exists,
@@ -111,12 +125,16 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
     let named = if which { "1Table" } else { "0Table" };
     let other = if which { "0Table" } else { "1Table" };
     let mut table = stream(&mut comp, named).or_else(|| stream(&mut comp, other)).unwrap_or_default();
-    if table.len() as u64 > MAX_STREAM {
-        return Err(DocbinError::Limit(format!("Table stream is {} bytes", table.len())));
+    if table.len() as u64 > max_stream() {
+        return Err(DocbinError::Limit(format!("the Table stream is {} MB, more than this process reads into memory ({} MB)", table.len() >> 20, max_stream() >> 20)));
     }
     let mut data = stream(&mut comp, "Data").unwrap_or_default();
-    if data.len() as u64 > MAX_STREAM {
-        return Err(DocbinError::Limit(format!("Data stream is {} bytes", data.len())));
+    if data.len() as u64 > max_stream() {
+        return Err(DocbinError::Limit(format!(
+            "the Data stream (pictures) is {} MB, more than this process reads into memory ({} MB); open it in Word and save it as .docx",
+            data.len() >> 20,
+            max_stream() >> 20
+        )));
     }
     if let Some(e) = enc {
         // Verify the password first; only then is anything decrypted.
@@ -171,7 +189,7 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
     // once) cannot exceed its stream. A hostile piece or story table that aliases the same bytes
     // many times can, so the walk is held to twice the stream's size — generous for real files,
     // tight against aliasing — and never past the absolute ceiling.
-    let budget = std::cell::Cell::new((word.len() as u64).saturating_mul(2).min(MAX_TOTAL_CHARS));
+    let budget = std::cell::Cell::new((word.len() as u64).saturating_mul(2).min(max_total_chars()));
 
     let ctx = WalkCtx {
         word: &word,
@@ -295,6 +313,15 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
     doc.media.extend(pics.media);
     doc.body = table::assemble(paras);
     doc.ensure_nonempty();
+    // WHIQ: a text budget spent means the walk stopped short: refuse with the reason rather
+    // than open part of the document in silence (legitimate files never reach it).
+    if budget.get() == 0 {
+        return Err(DocbinError::Limit(format!(
+            "the document's text runs past {} million characters read from a {} MB text stream: the file is damaged or repeats its text; open it in Word and save it as .docx",
+            max_total_chars().min((word.len() as u64).saturating_mul(2)) / 1_000_000,
+            word.len() >> 20
+        )));
+    }
     Ok(doc)
 }
 
@@ -701,7 +728,7 @@ fn stream<F: Read + Seek>(comp: &mut cfb::CompoundFile<F>, name: &str) -> Option
     let mut v = Vec::new();
     // Read with a cap one byte above the limit so oversized streams are still caught by the
     // caller instead of exhausting memory here.
-    s.by_ref().take(MAX_STREAM + 1).read_to_end(&mut v).ok()?;
+    s.by_ref().take(max_stream() + 1).read_to_end(&mut v).ok()?;
     Some(v)
 }
 

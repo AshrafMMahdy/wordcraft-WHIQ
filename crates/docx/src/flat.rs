@@ -17,7 +17,7 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use wordcraft_doc::Document;
 
-use crate::package::{ContentTypes, MAX_ENTRIES, MAX_PART, MAX_TOTAL, Package};
+use crate::package::{ContentTypes, Package, max_entries, max_part, max_total};
 use crate::xml::{self, W, esc};
 use crate::{DocxError, Flavor};
 
@@ -110,7 +110,7 @@ fn max_base64(bytes: u64) -> u64 {
 
 /// Bytes the next part may have: its own size limit, or what's left of the package's.
 fn room(total: u64) -> u64 {
-    MAX_PART.min(MAX_TOTAL.saturating_sub(total))
+    max_part().min(max_total().saturating_sub(total))
 }
 
 /// Unpack a Flat OPC file into its parts, with a `[Content_Types].xml` made from the parts'
@@ -145,8 +145,8 @@ pub(crate) fn unpack(bytes: &[u8]) -> Result<Package, DocxError> {
                 if depth == 2 {
                     entries += 1;
                     elements = 0;
-                    if entries > MAX_ENTRIES {
-                        return Err(DocxError::Limit(format!("more than {MAX_ENTRIES} parts")));
+                    if entries > max_entries() {
+                        return Err(DocxError::Limit(format!("more than {} parts (this process's memory budget)", max_entries())));
                     }
                 }
                 elements += 1;
@@ -290,12 +290,12 @@ fn store(
 ) -> Result<(), DocxError> {
     let name = name.trim_start_matches('/');
     let len = bytes.len() as u64;
-    if len > MAX_PART {
-        return Err(DocxError::Limit(format!("part {name} is larger than the size limit")));
+    if len > max_part() {
+        return Err(DocxError::Limit(format!("part {name} is {} MB, more than one part this process holds in memory ({} MB)", len >> 20, max_part() >> 20)));
     }
     *total = total.saturating_add(len);
-    if *total > MAX_TOTAL {
-        return Err(DocxError::Limit("the package is larger than the size limit".into()));
+    if *total > max_total() {
+        return Err(DocxError::Limit(format!("the package is larger than this process holds in memory ({} MB)", max_total() >> 20)));
     }
     if name.is_empty() || files.contains_key(name) {
         return Ok(());
@@ -486,7 +486,7 @@ mod tests {
         }
         assert_eq!((files.len(), total), (1, 30));
         // Near the package limit, what's left of it is all the next part may have.
-        total = MAX_TOTAL - 5;
+        total = max_total() - 5;
         assert_eq!(room(total), 5);
         assert_eq!(max_base64(5), 8);
         assert!(matches!(store("/b.bin", "", vec![0; 6], &mut files, &mut types, &mut total), Err(DocxError::Limit(_))));

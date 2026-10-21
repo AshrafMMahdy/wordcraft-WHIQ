@@ -115,6 +115,14 @@ pub fn tool_definitions() -> Value {
         ),
         tool("get_text", "Document text", "Body text with tracked deletions omitted.", obj(json!({}), &[]), true),
         tool(
+            "export_text",
+            "Export text",
+            "Write the whole body text (tracked deletions omitted) to a UTF-8 text file and answer with its path and length: the way \
+             to read a long document in one call (get_text returns a window per call).",
+            obj(json!({"path": {"type": "string", "description": "The .txt file to write (inside the write root)"}}), &["path"]),
+            false,
+        ),
+        tool(
             "inspect_document",
             "Inspect document",
             "Structure: blocks with text, styles, formatting runs, lists, tables, sections, parts, selection, pages.",

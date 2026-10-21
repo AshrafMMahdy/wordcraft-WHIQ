@@ -1,17 +1,47 @@
 //! OPC package access: bounded zip reading, relationships, part names.
+//!
+//! WHIQ: a package is read from its file (or bytes) lazily: a part is inflated when the reader
+//! asks for it, pictures are handed over without a second copy ([`Package::take`]), and the
+//! in-memory limits are shares of the process's memory budget ([`wordcraft_doc::memory`]). A
+//! limit that is reached fails the read with the reason and the route, never a silent skip.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 
 use crate::DocxError;
 use crate::xml::{self, El};
 
-/// Largest single part we decompress.
+/// Largest single part we decompress at the smallest memory budget ([`max_part`]: half the
+/// budget when that is more).
 pub const MAX_PART: u64 = 256 * 1024 * 1024;
-/// Largest total of all decompressed parts.
+/// Largest total of all decompressed parts at the smallest memory budget ([`max_total`]: twice
+/// the budget when that is more).
 pub const MAX_TOTAL: u64 = 512 * 1024 * 1024;
-/// Most zip entries we look at.
+/// Most zip entries we look at at the smallest memory budget ([`max_entries`]: one per kilobyte
+/// of the budget when that is more).
 pub const MAX_ENTRIES: usize = 20_000;
+
+/// The working per-part limit for this process.
+pub fn max_part() -> u64 {
+    wordcraft_doc::memory::share(MAX_PART, 2)
+}
+/// The working total limit for this process.
+pub fn max_total() -> u64 {
+    MAX_TOTAL.max(wordcraft_doc::memory::budget().saturating_mul(2))
+}
+/// The working entry limit for this process.
+pub fn max_entries() -> usize {
+    usize::try_from(wordcraft_doc::memory::share(MAX_ENTRIES as u64, 1024)).unwrap_or(usize::MAX)
+}
+
+/// The route a limit message gives.
+const ROUTE: &str = "the parts of a document (its text and pictures) are held in memory; the platform's engine memory limit (WHIQ_ENGINE_PROC_MB) \
+sets how much, or compress the pictures in Word (Picture Format › Compress Pictures) and open it again";
+
+/// Anything a zip can be read from: the file on disk, or bytes in memory.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
 
 /// Relationship type suffixes (after `.../relationships/`).
 pub mod rt {
@@ -154,25 +184,56 @@ pub fn rel_is(t: &str, full: &str) -> bool {
     t == full || tail(t) == tail(full)
 }
 
-/// The decompressed parts of a package (bounded).
+/// One zip entry, inflated on first use.
+struct Entry {
+    index: usize,
+    size: u64,
+    data: OnceCell<Option<Vec<u8>>>,
+}
+
+/// A package's zip, read lazily within the limits.
+struct Zip {
+    zip: RefCell<zip::ZipArchive<Box<dyn ReadSeek>>>,
+    entries: BTreeMap<String, Entry>,
+    max_part: u64,
+    max_total: u64,
+    total: std::cell::Cell<u64>,
+    /// The first limit reached or entry that failed, with its reason.
+    failed: RefCell<Option<String>>,
+}
+
+/// The parts of a package (bounded): read lazily from a zip, or given in memory.
 pub struct Package {
     files: BTreeMap<String, Vec<u8>>,
+    zip: Option<Zip>,
 }
 
 impl Package {
     pub fn open(bytes: &[u8]) -> Result<Package, DocxError> {
-        Package::open_limited(bytes, MAX_PART, MAX_TOTAL)
+        Package::open_reader_limited(Box::new(Cursor::new(bytes.to_vec())), max_part(), max_total())
+    }
+
+    /// WHIQ: a package read straight from its file (never read whole; parts inflated on use).
+    pub fn open_reader(r: Box<dyn ReadSeek>) -> Result<Package, DocxError> {
+        Package::open_reader_limited(r, max_part(), max_total())
     }
 
     pub fn open_limited(bytes: &[u8], max_part: u64, max_total: u64) -> Result<Package, DocxError> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| DocxError::Zip(e.to_string()))?;
-        if zip.len() > MAX_ENTRIES {
-            return Err(DocxError::Limit(format!("{} zip entries", zip.len())));
+        Package::open_reader_limited(Box::new(Cursor::new(bytes.to_vec())), max_part, max_total)
+    }
+
+    fn open_reader_limited(r: Box<dyn ReadSeek>, max_part: u64, max_total: u64) -> Result<Package, DocxError> {
+        let mut zip = zip::ZipArchive::new(r).map_err(|e| DocxError::Zip(e.to_string()))?;
+        if zip.len() > max_entries() {
+            return Err(DocxError::Limit(format!(
+                "{} zip entries, more than this process indexes ({}); {ROUTE}",
+                zip.len(),
+                max_entries()
+            )));
         }
-        let mut files = BTreeMap::new();
-        let mut total: u64 = 0;
+        let mut entries = BTreeMap::new();
         for i in 0..zip.len() {
-            let mut f = match zip.by_index(i) {
+            let f = match zip.by_index_raw(i) {
                 Ok(f) => f,
                 Err(e) => {
                     log::warn!("docx: skipping unreadable zip entry {i}: {e}");
@@ -184,34 +245,94 @@ impl Package {
             }
             let name = f.name().trim_start_matches('/').to_string();
             if f.size() > max_part {
-                return Err(DocxError::Limit(format!("part {name} declares {} bytes", f.size())));
+                return Err(DocxError::Limit(format!(
+                    "part {name} unpacks to {} MB, more than one part this process holds in memory ({} MB); {ROUTE}",
+                    f.size() >> 20,
+                    max_part >> 20
+                )));
             }
-            let room = max_part.min(max_total.saturating_sub(total));
-            let mut buf = Vec::with_capacity(f.size().min(16 * 1024 * 1024) as usize);
-            let read = (&mut f).take(room + 1).read_to_end(&mut buf);
-            if let Err(e) = read {
-                // A corrupt entry: keep going unless it's a part we can't do without.
-                log::warn!("docx: zip entry {name} unreadable: {e}");
-                continue;
-            }
-            if buf.len() as u64 > room {
-                return Err(DocxError::Limit(format!("part {name} decompresses past the size limit")));
-            }
-            total = total.saturating_add(buf.len() as u64);
-            files.insert(name, buf);
+            entries.insert(name, Entry { index: i, size: f.size(), data: OnceCell::new() });
         }
-        Ok(Package { files })
+        let zip = Zip { zip: RefCell::new(zip), entries, max_part, max_total, total: std::cell::Cell::new(0), failed: RefCell::new(None) };
+        Ok(Package { files: BTreeMap::new(), zip: Some(zip) })
+    }
+
+    /// WHIQ: the reason the package could not be read whole (a limit reached or a part that
+    /// failed to inflate), once a read asked for that part. The reader fails with it.
+    pub fn failure(&self) -> Option<String> {
+        self.zip.as_ref().and_then(|z| z.failed.borrow().clone())
+    }
+
+    fn entry_name(&self, name: &str) -> Option<String> {
+        let z = self.zip.as_ref()?;
+        let n = name.trim_start_matches('/');
+        if z.entries.contains_key(n) {
+            return Some(n.to_string());
+        }
+        z.entries.keys().find(|k| k.eq_ignore_ascii_case(n)).cloned()
+    }
+
+    fn inflate(z: &Zip, name: &str, e: &Entry) -> Option<Vec<u8>> {
+        let room = z.max_part.min(z.max_total.saturating_sub(z.total.get()));
+        let fail = |msg: String| {
+            log::warn!("docx: {msg}");
+            let mut f = z.failed.borrow_mut();
+            if f.is_none() {
+                *f = Some(msg);
+            }
+        };
+        let mut zip = z.zip.borrow_mut();
+        let mut f = match zip.by_index(e.index) {
+            Ok(f) => f,
+            Err(err) => {
+                // A corrupt entry: the reader goes on without it unless it needs it.
+                log::warn!("docx: zip entry {name} unreadable: {err}");
+                return None;
+            }
+        };
+        let mut buf = Vec::with_capacity(e.size.min(16 * 1024 * 1024) as usize);
+        if let Err(err) = (&mut f).take(room + 1).read_to_end(&mut buf) {
+            log::warn!("docx: zip entry {name} unreadable: {err}");
+            return None;
+        }
+        if buf.len() as u64 > room {
+            fail(format!(
+                "the document unpacks past what this process holds in memory ({} MB, reached at part {name}); {ROUTE}",
+                z.max_total >> 20
+            ));
+            return None;
+        }
+        z.total.set(z.total.get().saturating_add(buf.len() as u64));
+        Some(buf)
+    }
+
+    /// WHIQ: a part's bytes handed over, not kept by the package (pictures: one copy in memory).
+    pub fn take(&self, name: &str) -> Option<Vec<u8>> {
+        if let Some(v) = self.files.get(name.trim_start_matches('/')) {
+            return Some(v.clone());
+        }
+        let key = self.entry_name(name)?;
+        let z = self.zip.as_ref()?;
+        let e = z.entries.get(&key)?;
+        if let Some(Some(d)) = e.data.get() {
+            return Some(d.clone());
+        }
+        Self::inflate(z, &key, e)
     }
 
     /// A package from parts already in memory (a Flat OPC file, a converted document), by part
     /// name without the leading `/`.
     pub fn from_parts(files: BTreeMap<String, Vec<u8>>) -> Package {
-        Package { files }
+        Package { files, zip: None }
     }
 
     /// WHIQ: every part name (for the round-trip diff, [`crate::roundtrip`]).
     pub fn part_names(&self) -> std::collections::BTreeSet<String> {
-        self.files.keys().cloned().collect()
+        let mut names: std::collections::BTreeSet<String> = self.files.keys().cloned().collect();
+        if let Some(z) = &self.zip {
+            names.extend(z.entries.keys().cloned());
+        }
+        names
     }
 
     /// Part bytes by name (leading `/` ignored; case-insensitive fallback).
@@ -220,7 +341,13 @@ impl Package {
         if let Some(v) = self.files.get(n) {
             return Some(v);
         }
-        self.files.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_slice())
+        if let Some(v) = self.files.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_slice()) {
+            return Some(v);
+        }
+        let key = self.entry_name(n)?;
+        let z = self.zip.as_ref()?;
+        let e = z.entries.get(&key)?;
+        e.data.get_or_init(|| Self::inflate(z, &key, e)).as_deref()
     }
 
     pub fn xml(&self, name: &str) -> Result<Option<El>, DocxError> {
@@ -441,4 +568,28 @@ mod tests {
         let junk = EmbeddedManifest::parse(b"R\tnope\trId1\tk\tt\tI\nP\tonly-two\n\t\t\n\xff\xfe");
         assert!(junk.parts.is_empty());
     }
+
+    #[test]
+    fn whiq_parts_inflate_on_use_and_a_limit_reached_is_reported() {
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        zw.start_file("word/document.xml", o).unwrap();
+        zw.write_all(b"<w:document/>").unwrap();
+        zw.start_file("word/media/big.png", o).unwrap();
+        zw.write_all(&[7u8; 4000]).unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+        // Room for the document, not for the picture as well.
+        let pkg = Package::open_limited(&bytes, 10_000, 3000).unwrap();
+        assert!(pkg.part_names().contains("word/media/big.png"));
+        assert_eq!(pkg.get("word/document.xml"), Some(&b"<w:document/>"[..]));
+        assert!(pkg.failure().is_none(), "nothing was refused yet");
+        assert!(pkg.take("word/media/big.png").is_none());
+        let why = pkg.failure().expect("the refusal is kept for the reader to fail with");
+        assert!(why.contains("big.png") && why.contains("WHIQ_ENGINE_PROC_MB"), "{why}");
+        // With room, a picture is handed over (not kept by the package as well).
+        let pkg = Package::open(&bytes).unwrap();
+        assert_eq!(pkg.take("word/media/big.png").map(|b| b.len()), Some(4000));
+        assert!(pkg.failure().is_none());
+    }
+
 }

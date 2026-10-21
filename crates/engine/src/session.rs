@@ -404,6 +404,9 @@ pub struct Session {
         (bool, bool),
         NumeralMode,
     )>,
+    /// WHIQ: the printed page count of a revision (revision, Print Markup, pages), counted holding
+    /// a few pages at a time ([`Session::page_count`]).
+    page_counts: std::sync::Mutex<Option<(u64, bool, usize)>>,
     /// Picture edits: edited media key → original media key (Reset Picture).
     pub originals: std::collections::HashMap<String, String>,
     /// Last mutating command (Repeat).
@@ -622,6 +625,7 @@ impl Session {
             document_id: 1,
             cache: LayoutCache::new(),
             layout: None,
+            page_counts: std::sync::Mutex::new(None),
             originals: Default::default(),
             last_command: None,
             recording: None,
@@ -805,6 +809,11 @@ impl Session {
         self.layout = Some((self.rev, width, height, mode, spacing, l.clone(), self.view.proofing, outline, deleted, self.view.numeral));
         l
     }
+    /// WHIQ: the editing layout when one is cached for the current revision (nothing is laid out).
+    pub fn cached_layout(&self) -> Option<Arc<DocLayout>> {
+        self.layout.as_ref().filter(|l| l.0 == self.rev).map(|l| l.5.clone())
+    }
+
     /// A layout for output (PDF, images, print): no proofing marks, print view.
     pub fn export_layout(&self) -> Arc<DocLayout> {
         self.export_layout_with(false)
@@ -815,6 +824,40 @@ impl Session {
     pub fn export_layout_with(&self, markup: bool) -> Arc<DocLayout> {
         let opts = LayoutOptions { view: ViewMode::Print, comment_balloons: markup && self.prefs.markup.comments, ..Default::default() };
         Arc::new(wordcraft_layout::layout(&self.doc, &mut LayoutCache::new(), &opts))
+    }
+
+    /// WHIQ: the printed layout keeping only the pages of `window` (0-based) in memory: the rest
+    /// are paginated and given back as they finish (see [`wordcraft_layout::PageWindow`]). With
+    /// `window.stop` and a document that shows no page totals, pagination ends after the window.
+    pub fn export_layout_window(&self, markup: bool, mut window: wordcraft_layout::PageWindow) -> DocLayout {
+        if window.stop && wordcraft_layout::shows_page_totals(&self.doc) {
+            window.stop = false;
+        }
+        let opts = LayoutOptions {
+            view: ViewMode::Print,
+            comment_balloons: markup && self.prefs.markup.comments,
+            window: Some(window),
+            ..Default::default()
+        };
+        wordcraft_layout::layout(&self.doc, &mut LayoutCache::new(), &opts)
+    }
+
+    /// WHIQ: how many printed pages the document has (with Print Markup or without), counted
+    /// holding a few pages at a time, and remembered for this revision.
+    pub fn page_count(&self, markup: bool) -> usize {
+        let rev = self.rev;
+        if let Ok(g) = self.page_counts.lock()
+            && let Some((r, m, n)) = *g
+            && r == rev
+            && m == markup
+        {
+            return n;
+        }
+        let n = self.export_layout_window(markup, wordcraft_layout::PageWindow::COUNT).pages.len().max(1);
+        if let Ok(mut g) = self.page_counts.lock() {
+            *g = Some((rev, markup, n));
+        }
+        n
     }
 
     /// Invalidate the cached layout (fonts changed etc.).

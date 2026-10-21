@@ -27,6 +27,9 @@ pub trait Backend: Send {
     }
     /// WHIQ parity pass: remember the document before a call made of several commands, so a
     /// cancel can put it back ([`Backend::rollback_call`]).
+    /// WHIQ: give back memory that only speeds things up (layouts, decoded pictures), before a
+    /// document is closed for memory.
+    fn release_caches(&mut self) {}
     fn begin_call(&mut self) {}
     /// WHIQ parity pass: put the document back as [`Backend::begin_call`] found it. `false` when the
     /// backend can't (a running app keeps its own undo).

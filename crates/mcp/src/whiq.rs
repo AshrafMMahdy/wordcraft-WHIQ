@@ -414,8 +414,35 @@ fn page_list(spec: &str, total: usize) -> Result<Vec<usize>, ToolError> {
     })
 }
 
-fn page_count(b: &mut dyn Backend) -> usize {
+/// WHIQ: the printed page count, counted holding a few pages at a time and remembered for the
+/// revision (`document.layout` laid the whole document out and listed every page). A connected
+/// app without the command falls back to that.
+fn page_count(b: &mut dyn Backend, markup: bool) -> usize {
+    if let Ok(v) = exec(b, "document.pageCount", json!({"markup": markup}))
+        && let Some(n) = v.get("pages").and_then(Value::as_u64)
+    {
+        return (n as usize).max(1);
+    }
     exec(b, "document.layout", json!({})).ok().and_then(|v| v.get("pages").and_then(Value::as_array).map(Vec::len)).unwrap_or(1).max(1)
+}
+
+/// WHIQ: trim a window the engine already started at `from` (inspect_document): the
+/// continuation is absolute, and a window that fits but is not the last says where the next
+/// one starts.
+fn trim_window(v: Value, from: usize, max: usize) -> Value {
+    let next_window = v.get("nextOffset").and_then(Value::as_u64);
+    let mut t = trim(v, 0, max);
+    if t["truncated"] == true {
+        let rel = t["continue_from"].as_u64().unwrap_or(0) as usize;
+        let n = from + rel;
+        t["continue_from"] = json!(n);
+        t["next_step"] = json!(format!("call the same tool again with continue_from: {n} for the rest"));
+    } else if let Some(n) = next_window {
+        t["truncated"] = json!(true);
+        t["continue_from"] = json!(n);
+        t["next_step"] = json!(format!("call the same tool again with continue_from: {n} for the rest"));
+    }
+    t
 }
 
 /// Run one tool (by its resolved name) on normalised arguments.
@@ -435,7 +462,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                     "ask for a dpi between 7 and 576 (96 is screen size)",
                 ));
             }
-            let total = page_count(b);
+            let total = page_count(b, a.get("markup").and_then(Value::as_bool).unwrap_or(false));
             let pages = match (st("pages"), a.get("page").and_then(Value::as_u64)) {
                 (Some(spec), _) => page_list(spec, total)?,
                 (None, Some(p)) => vec![p.max(1) as usize],
@@ -511,12 +538,27 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             }
             Ok(Out::Images(images, summary))
         }
+        "inspect_document" => {
+            // WHIQ: the engine reads a window of blocks from `continue_from` (every block is
+            // reachable; nothing is laid out to count the pages).
+            let from = a.get("continue_from").or_else(|| a.get("offset")).and_then(Value::as_u64).unwrap_or(0);
+            let mut p = json!({"offset": from, "limit": 2000});
+            if let Some(t) = a.get("text").and_then(Value::as_bool) {
+                p["text"] = json!(t);
+            }
+            b.call("document.inspect", p).map(Out::Json).map_err(|e| contract::classify(&e, "inspect_document", a, &[]))
+        }
+        "export_text" => {
+            // WHIQ: the whole text into a file (the bulk read), any length.
+            let path = st("path").unwrap_or("");
+            exec(b, "document.textToFile", json!({"path": path})).map(Out::Json).map_err(|e| contract::classify(&e, "export_text", a, &[]))
+        }
         "export_pdf" => {
             let path = st("path").unwrap_or("");
             let mut p = json!({"path": path, "markup": a.get("markup").and_then(Value::as_bool).unwrap_or(false)});
             if let Some(spec) = st("pages") {
                 // Checked first, for an answer in the contract's terms.
-                page_list(spec, page_count(b))?;
+                page_list(spec, page_count(b, a.get("markup").and_then(Value::as_bool).unwrap_or(false)))?;
                 p["pages"] = json!(spec);
             }
             exec(b, "file.printPdf", p).map(Out::Json).map_err(|e| contract::classify(&e, "export_pdf", a, &[]))
@@ -858,7 +900,11 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     let from = args.get("continue_from").and_then(Value::as_u64).unwrap_or(0) as usize;
     match out {
         Ok(Out::Json(v)) => {
-            let mut v = if name == "render_page" { v } else { trim(v, from, max) };
+            let mut v = match name {
+                "render_page" => v,
+                "inspect_document" => trim_window(v, from, max),
+                _ => trim(v, from, max),
+            };
             if !kept_json.is_empty() {
                 if !v.is_object() {
                     v = json!({"result": v});

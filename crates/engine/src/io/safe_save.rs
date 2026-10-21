@@ -26,6 +26,25 @@ pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// WHIQ: [`write`] with the bytes written by `fill` into the temporary file (a copy streamed from
+/// another file): nothing of it is held in memory.
+pub(super) fn write_with(path: &Path, fill: &mut dyn FnMut(&mut File) -> io::Result<()>) -> io::Result<()> {
+    let permissions = match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Some(meta.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let private = permissions.is_some();
+    replace_with(path, private, |file| {
+        fill(file)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })
+}
+
 fn replace_with(path: &Path, private: bool, prepare: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let mut temp = Temporary::create(path, private)?;
     prepare(temp.file()?)?;

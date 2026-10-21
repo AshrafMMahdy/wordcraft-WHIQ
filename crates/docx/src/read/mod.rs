@@ -130,7 +130,22 @@ pub fn read(bytes: &[u8]) -> Result<Document, DocxError> {
 
 /// [`read`] for bytes known not to be an encrypted package.
 pub(crate) fn read_package(bytes: &[u8]) -> Result<Document, DocxError> {
-    read_opened(&Package::open(bytes)?)
+    read_checked(&Package::open(bytes)?)
+}
+
+/// WHIQ: read a `.docx` straight from its file: the file is never read whole, and each part is
+/// inflated when it is needed (pictures without a second copy).
+pub fn read_reader(r: Box<dyn crate::package::ReadSeek>) -> Result<Document, DocxError> {
+    read_checked(&Package::open_reader(r)?)
+}
+
+/// [`read_opened`], failing with the reason when a part had to be left out (a limit reached).
+fn read_checked(pkg: &Package) -> Result<Document, DocxError> {
+    let doc = read_opened(pkg)?;
+    match pkg.failure() {
+        Some(why) => Err(DocxError::Limit(why)),
+        None => Ok(doc),
+    }
 }
 
 /// Read a package whose parts are already unpacked (from a zip, a Flat OPC file or a converted
@@ -655,7 +670,7 @@ impl Reader<'_> {
         if let Some(k) = self.media_by_path.get(&rel.target) {
             return Some(k.clone());
         }
-        let bytes = self.pkg.get(&rel.target)?;
+        let bytes = self.pkg.take(&rel.target)?;
         let base: String =
             rel.target.rsplit('/').next().unwrap_or("image").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
         let base = if base.is_empty() || base.starts_with('.') { format!("image{base}") } else { base };
@@ -668,7 +683,7 @@ impl Reader<'_> {
                 None => format!("{base}_{n}"),
             };
         }
-        self.doc.media.insert(key.clone(), Arc::new(bytes.to_vec()));
+        self.doc.media.insert(key.clone(), Arc::new(bytes));
         self.media_by_path.insert(rel.target.clone(), key.clone());
         Some(key)
     }

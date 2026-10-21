@@ -13,8 +13,14 @@ use crate::DocxError;
 
 /// Maximum element nesting accepted by the parser.
 pub const MAX_DEPTH: usize = 256;
-/// Maximum number of elements in one part.
+/// Maximum number of elements in one part at the smallest memory budget. WHIQ: the working limit
+/// ([`max_elements`]) is one element per 64 bytes of the memory budget when that is more.
 pub const MAX_ELEMENTS: usize = 8_000_000;
+
+/// The element limit for one part in this process.
+pub fn max_elements() -> usize {
+    usize::try_from(wordcraft_doc::memory::share(MAX_ELEMENTS as u64, 64)).unwrap_or(usize::MAX)
+}
 
 /// Known namespaces and the canonical prefix we use for them (read and write).
 pub const NAMESPACES: &[(&str, &str)] = &[
@@ -431,8 +437,11 @@ pub fn parse_ns(bytes: &[u8], extra: &[(&'static str, &str)]) -> Result<El, Docx
         match ev {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 count += 1;
-                if count > MAX_ELEMENTS {
-                    return Err(DocxError::Limit("too many XML elements".into()));
+                if count > max_elements() {
+                    return Err(DocxError::Limit(format!(
+                        "a part holds more than {} XML elements, more than this process holds in memory (--max-memory-mb); split the document",
+                        max_elements()
+                    )));
                 }
                 let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 let name = match el_prefix {

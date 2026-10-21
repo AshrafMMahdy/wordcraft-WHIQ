@@ -590,6 +590,10 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                 limits.max_result_bytes = (b as usize).clamp(1024, 64 << 20);
             }
             limits.max_memory_bytes = number("--max-memory-mb")?.map(|mb| mb.saturating_mul(1024 * 1024));
+            // WHIQ: the readers' in-memory limits are shares of this budget.
+            if let Some(b) = limits.max_memory_bytes {
+                wordcraft_engine::doc::memory::set_budget(b);
+            }
             limits.test_hooks = std::env::var("WORDCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1");
             limits.keep_old = !rest.iter().any(|a| a == "--automation-no-old-copies");
             let shared = wordcraft_mcp::runtime::SharedState::default();

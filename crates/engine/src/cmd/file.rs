@@ -144,12 +144,29 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("file.privacy", "Privacy Settings", "File › Options › Save", |s, _| Ok(privacy(s)))
             .params(r#"{} → {"removePersonalInfo": bool, "removeDateTime": bool} (file.privacyOptions changes them)"#)
             .pure(),
-        CommandSpec::new("document.inspect", "Inspect Document", "Agents", inspect).params(r#"{"text"?: bool}"#).pure(),
+        CommandSpec::new("document.inspect", "Inspect Document", "Agents", inspect)
+            .params(r#"{"text"?: bool, "offset"?: block index to start at, "limit"?: blocks (default 2000)}"#)
+            .pure(),
+        CommandSpec::new("document.pageCount", "Count Pages", "Agents", |s, v| {
+            let markup = p::bool(v, "markup").unwrap_or(false);
+            Ok(json!({"pages": s.page_count(markup), "markup": markup}))
+        })
+        .params(r#"{"markup"?: bool (count with Print Markup)}"#)
+        .pure(),
         CommandSpec::new("document.text", "Document Text", "Agents", |s, v| {
             let story = super::story_param(s, v);
             Ok(json!({"text": s.doc.final_text(story)}))
         })
         .pure(),
+        CommandSpec::new("document.textToFile", "Document Text to File", "Agents", |s, v| {
+            // WHIQ: the bulk read: the whole text (tracked deletions omitted) as a UTF-8 file.
+            let path = p::req_str(v, "path")?;
+            let story = super::story_param(s, v);
+            let text = s.doc.final_text(story);
+            crate::io::write_file(path, text.as_bytes()).map_err(CmdError::Failed)?;
+            Ok(json!({"path": path, "characters": text.chars().count(), "bytes": text.len()}))
+        })
+        .params(r#"{"path": "file.txt", "story"?: Story}"#),
         CommandSpec::new("document.paragraph", "Paragraph Details", "Agents", paragraph).params(r#"{"path": [n], "story"?: Story}"#).pure(),
         CommandSpec::new("document.selection", "Selection", "Agents", |s, _| {
             let mut r = sel_result(s)?;
@@ -411,8 +428,13 @@ fn info(s: &mut Session, _: &Value) -> CmdResult {
 /// Structure for agents: blocks with text and formatting summary, selection, stats.
 fn inspect(s: &mut Session, v: &Value) -> CmdResult {
     let with_text = p::bool(v, "text").unwrap_or(true);
+    // WHIQ: a window of blocks (`offset`, `limit`); the answer says where the next one starts,
+    // so every block of a long document is reachable (the first 2,000 were all there was).
+    let total_blocks = s.doc.body.len();
+    let offset = v.get("offset").and_then(Value::as_u64).map_or(0, |n| n as usize).min(total_blocks);
+    let limit = v.get("limit").and_then(Value::as_u64).map_or(2000, |n| (n as usize).max(1));
     let mut blocks = Vec::new();
-    for (i, b) in s.doc.body.iter().enumerate().take(2000) {
+    for (i, b) in s.doc.body.iter().enumerate().skip(offset).take(limit) {
         match &**b {
             Block::Para(p) => {
                 let style = p.props.style.clone().unwrap_or_else(|| "Normal".into());
@@ -458,14 +480,23 @@ fn inspect(s: &mut Session, v: &Value) -> CmdResult {
             }
         }
     }
-    let l = s.layout();
+    // WHIQ: the page count without keeping the layout of the whole document in memory: the
+    // editing layout when it is already there, else the printed pages counted a few at a time.
+    let pages = match s.cached_layout() {
+        Some(l) => l.pages.len(),
+        None => s.page_count(false),
+    };
     let parts: Vec<Value> =
         s.doc.parts.iter().map(|(id, p)| json!({"id": id, "kind": p.kind, "text": s.doc.plain_text(StoryRef::Part(*id))})).collect();
+    let next = offset + blocks.len();
     Ok(json!({
         "blocks": blocks,
+        "totalBlocks": total_blocks,
+        "offset": offset,
+        "nextOffset": (next < total_blocks).then_some(next),
         "parts": parts,
         "selection": {"anchor": pos_json(&s.sel.anchor), "focus": pos_json(&s.sel.focus), "text": s.selected_text()},
-        "pages": l.pages.len(),
+        "pages": pages,
         "words": s.doc.word_count(),
         "sections": s.doc.sections().iter().map(|(end, sp)| json!({"endBlock": end, "props": sp})).collect::<Vec<_>>(),
         "comments": s.doc.comments.len(),

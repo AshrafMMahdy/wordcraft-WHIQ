@@ -17,7 +17,7 @@ use wordcraft_doc::Document;
 
 use crate::DocxError;
 use crate::flat::W2003_NS;
-use crate::package::{MAX_PART, MAX_TOTAL, Package, rt};
+use crate::package::{Package, max_part, max_total, rt};
 use crate::write::PartRels;
 use crate::xml::{self, El, MAX_DEPTH, NAMESPACES, Node, W};
 
@@ -184,16 +184,16 @@ impl Conv {
                 }
                 let text = k.text();
                 let b64: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-                if (b64.len() / 4 * 3) as u64 > MAX_PART {
-                    return Err(DocxError::Limit(format!("picture {name} is larger than the size limit")));
+                if (b64.len() / 4 * 3) as u64 > max_part() {
+                    return Err(DocxError::Limit(format!("picture {name} is larger than one part this process holds in memory ({} MB)", max_part() >> 20)));
                 }
                 let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64.trim_end_matches('=')) else {
                     log::warn!("wordml2003: skipping picture {name}: invalid base64");
                     continue;
                 };
                 *total = total.saturating_add(bytes.len() as u64);
-                if *total > MAX_TOTAL {
-                    return Err(DocxError::Limit("pictures larger than the size limit".into()));
+                if *total > max_total() {
+                    return Err(DocxError::Limit(format!("the pictures come to more than this process holds in memory ({} MB)", max_total() >> 20)));
                 }
                 let ext = picture_ext(&bytes, name);
                 let target = format!("media/image{}.{ext}", self.media.len() + 1);
