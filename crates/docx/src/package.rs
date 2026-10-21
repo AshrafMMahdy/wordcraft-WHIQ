@@ -218,6 +218,7 @@ impl Package {
         Package::open_reader_limited(r, max_part(), max_total())
     }
 
+    #[cfg(test)]
     pub fn open_limited(bytes: &[u8], max_part: u64, max_total: u64) -> Result<Package, DocxError> {
         Package::open_reader_limited(Box::new(Cursor::new(bytes.to_vec())), max_part, max_total)
     }
@@ -508,9 +509,14 @@ mod tests {
     fn decompression_bomb_is_rejected() {
         let z = zip_of(&[("word/document.xml", vec![b' '; 2_000_000])]);
         assert!(z.len() < 100_000);
+        // Past the part limit: refused at open (the declared size says so).
         assert!(matches!(Package::open_limited(&z, 1_000_000, 10_000_000), Err(DocxError::Limit(_))));
-        assert!(matches!(Package::open_limited(&z, 10_000_000, 1_000_000), Err(DocxError::Limit(_))));
-        assert!(Package::open_limited(&z, 10_000_000, 10_000_000).is_ok());
+        // Past the total: WHIQ, parts inflate on use; the read is refused, with the reason.
+        let p = Package::open_limited(&z, 10_000_000, 1_000_000).unwrap();
+        assert!(p.get("word/document.xml").is_none());
+        assert!(p.failure().is_some());
+        let p = Package::open_limited(&z, 10_000_000, 10_000_000).unwrap();
+        assert!(p.get("word/document.xml").is_some() && p.failure().is_none());
     }
 
     #[test]

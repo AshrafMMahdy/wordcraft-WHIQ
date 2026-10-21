@@ -900,7 +900,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     let from = args.get("continue_from").and_then(Value::as_u64).unwrap_or(0) as usize;
     match out {
         Ok(Out::Json(v)) => {
-            let mut v = match name {
+            let mut v = match name.as_str() {
                 "render_page" => v,
                 "inspect_document" => trim_window(v, from, max),
                 _ => trim(v, from, max),

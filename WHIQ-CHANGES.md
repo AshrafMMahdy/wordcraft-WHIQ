@@ -283,6 +283,33 @@ several documents, as GridCraft and DeckCraft do.
 | Every open document's unsaved work is kept. SIGTERM, the client hanging up, a panic, eviction (`evict`, idle, memory) and checkpoints cover each dirty document, each in its own `<name>.recovered-<stamp>.docx` (`evicted` lists them all; the `evicted` error carries `recovered_paths`). A document set aside is checkpointed as soon as it holds work no checkpoint has. | `recover.rs` (recovered files and saved states per document), `runtime.rs` (`autosave_shared`, `Checkpoints`), `server.rs` (`evict`) | same test (hang-up, `evict`); `a_hard_kill_keeps_a_checkpoint_of_every_open_document` |
 | `whiq-release.yml` publish: whiq-v0.7.1's first run failed on `HTTP 422 ReleaseAsset.name already exists` for the Windows zip. The run held only two archives, one per glob, so the cause was not a duplicate match. The zip's upload reached GitHub, but its answer did not; gh retried it and got 422, then deleted its draft, so no tag or release was left behind. Now the release is created as a draft without files, and each file is uploaded on its own. After any failed upload the file on the release is checked: it is kept when it is this file (size and sha256). On a draft only, an incomplete one is removed and uploaded again; on a published release a different file fails the run. The draft is published once every file is there. | `.github/workflows/whiq-release.yml` | the upload function run locally against a stubbed `gh` (upload failed but arrived; a partial file on the draft; a different file on a published release) |
 
+## File-size pass (2026-10-21): long documents in a few pages of memory, nothing cut in silence
+
+The owner's rule: no tool is limited by file size. Measured over MCP stdio with the audit's driver
+(`--max-memory-mb 400`, RSS of the process), on a 1,343-page document (38,325 paragraphs, 1 M words):
+
+| Call | Before (whiq-v0.7.1) | After |
+|---|---|---|
+| `inspect_document` | 975 MB, then the document is evicted | 114 MB, stays open |
+| `render_page` page 900 | 1,826 MB, then evicted | 111 MB (pagination stops after the page) |
+| `export_pdf` (1,343 pages) | (evicted before it) | 980 MB transient, 105 MB after; stays open |
+| inspect past block 2,000 | unreachable (the engine answered the first 2,000 blocks, in silence) | every block, by `continue_from` |
+
+| Change | Where | Tested by |
+|---|---|---|
+| **Page windows.** `LayoutOptions::window` (`PageWindow {first, last, stop}`): pages outside the window give their lines back as soon as they are finished and the paragraph cache is emptied with them; with `stop`, pagination ends after the window (unless the document shows page totals, `shows_page_totals`). `Session::export_layout_window`, `Session::page_count` (counted holding a few pages, remembered per revision), command `document.pageCount`. `render_page` lays out the page it draws this way and counts pages with `document.pageCount` (it used to lay the whole document out twice: `document.layout` for the count, then the print layout). | `crates/layout/src/lib.rs`, `crates/engine/src/session.rs`, `cmd/file.rs`, `crates/mcp/src/lib.rs`, `whiq.rs` | `layout` `tests_window` (count = full layout's pages; the window page equal to the full layout's; nothing else kept) |
+| **`inspect_document` reads a window of blocks** (`document.inspect {offset, limit}`; the answer has `totalBlocks`, `offset`, `nextOffset`) and the continuation is absolute; its page count comes from the cached editing layout or the low-memory count — it no longer lays the whole document out. | `cmd/file.rs` (`inspect`), `mcp/src/whiq.rs` (`trim_window`) | `contract.rs` `inspect_document_reaches_every_block_and_export_text_writes_it_all` |
+| **`export_text`** (new tool, command `document.textToFile`): the whole body text as a UTF-8 file, any length. | `tools.rs`, `whiq.rs`, `cmd/file.rs` | same test |
+| **Caches go before the document.** Past `--max-memory-mb` after a call, the layouts and decoded pictures are released first (`Backend::release_caches`, `wordcraft_render::release_caches`) and the document is closed only if that is not enough. | `mcp/src/server.rs` (`publish`), `lib.rs`, `render/src/lib.rs` | the measurements above |
+| **A save is never lost to an eviction**: `save_document` (or `execute` `file.save` / `file.saveAs`) of a closed document writes its auto-saved copy (or unchanged original) where asked, byte for byte (`saved_from`, `evicted`, `next_step`), through the same atomic, `OLD_`-keeping write (`io::write_file_with`). | `mcp/src/server.rs` (`save_evicted`), `engine/src/io.rs`, `io/safe_save.rs` | `contract.rs` `a_save_after_a_memory_eviction_writes_the_auto_saved_work` |
+| **A `.docx` is read from its file, part by part**: `read_reader`; a part is inflated when the reader needs it and a picture is handed over without a second copy (`Package::take`). The package limits (256 MB a part, 512 MB in all, 20,000 entries, 8 M XML elements a part) are floors; the working limits are shares of the memory budget (half / twice / one entry per KB / one element per 64 bytes). A limit reached fails the open with the numbers and the route ("the platform's engine memory limit (WHIQ_ENGINE_PROC_MB) …, or compress the pictures in Word"), never a skipped part. Files read whole (other formats) may be the size of the budget (was a fixed 2 GB). | `crates/docx/src/package.rs`, `read/mod.rs`, `xml.rs`, `flat.rs`, `wordml2003.rs`; `engine/src/io.rs`; `crates/doc/src/memory.rs` | `package` `whiq_parts_inflate_on_use_and_a_limit_reached_is_reported`, `decompression_bomb_is_rejected`, `memory` tests |
+| **Legacy `.doc`**: the 1 GB stream limit and the 64 M-character ceiling are floors (the whole budget / one character per 16 bytes of it); a text walk that runs out of its budget (a damaged file repeating its text) fails with the reason instead of opening part of the document in silence. | `crates/docbin/src/lib.rs` | docbin tests |
+| `--max-memory-mb` sets the readers' budget (`wordcraft_doc::memory::set_budget`). | `apps/wordcraft-cli/src/main.rs` | — |
+
+Not done: `export_pdf` still lays the whole document out for the PDF (980 MB transient on 1,343
+pages; given back after the call). Pictures stay in memory while the document is open (they are
+drawn); a document whose pictures pass the budget is refused with the route above.
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject
