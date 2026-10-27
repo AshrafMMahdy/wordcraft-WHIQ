@@ -1577,12 +1577,38 @@ fn a_range_of_pages_streams_the_same_and_pages_out_of_order_do_not_stream() {
         let (a, b) = classic_and_streamed(&d, &opts);
         assert!(a == b, "{pages:?}");
     }
-    let twice = PdfOptions { pages: Some(vec![2, 2]), ..Default::default() };
-    assert!(export_streaming(&d, &lo, &twice).is_none(), "a page printed twice is drawn twice: not streamed");
+    // Copies: a page more than once in a row is drawn that many times as it comes; collated copies
+    // are one pass over the document each; any other order is not streamed.
+    for pages in [vec![2, 2], vec![1, 1, 3, 3, 3], vec![1, 3, 4, 1, 3, 4], vec![0, 2, 0, 2, 0, 2]] {
+        let opts = PdfOptions { pages: Some(pages.clone()), tagged: false, ..Default::default() };
+        let (a, b) = classic_and_streamed(&d, &opts);
+        assert!(a == b, "{pages:?}");
+    }
     let back = PdfOptions { pages: Some(vec![4, 1]), ..Default::default() };
     assert!(export_streaming(&d, &lo, &back).is_none());
+    let mixed = PdfOptions { pages: Some(vec![1, 2, 1, 3]), ..Default::default() };
+    assert!(export_streaming(&d, &lo, &mixed).is_none());
     let past = PdfOptions { pages: Some(vec![1, n]), ..Default::default() };
     assert_eq!(export_streaming(&d, &lo, &past).unwrap().unwrap_err(), PdfError::BadPage(n + 1));
     let none = PdfOptions { pages: Some(vec![]), ..Default::default() };
     assert_eq!(export_streaming(&d, &lo, &none).unwrap().unwrap_err(), PdfError::NoPages);
+}
+
+#[test]
+fn links_to_bookmarks_outside_the_body_are_the_same_streamed_or_not() {
+    use wordcraft_doc::para::NoteKind;
+    use wordcraft_doc::{PartKind, Pos};
+    let mut d = long_with_links(300);
+    // A bookmark inside a footnote, and links to it and to a body bookmark.
+    let mut note = Paragraph::with_text("The note ", CharProps::default());
+    let n = note.len();
+    note.insert_object(n, InlineObject::BookmarkStart { name: "innote".into() }, &CharProps::default()).unwrap();
+    let id = d.add_part(PartKind::Footnote, vec![para_block(note)]);
+    d.insert_object(&Pos::body(3, 4), InlineObject::NoteRef { kind: NoteKind::Footnote, id, custom: String::new() }, &CharProps::default()).unwrap();
+    if let Some(Block::Para(p)) = d.body.get_mut(10).map(Arc::make_mut) {
+        let n = p.len();
+        p.insert_text(n, " to the note", &CharProps { link: Some("#innote".into()), ..Default::default() }).unwrap();
+    }
+    let (a, b) = classic_and_streamed(&d, &PdfOptions::default());
+    assert!(a == b, "the links come out the same either way");
 }
