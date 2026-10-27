@@ -54,7 +54,13 @@ fn a_printed_pdf_written_a_page_at_a_time_is_the_pdf_of_the_whole_layout() {
     assert!(some.len() < streamed.len());
     let (twice, plan) = s.print_pdf(&json!({"range": "custom", "pages": "2-3", "copies": 2})).unwrap();
     assert_eq!(plan.pages, vec![1, 2, 1, 2]);
-    assert!(twice.starts_with(b"%PDF"));
+    // ... streamed (a pass a copy), the same PDF as the whole layout gives for them.
+    let classic = |pages: Vec<usize>| {
+        wordcraft_pdf::export_layout(&s.doc, &whole, &wordcraft_pdf::PdfOptions { pages: Some(pages), tagged: false, ..Default::default() }).unwrap()
+    };
+    assert!(twice == classic(vec![1, 2, 1, 2]));
+    let (alone, _) = s.print_pdf(&json!({"range": "custom", "pages": "2-3", "copies": 3, "collate": false})).unwrap();
+    assert!(alone == classic(vec![1, 1, 1, 2, 2, 2]));
     // A job with a page past the end is still refused with the page.
     let err = s.print_pdf(&json!({"range": "custom", "pages": "999999"})).unwrap_err().to_string();
     assert!(err.contains("999999") || err.contains("page"), "{err}");

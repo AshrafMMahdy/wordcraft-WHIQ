@@ -6,19 +6,21 @@
 //!
 //! Page ranges and copies come from users and control channels, so they are bounded: a range
 //! text is at most [`MAX_SPEC_CHARS`] long, copies are clamped to [`MAX_COPIES`], and the
-//! resulting page list never exceeds [`MAX_PRINT_PAGES`].
+//! resulting page list is as long as the job.
 
 use serde_json::{Value, json};
 use wordcraft_layout::DocLayout;
 
 use crate::{CmdError, Session, p};
 
+/// Most pages (counting copies) the desktop's native print dialog sends in one job. A PDF print
+/// job (`file.printPdf`) has no such limit: it is written a page at a time.
+pub const MAX_PRINT_PAGES: usize = 5000;
+
 /// Longest page-range text accepted.
 pub const MAX_SPEC_CHARS: usize = 500;
 /// Most copies one print job asks for.
 pub const MAX_COPIES: u32 = 999;
-/// Most pages (counting copies) one print job holds.
-pub const MAX_PRINT_PAGES: usize = 5000;
 
 /// Parses a custom page range like `1-3, 5, 8-` into 0-based page indexes, in the order typed
 /// (Word prints them in document order; so does this: sorted, without repeats). Pages are
@@ -110,11 +112,9 @@ pub fn plan(v: &Value, total: usize, current: (usize, usize)) -> Result<PrintPla
     }
     let copies = p::u64(v, "copies").unwrap_or(1).clamp(1, u64::from(MAX_COPIES)) as u32;
     let chosen = pages.len();
-    // WHIQ: one copy of any number of pages is no more than the document has; the cap is for
-    // copies, which multiply the job.
-    let total_out = chosen.checked_mul(copies as usize).filter(|n| copies == 1 || *n <= MAX_PRINT_PAGES);
-    let Some(total_out) = total_out else {
-        return Err(bad(format!("{chosen} pages × {copies} copies is more than the {MAX_PRINT_PAGES} pages one print job can hold")));
+    // WHIQ: a job is as many pages as it asks for (copies are drawn a pass at a time, not held).
+    let Some(total_out) = chosen.checked_mul(copies as usize) else {
+        return Err(bad(format!("{chosen} pages × {copies} copies is more pages than a print job can count")));
     };
     let mut out = Vec::with_capacity(total_out);
     if p::bool(v, "collate").unwrap_or(true) {
@@ -133,7 +133,7 @@ impl Session {
     /// WHIQ: [`Session::print_pdf`] without ever holding the document's layout: the pages are laid
     /// out and drawn one after the other (`wordcraft_pdf::export_streaming`). `None` when the job
     /// cannot be done that way (Print Markup balloons, a range that depends on where the caret is,
-    /// pages out of order or twice, a document whose headers refer to the page of a bookmark…).
+    /// pages in an order that is neither ascending nor the same ascending list over again, a document whose headers refer to the page of a bookmark…).
     fn print_pdf_streamed(&self, v: &Value, markup: &crate::io::ExportOptions) -> Option<Result<(Vec<u8>, PrintPlan), CmdError>> {
         if matches!(p::str(v, "range").unwrap_or("all"), "current" | "selection") {
             return None;
@@ -151,10 +151,6 @@ impl Session {
             Ok(plan) => plan,
             Err(e) => return Some(Err(e)),
         };
-        // The pages go out in the order they are laid out.
-        if plan.pages.windows(2).any(|w| w[0] >= w[1]) {
-            return None;
-        }
         crate::whiq_progress::report(1, 3, "pdf: laying out and drawing the pages");
         if let Err(e) = crate::whiq_progress::check("stopped before the PDF was made; no file was written") {
             return Some(Err(e));
@@ -253,7 +249,8 @@ mod tests {
         assert!(p(json!({"range": "current", "parity": "even"})).is_err(), "page 3 is odd: nothing left");
         // Hostile copies are clamped; a job that would be too big is refused, not allocated.
         assert_eq!(p(json!({"range": "current", "copies": 1e12})).map(|v| v.len()), Ok(MAX_COPIES as usize));
-        assert!(plan(&json!({"copies": 999}), 600, (0, 0)).is_err());
+        // A big job is the job: 999 copies of 600 pages is 599,400 pages (drawn a pass at a time).
+        assert_eq!(plan(&json!({"copies": 999}), 600, (0, 0)).map(|p| p.pages.len()), Ok(599_400));
         assert_eq!(p(json!({"copies": -5, "range": "current"})), Ok(vec![2]));
     }
 

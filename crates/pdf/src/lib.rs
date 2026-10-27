@@ -135,26 +135,55 @@ pub fn export_streaming(doc: &Document, lo: &LayoutOptions, opts: &PdfOptions) -
     if !wordcraft_layout::can_stream(doc, lo) {
         return None;
     }
-    let chosen: Option<Vec<usize>> = match &opts.pages {
-        Some(v) if v.windows(2).any(|w| w[0] >= w[1]) => return None,
-        Some(v) => Some(v.clone()),
+    let chosen: Option<Vec<Vec<(usize, usize)>>> = match &opts.pages {
+        Some(v) => Some(split_passes(v)?),
         None => None,
     };
-    if chosen.as_ref().is_some_and(|v| v.is_empty()) {
+    if opts.pages.as_ref().is_some_and(|v| v.is_empty()) {
         return Some(Err(PdfError::NoPages));
     }
     Some(write::guard(|| export_streaming_inner(doc, lo, opts, chosen.as_deref())))
 }
 
-fn export_streaming_inner(doc: &Document, lo: &LayoutOptions, opts: &PdfOptions, chosen: Option<&[usize]>) -> Result<Vec<u8>, PdfError> {
-    let out_of: HashMap<usize, usize> = chosen.map(|v| v.iter().enumerate().map(|(o, p)| (*p, o)).collect()).unwrap_or_default();
-    let last = chosen.and_then(|v| v.last().copied());
+/// The pages of a job as passes over the document, each a list of (layout page, output page) in
+/// layout order: pages in order (a page more than once in a row is drawn that many times as it
+/// comes), or the same ascending list over again (collated copies: one pass a copy). `None` for any
+/// other order, which needs a page drawn after later ones are: the whole layout is held for that.
+fn split_passes(pages: &[usize]) -> Option<Vec<Vec<(usize, usize)>>> {
+    if pages.is_empty() {
+        return Some(Vec::new());
+    }
+    let numbered = |from: usize, v: &[usize]| v.iter().enumerate().map(|(k, p)| (*p, from + k)).collect::<Vec<_>>();
+    if pages.windows(2).all(|w| w[0] <= w[1]) {
+        return Some(vec![numbered(0, pages)]);
+    }
+    let n = pages.len();
+    let first = (1..=n).find(|k| pages.get(*k).is_none_or(|p| *p <= pages[k - 1]))?;
+    if first == 0 || !n.is_multiple_of(first) || pages.get(..first)?.windows(2).any(|w| w[0] >= w[1]) {
+        return None;
+    }
+    let each = pages.get(..first)?;
+    if pages.chunks(first).any(|c| c != each) {
+        return None;
+    }
+    Some(pages.chunks(first).enumerate().map(|(i, c)| numbered(i * first, c)).collect())
+}
+
+fn export_streaming_inner(
+    doc: &Document,
+    lo: &LayoutOptions,
+    opts: &PdfOptions,
+    chosen: Option<&[Vec<(usize, usize)>]>,
+) -> Result<Vec<u8>, PdfError> {
+    // A page's output page for links to it: the last time it is drawn, as in a whole layout.
+    let out_of: HashMap<usize, usize> = chosen.map(|passes| passes.iter().flatten().copied().collect()).unwrap_or_default();
+    let last = chosen.and_then(|passes| passes.iter().flatten().map(|(p, _)| *p).max());
     let out = |page: usize| if chosen.is_some() { out_of.get(&page).copied() } else { Some(page) };
     // Links to a bookmark further on need to know where it is before the page they are on is drawn.
     let survey = if has_internal_links(doc) { Some(survey(doc, lo, &out, last)) } else { None };
     let mut outlined = HashSet::new();
     loop {
-        match write_attempt_streaming(doc, lo, opts, chosen, &out, survey.as_ref(), &outlined)? {
+        match write_attempt_streaming(doc, lo, opts, chosen, survey.as_ref(), &outlined)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::BadFont(id, msg) if outlined.len() < MAX_OUTLINED_FONTS && outlined.insert(id) => {
                 log::warn!("PDF: {msg}; its text is drawn as outlines");
@@ -169,12 +198,10 @@ fn write_attempt_streaming(
     doc: &Document,
     lo: &LayoutOptions,
     opts: &PdfOptions,
-    chosen: Option<&[usize]>,
-    out: &dyn Fn(usize) -> Option<usize>,
+    chosen: Option<&[Vec<(usize, usize)>]>,
     survey: Option<&Survey>,
     outlined: &HashSet<u32>,
 ) -> Result<Attempt, PdfError> {
-    let last = chosen.and_then(|v| v.last().copied());
     let settings = krilla::SerializeSettings { compress_content_streams: opts.compress, enable_tagging: opts.tagged, ..Default::default() };
     let language = doc.styles.default_chr.lang.clone().filter(|l| !l.is_empty() && l.is_ascii());
     let mut writer = Writer::new_with_language(settings, metadata(doc, opts), language);
@@ -198,28 +225,52 @@ fn write_attempt_streaming(
     };
     let mut written = 0usize;
     let mut failed: Option<PdfError> = None;
-    let pages = {
+    // One pass over the document, or one for each collated copy.
+    let all: Vec<Vec<(usize, usize)>>;
+    let passes: &[Vec<(usize, usize)>] = match chosen {
+        Some(p) => p,
+        None => {
+            all = vec![Vec::new()];
+            &all
+        }
+    };
+    let mut pages_seen: Option<usize> = None;
+    for (k, pass) in passes.iter().enumerate() {
+        // Output pages of each layout page in this pass (None: every page, in order).
+        let mut outs: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (p, o) in pass {
+            outs.entry(*p).or_default().push(*o);
+        }
+        let last = pass.iter().map(|(p, _)| *p).max();
         let pdf = writer.document_mut();
         let mut sink = |i: usize, page: Page| {
-            let Some(o) = out(i) else { return last.is_none_or(|l| i < l) };
-            if let Err(e) = write_page(&mut ex, pdf, &page) {
-                failed = Some(e);
-                return false;
+            let wanted: Vec<usize> = if chosen.is_some() { outs.get(&i).cloned().unwrap_or_default() } else { vec![i] };
+            for o in &wanted {
+                if let Err(e) = write_page(&mut ex, pdf, &page) {
+                    failed = Some(e);
+                    return false;
+                }
+                let items = ex.outline_items(&page, *o);
+                ex.outline_flat.extend(items);
+                written += 1;
             }
-            let items = ex.outline_items(&page, o);
-            ex.outline_flat.extend(items);
-            written += 1;
             // Pages after the last one wanted need not be laid out.
             last.is_none_or(|l| i < l)
         };
-        layout_streaming(doc, &mut LayoutCache::new(), lo, &mut sink)
-    };
+        let n = layout_streaming(doc, &mut LayoutCache::new(), lo, &mut sink);
+        if k == 0 {
+            pages_seen = n;
+        }
+        if failed.is_some() {
+            break;
+        }
+    }
     if let Some(e) = failed {
         return Err(e);
     }
     // Pages asked for that the document does not have.
-    if let (Some(v), Some(n)) = (chosen, pages)
-        && let Some(bad) = v.iter().find(|p| **p >= n)
+    if let (Some(first), Some(n)) = (passes.first(), pages_seen)
+        && let Some((bad, _)) = first.iter().find(|(p, _)| *p >= n)
     {
         return Err(PdfError::BadPage(bad.saturating_add(1)));
     }
