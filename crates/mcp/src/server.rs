@@ -395,6 +395,7 @@ impl Server {
         }
         let mut notice = evs.first().cloned().unwrap_or(json!({}));
         notice["recovered_paths"] = json!(all);
+        notice["documents"] = json!(evs.clone());
         self.notice = Some(notice);
         json!({"evicted": evs})
     }
@@ -411,8 +412,29 @@ impl Server {
             }
             _ => return None,
         };
-        let recovered = n.get("recovered_path").and_then(Value::as_str).map(str::to_string);
-        let original = n.get("original_path").and_then(Value::as_str).map(str::to_string);
+        // The document the call names (the first closed, the active one, when it names none).
+        let want = args.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(crate::handle_of)));
+        let docs = n.get("documents").and_then(Value::as_array).cloned().unwrap_or_default();
+        let one = match (&want, docs.is_empty()) {
+            (_, true) => n.clone(),
+            (Some(h), false) => match docs.iter().find(|d| d.get("document").and_then(Value::as_str) == Some(h.as_str())) {
+                Some(d) => d.clone(),
+                None => {
+                    let had: Vec<&str> = docs.iter().filter_map(|d| d.get("document").and_then(Value::as_str)).collect();
+                    return Some(crate::whiq::error_result(
+                        &crate::contract::ToolError::new(
+                            crate::contract::code::FAILED,
+                            format!("no document closed by the eviction has the handle `{h}` (they were: {})", had.join(", ")),
+                            "use one of those handles, or open the recovered file",
+                        ),
+                        &[],
+                    ));
+                }
+            },
+            (None, false) => docs.first().cloned().unwrap_or_else(|| n.clone()),
+        };
+        let recovered = one.get("recovered_path").and_then(Value::as_str).map(str::to_string);
+        let original = one.get("original_path").and_then(Value::as_str).map(str::to_string);
         let source = recovered.clone().or_else(|| original.clone())?;
         let target = params.get("path").and_then(Value::as_str).map(str::to_string).or_else(|| original.clone())?;
         let ext = |p: &str| std::path::Path::new(p).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();

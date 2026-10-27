@@ -397,6 +397,32 @@ fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
     assert_eq!(text_of(&mut m2), "Saved after the eviction");
 }
 
+// WHIQ: a save after an eviction saves the document the call NAMES, not the first one closed.
+#[test]
+fn a_save_after_an_eviction_saves_the_document_it_names() {
+    let d = Dir::new("evict-names");
+    let mut m = Mcp::start(&d.0, &[]);
+    let a = m.ok("new_document", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("type_text", json!({"text": "work of A", "document": a}));
+    let b = m.ok("new_document", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("type_text", json!({"text": "work of B", "document": b}));
+    assert_ne!(a, b);
+    m.ok("evict", json!({}));
+    let (out_b, out_a) = (d.0.join("b-saved.docx"), d.0.join("a-saved.docx"));
+    let s = m.ok("save_document", json!({"path": out_b.to_string_lossy(), "document": b}));
+    assert!(s["saved_from"].is_string(), "{s}");
+    m.ok("save_document", json!({"path": out_a.to_string_lossy(), "document": a}));
+    let mut m2 = Mcp::start(&d.0, &[]);
+    m2.ok("open_document", json!({"path": out_b.to_string_lossy()}));
+    assert_eq!(text_of(&mut m2), "work of B");
+    drop(m2);
+    let mut m3 = Mcp::start(&d.0, &[]);
+    m3.ok("open_document", json!({"path": out_a.to_string_lossy()}));
+    assert_eq!(text_of(&mut m3), "work of A");
+    // A handle the eviction did not close is an error, not another document's work.
+    m.err("save_document", json!({"path": d.0.join("c.docx").to_string_lossy(), "document": "doc-999"}), "failed");
+}
+
 // WHIQ: every block of a long document is reachable through inspect_document's continuation
 // (the engine answered the first 2,000 and no more), and export_text writes the whole text.
 #[test]
