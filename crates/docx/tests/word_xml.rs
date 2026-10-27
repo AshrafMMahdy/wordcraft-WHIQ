@@ -175,8 +175,15 @@ fn imports_word_2003_xml() {
     assert_eq!(part_text(&doc, doc.last_section.headers.default), "Garden header");
 }
 
+/// WHIQ: the package limits are floors that grow with the memory budget; a test of the floors
+/// runs at the smallest budget (every test in this file reads documents of a few kilobytes).
+fn small_budget() {
+    wordcraft_doc::memory::set_budget(1 << 20);
+}
+
 #[test]
 fn hostile_word_xml_is_an_error_not_a_panic() {
+    small_budget();
     let flat = r#"<pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">"#;
     let w2003 = r#"<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml">"#;
     // Other XML (and non-XML) is refused with the Word XML error.
@@ -249,6 +256,7 @@ fn flat_opc_binary_data_reads_the_same_in_cdata_and_character_references() {
 /// and elements no part reader looks at, and repeated part names, count too (#1353).
 #[test]
 fn flat_opc_limits_count_what_is_not_kept() {
+    small_budget();
     let png = tiny_png_b64();
     let limited = |extra: &str| matches!(read_xml(picture_package(&png, extra).as_bytes()), Err(DocxError::Limit(_)));
     assert!(read_xml(picture_package(&png, "<x/>").as_bytes()).is_ok());
