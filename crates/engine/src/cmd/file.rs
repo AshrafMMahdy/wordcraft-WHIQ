@@ -362,6 +362,7 @@ fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     opts.display.dim_header = false;
     let img = wordcraft_render::render_page(&s.doc, pg, scale, &opts);
     let png = img.to_png();
+    crate::io::check_pictures_read(&s.doc).map_err(CmdError::Failed)?;
     crate::io::write_file(path, &png).map_err(CmdError::Failed)?;
     Ok(json!({"path": path, "width": img.width, "height": img.height, "bytes": png.len()}))
 }

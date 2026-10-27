@@ -213,6 +213,8 @@ pub(crate) fn print_pdf_to_file(s: &mut Session, v: &Value) -> Result<Value, Cmd
     crate::whiq_progress::report(0, 3, "pdf: laying out pages");
     crate::whiq_progress::check("stopped before the PDF was made; no file was written")?;
     let (bytes, plan) = s.print_pdf(v)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::io::check_pictures_read(&s.doc).map_err(CmdError::Failed)?;
     crate::whiq_progress::report(2, 3, "pdf: writing the file");
     crate::whiq_progress::check("stopped before the PDF was written; no file was written")?;
     // Through `io`, so an agent confined to an automation write root (#769) can't print elsewhere.

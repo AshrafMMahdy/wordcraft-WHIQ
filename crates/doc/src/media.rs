@@ -13,9 +13,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Pictures under this size always stay in memory (they cost less than the file handling does).
@@ -38,21 +39,67 @@ pub fn set_memory_share(bytes: u64) {
     SHARE.store(bytes, Ordering::Relaxed);
 }
 
-/// The bytes of one picture in a file of the spill folder. The file is removed on drop.
+/// The bytes of one picture in a file of the spill folder. The file is removed on drop. It stays
+/// OPEN while the picture is cold: every read goes through that handle, so a cleaner that deletes
+/// the file does not take the picture; a read that fails is remembered (`failure`) and the saves and
+/// exports refuse (never a picture read as empty).
 #[derive(Debug)]
 pub struct SpillFile {
     path: PathBuf,
+    file: Mutex<std::fs::File>,
     len: u64,
+    failure: Mutex<Option<String>>,
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// The spill folder (created on first use).
+/// The spill folder of THIS process: a folder of its own (`pid-<pid>`) under the spill base, which
+/// is `WORDCRAFT_SPILL_DIR`, else `wordcraft/spill` in the user's data folder (not the temporary
+/// folder, which cleaners empty), else the temporary folder. A lock file in it is held open (and
+/// locked) for as long as the process lives: that is what tells another process it is in use.
 pub fn spill_dir() -> PathBuf {
+    let dir = spill_base().join(format!("pid-{}", std::process::id()));
+    claim(&dir);
+    dir
+}
+
+static BASE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Fix the folder all processes' spill folders are in (before the first picture is kept on disk).
+pub fn set_spill_base(base: Option<PathBuf>) {
+    if let Ok(mut b) = BASE.lock() {
+        *b = base;
+    }
+}
+
+/// The folder all processes' spill folders are in.
+pub fn spill_base() -> PathBuf {
+    if let Some(b) = BASE.lock().ok().and_then(|b| b.clone()) {
+        return b;
+    }
     match std::env::var_os("WORDCRAFT_SPILL_DIR") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => std::env::temp_dir().join("wordcraft-spill"),
+        _ => {
+            let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+            let data = var("LOCALAPPDATA").or_else(|| var("XDG_DATA_HOME")).or_else(|| var("HOME").map(|h| h.join(".local").join("share")));
+            data.unwrap_or_else(std::env::temp_dir).join("wordcraft").join("spill")
+        }
     }
+}
+
+const LOCK_NAME: &str = "lock";
+
+/// The lock of this process's spill folder, held until it exits.
+static CLAIM: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+
+/// Create `dir` and lock its lock file (once per process).
+fn claim(dir: &Path) {
+    CLAIM.get_or_init(|| {
+        std::fs::create_dir_all(dir).ok()?;
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_NAME)).ok()?;
+        f.try_lock().ok()?;
+        Some(f)
+    });
 }
 
 impl SpillFile {
@@ -61,24 +108,29 @@ impl SpillFile {
     pub fn from_reader(src: &mut dyn Read, max: u64) -> std::io::Result<SpillFile> {
         let dir = spill_dir();
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}-{}.part", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let path = dir.join(format!("{}.part", NEXT.fetch_add(1, Ordering::Relaxed)));
+        let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
         // Removed again on any failure below (the drop).
-        let mut sf = SpillFile { path, len: 0 };
+        let mut sf = SpillFile { path, file: Mutex::new(f), len: 0, failure: Mutex::new(None) };
         let mut buf = vec![0u8; 1 << 20];
         let mut limited = src.take(max.saturating_add(1));
-        loop {
-            let n = limited.read(&mut buf)?;
-            if n == 0 {
-                break;
+        {
+            let f = sf.file.get_mut().map_err(|_| std::io::Error::other("lock poisoned"))?;
+            let mut len = 0u64;
+            loop {
+                let n = limited.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                len = len.saturating_add(n as u64);
+                if len > max {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("more than the {max} bytes it declared")));
+                }
+                f.write_all(buf.get(..n).unwrap_or_default())?;
             }
-            sf.len = sf.len.saturating_add(n as u64);
-            if sf.len > max {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("more than the {max} bytes it declared")));
-            }
-            f.write_all(buf.get(..n).unwrap_or_default())?;
+            f.flush()?;
+            sf.len = len;
         }
-        f.flush()?;
         Ok(sf)
     }
 
@@ -94,28 +146,83 @@ impl SpillFile {
         &self.path
     }
 
+    /// Why a read of this picture failed, if one did.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|f| f.clone())
+    }
+
+    fn fail(&self, e: &std::io::Error) {
+        if let Ok(mut f) = self.failure.lock() {
+            f.get_or_insert(format!("a picture kept on disk could not be read back ({}): {e}", self.path.display()));
+        }
+    }
+
+    /// The file at its start, under the lock.
+    fn rewound(&self) -> std::io::Result<std::sync::MutexGuard<'_, std::fs::File>> {
+        let mut g = self.file.lock().map_err(|_| std::io::Error::other("lock poisoned"))?;
+        g.seek(std::io::SeekFrom::Start(0))?;
+        Ok(g)
+    }
+
     /// The whole file in memory (a caller that has to decode it to draw it).
     pub fn read_all(&self) -> std::io::Result<Vec<u8>> {
-        std::fs::read(&self.path)
+        let mut g = self.rewound()?;
+        let mut v = Vec::with_capacity(self.len.min(1 << 30) as usize);
+        (&mut *g).take(self.len.saturating_add(1)).read_to_end(&mut v)?;
+        if v.len() as u64 != self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{} holds {} of {} bytes", self.path.display(), v.len(), self.len),
+            ));
+        }
+        Ok(v)
     }
 
     /// Stream the bytes into `w`; returns the bytes copied.
     pub fn copy_to(&self, w: &mut dyn Write) -> std::io::Result<u64> {
-        let mut f = std::fs::File::open(&self.path)?;
-        let n = std::io::copy(&mut f, w)?;
+        let mut g = self.rewound()?;
+        let n = std::io::copy(&mut (&mut *g).take(self.len), w)?;
         if n != self.len {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("{} holds {n} of {} bytes", self.path.display(), self.len)));
         }
         Ok(n)
     }
 
-    /// The first `n` bytes (format sniffing).
+    /// A reader on the bytes, from the start.
+    fn reader(&self) -> std::io::Result<SpillReader<'_>> {
+        let g = self.rewound()?;
+        Ok(SpillReader { g })
+    }
+
+    /// The first `n` bytes (format sniffing). Short when the file cannot be read (see `failure`).
     pub fn head(&self, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(n);
-        if let Ok(f) = std::fs::File::open(&self.path) {
-            let _ = f.take(n as u64).read_to_end(&mut out);
+        match self.rewound() {
+            Ok(mut g) => {
+                if let Err(e) = (&mut *g).take(n as u64).read_to_end(&mut out) {
+                    self.fail(&e);
+                }
+            }
+            Err(e) => self.fail(&e),
         }
         out
+    }
+}
+
+/// A reader on a spill file under its lock.
+struct SpillReader<'a> {
+    g: std::sync::MutexGuard<'a, std::fs::File>,
+}
+
+impl Read for SpillReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.g.read(buf)
+    }
+}
+
+impl std::io::Seek for SpillReader<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.g.seek(to)
     }
 }
 
@@ -125,40 +232,54 @@ impl Drop for SpillFile {
     }
 }
 
-/// The process id a spill file's name starts with (`<pid>-<n>.part`).
-fn owner(path: &Path) -> Option<u32> {
-    path.file_name()?.to_str()?.split('-').next()?.parse().ok()
-}
-
-/// Remove spill files left by processes that are gone: older than `age`, or (where the system
-/// tells it, Linux) whose process no longer runs. Returns how many.
-pub fn sweep_stale(age: std::time::Duration) -> usize {
-    let Ok(rd) = std::fs::read_dir(spill_dir()) else { return 0 };
-    let me = std::process::id();
+/// Remove the spill folders of processes that are gone: a folder whose lock file nobody holds. A
+/// folder of a live process (its lock is held) is never touched, whatever its age; one with no lock
+/// file yet is left for a minute (it is being made). Files of the old layout (`<pid>-<n>.part` in the
+/// base folder) go when the system tells their process is gone (Linux). Returns how many files.
+pub fn sweep_stale(_age: std::time::Duration) -> usize {
+    let base = spill_base();
+    let Ok(rd) = std::fs::read_dir(&base) else { return 0 };
+    let mine = spill_dir();
     let mut n = 0;
     for e in rd.flatten() {
         let path = e.path();
-        if path.extension().is_none_or(|x| x != "part") {
+        if path == mine {
             continue;
         }
-        let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|d| d > age);
-        let gone = owner(&path).is_some_and(|pid| pid != me && Path::new("/proc/self").exists() && !Path::new(&format!("/proc/{pid}")).exists());
-        if (old || gone) && std::fs::remove_file(&path).is_ok() {
-            n += 1;
+        if path.is_dir() {
+            let lock = path.join(LOCK_NAME);
+            let free = match std::fs::OpenOptions::new().read(true).write(true).open(&lock) {
+                // Free when we can take the lock (and then we hold it while the folder goes).
+                Ok(f) => f.try_lock().is_ok().then_some(f),
+                Err(_) => {
+                    let young = e
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .is_none_or(|d| d < std::time::Duration::from_secs(60));
+                    if young { None } else { std::fs::File::open(&path).ok() }
+                }
+            };
+            if free.is_some() {
+                n += std::fs::read_dir(&path).map(|r| r.flatten().filter(|x| x.file_name() != LOCK_NAME).count()).unwrap_or(0);
+                drop(free);
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        } else if path.extension().is_some_and(|x| x == "part") {
+            let pid: Option<u32> = path.file_name().and_then(|f| f.to_str()).and_then(|f| f.split('-').next()).and_then(|p| p.parse().ok());
+            let gone = pid.is_some_and(|pid| Path::new("/proc/self").exists() && !Path::new(&format!("/proc/{pid}")).exists());
+            if gone && std::fs::remove_file(&path).is_ok() {
+                n += 1;
+            }
         }
     }
     n
 }
 
-/// Remove this process's spill files (before an exit that skips destructors: a signal).
+/// Remove this process's spill folder (before an exit that skips destructors: a signal).
 pub fn remove_own() {
-    let Ok(rd) = std::fs::read_dir(spill_dir()) else { return };
-    let me = std::process::id();
-    for e in rd.flatten() {
-        if owner(&e.path()) == Some(me) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
+    let _ = std::fs::remove_dir_all(spill_dir());
 }
 
 /// One picture: in memory or on disk.
@@ -176,8 +297,9 @@ impl Blob {
         }
     }
 
-    /// The bytes in memory (read back from disk for a spilled picture; empty when the spill file
-    /// cannot be read, which is logged).
+    /// The bytes in memory (read back from disk for a spilled picture). A spill file that cannot be
+    /// read gives NO bytes and the failure is kept on the file ([`SpillFile::failure`]): the saves
+    /// and exports ask [`MediaMap::load_failure`] and refuse, so a picture is never lost in silence.
     fn load(&self) -> Arc<Vec<u8>> {
         match self {
             Blob::Mem(b) => b.clone(),
@@ -185,6 +307,7 @@ impl Blob {
                 Ok(v) => Arc::new(v),
                 Err(e) => {
                     log::error!("a picture kept on disk could not be read back ({}): {e}", f.path().display());
+                    f.fail(&e);
                     Arc::new(Vec::new())
                 }
             },
@@ -241,13 +364,30 @@ impl Picture {
     pub fn open(&self) -> std::io::Result<Box<dyn ReadSeek + '_>> {
         match &self.blob {
             Blob::Mem(b) => Ok(Box::new(std::io::Cursor::new(b.as_slice()))),
-            Blob::Disk(f) => Ok(Box::new(std::io::BufReader::new(std::fs::File::open(f.path())?))),
+            Blob::Disk(f) => Ok(Box::new(std::io::BufReader::new(f.reader()?))),
         }
     }
 
-    /// The whole picture in memory (read back from disk when it is kept there).
+    /// The whole picture in memory (read back from disk when it is kept there). A picture that
+    /// cannot be read gives no bytes: see [`Picture::failure`].
     pub fn bytes(&self) -> Arc<Vec<u8>> {
         self.blob.load()
+    }
+
+    /// Note that reading this picture failed (an exporter that read it a piece at a time found it
+    /// short), so [`MediaMap::load_failure`] says so and the save is refused.
+    pub fn report_failure(&self, e: &std::io::Error) {
+        if let Blob::Disk(f) = &self.blob {
+            f.fail(e);
+        }
+    }
+
+    /// Why the picture could not be read back from disk, if it could not.
+    pub fn failure(&self) -> Option<String> {
+        match &self.blob {
+            Blob::Disk(f) => f.failure(),
+            Blob::Mem(_) => None,
+        }
     }
 }
 
@@ -350,6 +490,16 @@ impl MediaMap {
             Blob::Disk(f) => Arc::as_ptr(f) as usize,
         };
         Some(Pin { ident, hold: b.clone() })
+    }
+
+    /// Why a picture kept on disk could not be read back, if one could not (its key and the
+    /// reason). A save or export of the document checks this and refuses: a picture is never
+    /// written as empty.
+    pub fn load_failure(&self) -> Option<String> {
+        self.items.iter().find_map(|(k, b)| match b {
+            Blob::Disk(f) => f.failure().map(|why| format!("picture {k}: {why}")),
+            Blob::Mem(_) => None,
+        })
     }
 
     /// The size of a picture, without reading it.

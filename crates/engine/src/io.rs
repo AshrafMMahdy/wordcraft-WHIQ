@@ -325,8 +325,18 @@ pub fn save_bytes_opts(name: &str, doc: &Document, opts: &ExportOptions) -> Resu
 
 /// [`save_bytes`], encrypted with `password` when there is one and the format is a Word package
 /// (other formats are copies and are written as they are).
+/// WHIQ: a save or export of pictures that could not be read back from their spill files is refused:
+/// the file would be missing them.
+pub fn check_pictures_read(doc: &Document) -> Result<(), String> {
+    match doc.media.load_failure() {
+        Some(why) => Err(format!("nothing was saved: {why}")),
+        None => Ok(()),
+    }
+}
+
 pub fn save_bytes_with(name: &str, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<Vec<u8>, String> {
     let bytes = save_bytes_opts(name, doc, opts)?;
+    check_pictures_read(doc)?;
     match password {
         Some(pw) if can_encrypt(name) => wordcraft_docx::encrypt(&bytes, pw).map_err(|e| e.to_string()),
         _ => Ok(bytes),
@@ -628,6 +638,7 @@ pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&
                     use std::io::Write;
                     let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
                     wordcraft_formats::odt::export_to(doc, &mut w).map_err(std::io::Error::other)?;
+                    check_pictures_read(doc).map_err(std::io::Error::other)?;
                     w.flush()
                 });
             }
@@ -636,6 +647,7 @@ pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&
                     use std::io::Write;
                     let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
                     wordcraft_formats::rtf::export_to(doc, &mut w)?;
+                    check_pictures_read(doc).map_err(std::io::Error::other)?;
                     w.flush()
                 });
             }

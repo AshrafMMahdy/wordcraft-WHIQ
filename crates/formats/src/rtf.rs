@@ -549,6 +549,7 @@ fn write_hex(pic: &wordcraft_doc::media::Picture, w: &mut dyn std::io::Write) ->
     use std::io::Read;
     let mut r = std::io::BufReader::new(pic.open()?);
     let mut buf = [0u8; 64];
+    let mut total = 0u64;
     loop {
         let mut n = 0;
         while n < buf.len() {
@@ -558,8 +559,9 @@ fn write_hex(pic: &wordcraft_doc::media::Picture, w: &mut dyn std::io::Write) ->
             }
             n += k;
         }
+        total += n as u64;
         if n == 0 {
-            return Ok(());
+            return short(pic, total);
         }
         let mut line = String::with_capacity(n * 2 + 1);
         for b in buf.get(..n).unwrap_or_default() {
@@ -568,8 +570,20 @@ fn write_hex(pic: &wordcraft_doc::media::Picture, w: &mut dyn std::io::Write) ->
         line.push('\n');
         w.write_all(line.as_bytes())?;
         if n < buf.len() {
-            return Ok(());
+            return short(pic, total);
         }
+    }
+}
+
+/// A picture file that holds fewer bytes than it should is an error, not a shorter picture (and the
+/// picture says so, for the save that asks).
+fn short(pic: &wordcraft_doc::media::Picture, got: u64) -> std::io::Result<()> {
+    if got == pic.len() {
+        Ok(())
+    } else {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("a picture kept on disk holds {got} of {} bytes", pic.len()));
+        pic.report_failure(&e);
+        Err(e)
     }
 }
 
