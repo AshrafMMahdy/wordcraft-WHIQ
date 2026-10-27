@@ -1035,7 +1035,7 @@ fn adjust(s: &mut Session, f: impl Fn(image::DynamicImage) -> image::DynamicImag
 /// of the picture's current bitmap. The result still chains onto the originals map, so Reset
 /// Picture keeps working.
 fn adjust_media(s: &mut Session, base: &str, f: impl Fn(image::DynamicImage) -> image::DynamicImage) -> CmdResult {
-    let bytes = s.doc.media.get(base).cloned().ok_or_else(|| CmdError::Failed("picture data missing".into()))?;
+    let bytes = s.doc.media.get(base).ok_or_else(|| CmdError::Failed("picture data missing".into()))?;
     let img = image::load_from_memory(&bytes).map_err(|e| CmdError::Failed(format!("can't decode the picture: {e}")))?;
     if (img.width() as u64) * (img.height() as u64) > 80_000_000 {
         return Err(CmdError::Failed("picture is too large to edit".into()));
@@ -1639,7 +1639,7 @@ mod tests {
         let rgba = |s: &Session| {
             let (_, o) = selected(s).unwrap();
             let InlineObject::Image { media, .. } = o else { panic!("a picture") };
-            let bytes = s.doc.media.get(&media).cloned().unwrap();
+            let bytes = s.doc.media.get(&media).unwrap();
             image::load_from_memory(&bytes).unwrap().to_rgba8().pixels().map(|p| p.0).collect::<Vec<_>>()
         };
         let alpha = |s: &Session| rgba(s).iter().map(|p| p[3]).collect::<Vec<_>>();

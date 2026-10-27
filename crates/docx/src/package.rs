@@ -35,9 +35,21 @@ pub fn max_entries() -> usize {
     usize::try_from(wordcraft_doc::memory::share(MAX_ENTRIES as u64, 1024)).unwrap_or(usize::MAX)
 }
 
+/// A part this big must not claim more than [`BOMB_RATIO`] times its compressed size.
+const BOMB_FLOOR: u64 = 256 << 20;
+const BOMB_RATIO: u64 = 1000;
+
 /// The route a limit message gives.
 const ROUTE: &str = "the parts of a document (its text and pictures) are held in memory; the platform's engine memory limit (WHIQ_ENGINE_PROC_MB) \
 sets how much, or compress the pictures in Word (Picture Format › Compress Pictures) and open it again";
+
+/// Is this part a picture or other binary media (kept by the document's media map, not by the
+/// package)?
+fn is_media_name(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l.contains("/media/")
+        || [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".emf", ".wmf", ".svg"].iter().any(|e| l.ends_with(e))
+}
 
 /// Anything a zip can be read from: the file on disk, or bytes in memory.
 pub trait ReadSeek: Read + Seek {}
@@ -241,7 +253,9 @@ impl Package {
                 continue;
             }
             let name = f.name().trim_start_matches('/').to_string();
-            if f.size() > max_part {
+            // WHIQ: a picture is not held by the package: it goes to the document's media map, in
+            // memory or on disk (`take_into`), so the per-part limit is not for it.
+            if f.size() > max_part && !is_media_name(&name) {
                 return Err(DocxError::Limit(format!(
                     "part {name} unpacks to {} MB, more than one part this process holds in memory ({} MB); {ROUTE}",
                     f.size() >> 20,
@@ -300,18 +314,61 @@ impl Package {
         Some(buf)
     }
 
-    /// WHIQ: a part's bytes handed over, not kept by the package (pictures: one copy in memory).
-    pub fn take(&self, name: &str) -> Option<Vec<u8>> {
+    /// WHIQ: a picture handed to the document's media map, not kept by the package: a picture of
+    /// any size is inflated straight from the zip into memory or, past the document's share of the
+    /// budget, into a spill file on disk (one copy, never whole in memory then). `false` when the
+    /// picture is not there or is unreadable (logged); a disk that cannot take it fails the read
+    /// with the reason ([`Package::failure`]).
+    pub fn take_into(&self, name: &str, media: &mut wordcraft_doc::media::MediaMap, key: String) -> bool {
         if let Some(v) = self.files.get(name.trim_start_matches('/')) {
-            return Some(v.clone());
+            media.insert(key, std::sync::Arc::new(v.clone()));
+            return true;
         }
-        let key = self.entry_name(name)?;
-        let z = self.zip.as_ref()?;
-        let e = z.entries.get(&key)?;
+        let Some(entry) = self.entry_name(name) else { return false };
+        let Some(z) = self.zip.as_ref() else { return false };
+        let Some(e) = z.entries.get(&entry) else { return false };
         if let Some(Some(d)) = e.data.get() {
-            return Some(d.clone());
+            media.insert(key, std::sync::Arc::new(d.clone()));
+            return true;
         }
-        Self::inflate(z, &key, e)
+        let fail = |msg: String| {
+            log::warn!("docx: {msg}");
+            let mut f = z.failed.borrow_mut();
+            if f.is_none() {
+                *f = Some(msg);
+            }
+        };
+        let mut zip = z.zip.borrow_mut();
+        let mut f = match zip.by_index(e.index) {
+            Ok(f) => f,
+            Err(err) => {
+                log::warn!("docx: zip entry {entry} unreadable: {err}");
+                return false;
+            }
+        };
+        // A bomb: a picture that claims to be a thousand times its compressed size.
+        if e.size > BOMB_FLOOR && e.size > f.compressed_size().saturating_mul(BOMB_RATIO) {
+            fail(format!(
+                "picture {entry} unpacks to {} MB from {} MB (more than {BOMB_RATIO}:1); the file is damaged or hostile",
+                e.size >> 20,
+                f.compressed_size() >> 20
+            ));
+            return false;
+        }
+        match media.insert_reader(key, &mut f, e.size, e.size) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                log::warn!("docx: zip entry {entry} unreadable: {err}");
+                false
+            }
+            Err(err) => {
+                fail(format!(
+                    "picture {entry} could not be kept: {err} (the folder for large pictures is WORDCRAFT_SPILL_DIR, now {})",
+                    wordcraft_doc::media::spill_dir().display()
+                ));
+                false
+            }
+        }
     }
 
     /// A package from parts already in memory (a Flat OPC file, a converted document), by part
@@ -475,18 +532,40 @@ pub fn relative(from: &str, to: &str) -> String {
 
 /// Build a zip from (name, bytes) entries.
 pub fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, DocxError> {
-    let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let none = BTreeMap::new();
+    zip_into(Cursor::new(Vec::new()), entries, &none, &wordcraft_doc::media::MediaMap::new()).map(Cursor::into_inner)
+}
+
+/// WHIQ: [`zip_entries`] written to `w`, a file as it is made. An entry named in `deferred` (part
+/// name to media key) has no bytes in `entries`: they are streamed from the document's media map,
+/// so a picture kept on disk is never held in memory by a save.
+pub fn zip_into<W: Write + Seek>(
+    w: W,
+    entries: &[(String, Vec<u8>)],
+    deferred: &BTreeMap<String, String>,
+    media: &wordcraft_doc::media::MediaMap,
+) -> Result<W, DocxError> {
+    let mut zw = zip::ZipWriter::new(w);
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).compression_level(Some(6));
     let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let zerr = |e: &dyn std::fmt::Display| DocxError::Zip(e.to_string());
     for (name, bytes) in entries {
         // Already-compressed media gain nothing from deflate.
         let lower = name.to_ascii_lowercase();
         let o = if [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| lower.ends_with(e)) { stored } else { opts };
-        zw.start_file(name.as_str(), o).map_err(|e| DocxError::Zip(e.to_string()))?;
-        zw.write_all(bytes).map_err(|e| DocxError::Zip(e.to_string()))?;
+        let len = match deferred.get(name) {
+            Some(key) => media.byte_len(key).unwrap_or(0),
+            None => bytes.len() as u64,
+        };
+        zw.start_file(name.as_str(), o.large_file(len >= u64::from(u32::MAX))).map_err(|e| zerr(&e))?;
+        match deferred.get(name) {
+            Some(key) => {
+                media.copy_to(key, &mut zw).map_err(|e| zerr(&e))?;
+            }
+            None => zw.write_all(bytes).map_err(|e| zerr(&e))?,
+        }
     }
-    let c = zw.finish().map_err(|e| DocxError::Zip(e.to_string()))?;
-    Ok(c.into_inner())
+    zw.finish().map_err(|e| zerr(&e))
 }
 
 #[cfg(test)]
@@ -574,20 +653,43 @@ mod tests {
         let o = zip::write::SimpleFileOptions::default();
         zw.start_file("word/document.xml", o).unwrap();
         zw.write_all(b"<w:document/>").unwrap();
-        zw.start_file("word/media/big.png", o).unwrap();
-        zw.write_all(&[7u8; 4000]).unwrap();
+        zw.start_file("word/footnotes.xml", o).unwrap();
+        zw.write_all(&[b' '; 4000]).unwrap();
         let bytes = zw.finish().unwrap().into_inner();
-        // Room for the document, not for the picture as well.
+        // Room for the document, not for the footnotes as well.
         let pkg = Package::open_limited(&bytes, 10_000, 3000).unwrap();
-        assert!(pkg.part_names().contains("word/media/big.png"));
+        assert!(pkg.part_names().contains("word/footnotes.xml"));
         assert_eq!(pkg.get("word/document.xml"), Some(&b"<w:document/>"[..]));
         assert!(pkg.failure().is_none(), "nothing was refused yet");
-        assert!(pkg.take("word/media/big.png").is_none());
+        assert!(pkg.get("word/footnotes.xml").is_none());
         let why = pkg.failure().expect("the refusal is kept for the reader to fail with");
-        assert!(why.contains("big.png") && why.contains("WHIQ_ENGINE_PROC_MB"), "{why}");
-        // With room, a picture is handed over (not kept by the package as well).
-        let pkg = Package::open(&bytes).unwrap();
-        assert_eq!(pkg.take("word/media/big.png").map(|b| b.len()), Some(4000));
+        assert!(why.contains("footnotes.xml") && why.contains("WHIQ_ENGINE_PROC_MB"), "{why}");
+    }
+
+    /// A picture goes to the media map (memory, or disk past the document's share), whatever the
+    /// package's part and total limits; it is not counted against them.
+    #[test]
+    fn whiq_a_picture_is_handed_to_the_media_map_past_the_part_limit() {
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        zw.start_file("word/document.xml", o).unwrap();
+        zw.write_all(b"<w:document/>").unwrap();
+        zw.start_file("word/media/big.png", o).unwrap();
+        zw.write_all(&[7u8; 400_000]).unwrap();
+        zw.start_file("word/media/big2.png", o).unwrap();
+        zw.write_all(&[8u8; 400_000]).unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+        // Parts of at most 10,000 bytes and 20,000 in all: the pictures are far past both.
+        let pkg = Package::open_limited(&bytes, 10_000, 20_000).unwrap();
+        wordcraft_doc::media::set_memory_share(500_000);
+        let mut media = wordcraft_doc::media::MediaMap::new();
+        assert!(pkg.take_into("word/media/big.png", &mut media, "big.png".into()));
+        assert!(pkg.take_into("/word/media/big2.png", &mut media, "big2.png".into()));
+        assert!(!pkg.take_into("word/media/none.png", &mut media, "none.png".into()));
+        assert!(!media.is_spilled("big.png") && media.is_spilled("big2.png"), "the second is past the share");
+        assert_eq!(media.get("big2.png").unwrap().len(), 400_000);
+        assert_eq!(media.get("big.png").unwrap().first(), Some(&7));
         assert!(pkg.failure().is_none());
+        wordcraft_doc::media::set_memory_share(0);
     }
 }

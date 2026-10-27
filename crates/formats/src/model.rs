@@ -890,9 +890,7 @@ fn flow_paras_in(doc: &Document, p: &Paragraph, tracked: bool) -> Vec<Para> {
                         out.push_text(&std::mem::take(&mut buf), &f);
                     }
                     match doc.media.get(media) {
-                        Some(data) => {
-                            out.inlines.push(Inline::Image(Img { data: data.clone(), ext: media_ext(media, data), w: *w, h: *h, alt: alt.clone() }))
-                        }
+                        Some(data) => out.inlines.push(Inline::Image(Img { ext: media_ext(media, &data), data, w: *w, h: *h, alt: alt.clone() })),
                         None if !alt.is_empty() => buf.push_str(alt),
                         None => {}
                     }

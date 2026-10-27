@@ -706,15 +706,18 @@ impl Ctx<'_> {
     fn wrap_outline(&mut self, o: &InlineObject) -> Option<Arc<Vec<(f32, f32)>>> {
         let (doc, cache) = (self.doc, &mut *self.cache);
         contour::wrap_outline(o, |media, crop| {
-            let bytes = doc.media.get(media)?;
-            let key = (media.to_string(), Arc::as_ptr(bytes) as usize, bytes.len(), crop.map(f32::to_bits));
+            // WHIQ: a picture kept on disk is identified by its size, and read only on a miss.
+            let len = doc.media.byte_len(media)?;
+            let ptr = if doc.media.is_spilled(media) { 0 } else { Arc::as_ptr(&doc.media.get(media)?) as usize };
+            let key = (media.to_string(), ptr, len as usize, crop.map(f32::to_bits));
             if let Some(o) = cache.outlines.get(&key) {
                 return o.clone();
             }
             if cache.outlines.len() >= 256 {
                 cache.outlines.clear();
             }
-            let outline = contour::picture_outline(bytes, crop).map(Arc::new);
+            let bytes = doc.media.get(media)?;
+            let outline = contour::picture_outline(&bytes, crop).map(Arc::new);
             cache.outlines.insert(key, outline.clone());
             outline
         })

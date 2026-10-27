@@ -724,13 +724,13 @@ impl Exporter<'_> {
     fn vector(&mut self, key: &str) -> Option<Arc<Vector>> {
         let doc = self.doc;
         let bytes = doc.media.get(key)?;
-        if !wordcraft_metafile::is_metafile(bytes) {
+        if !wordcraft_metafile::is_metafile(&bytes) {
             return None;
         }
         if let Some(v) = self.vectors.get(key) {
             return v.clone();
         }
-        let v = build_vector(bytes).map(Arc::new);
+        let v = build_vector(&bytes).map(Arc::new);
         if v.is_none() {
             log::warn!("PDF: metafile `{key}` could not be read");
         }
@@ -742,7 +742,7 @@ impl Exporter<'_> {
         if let Some(i) = self.images.get(key) {
             return i.clone();
         }
-        let img = self.doc.media.get(key).and_then(load_image);
+        let img = self.doc.media.get(key).and_then(|b| load_image(&b));
         if img.is_none() {
             log::warn!("PDF: picture `{key}` could not be decoded");
         }

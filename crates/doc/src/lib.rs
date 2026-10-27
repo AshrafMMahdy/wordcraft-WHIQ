@@ -31,6 +31,7 @@ pub mod math_edit;
 pub mod math_latex;
 pub mod math_linear;
 pub mod math_symbols;
+pub mod media;
 pub mod memory;
 pub mod numbering;
 pub mod para;
@@ -678,8 +679,8 @@ pub struct Document {
     #[serde(skip_serializing_if = "NoteSeparators::is_empty")]
     pub endnote_separators: NoteSeparators,
     /// Embedded media (images) by key.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub media: BTreeMap<String, Arc<Vec<u8>>>,
+    #[serde(skip_serializing_if = "media::MediaMap::is_empty")]
+    pub media: media::MediaMap,
     /// Source-format parts we keep verbatim for round-trip (e.g. custom XML), by part name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub passthrough: BTreeMap<String, Arc<Vec<u8>>>,
@@ -708,7 +709,7 @@ impl Document {
             custom_props: Vec::new(),
             footnote_separators: NoteSeparators::default(),
             endnote_separators: NoteSeparators::default(),
-            media: BTreeMap::new(),
+            media: media::MediaMap::new(),
             passthrough: BTreeMap::new(),
         }
     }
@@ -1270,7 +1271,7 @@ impl Document {
 
     /// Add a media item; returns its key (deduplicated by content).
     pub fn add_media(&mut self, bytes: Vec<u8>, ext: &str) -> String {
-        if let Some((k, _)) = self.media.iter().find(|(_, v)| v.as_slice() == bytes.as_slice()) {
+        if let Some(k) = self.media.find_bytes(&bytes) {
             return k.clone();
         }
         let n = self.media.len() + 1;

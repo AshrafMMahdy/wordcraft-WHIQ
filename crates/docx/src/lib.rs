@@ -34,7 +34,7 @@ pub use package::ReadSeek;
 pub use read::{read, read_reader};
 pub use smart_art::smart_art_items;
 pub use wordml2003_write::write as write_wordml2003;
-pub use write::{write, write_as};
+pub use write::{write, write_as, write_to};
 
 /// Largest `.xml` file read as a Word XML document.
 pub const MAX_XML_FILE: usize = 1 << 30;

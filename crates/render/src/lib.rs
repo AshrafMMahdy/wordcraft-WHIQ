@@ -114,30 +114,30 @@ const CACHE_BYTES: usize = 256 * 1024 * 1024 / 2;
 const CACHE_ENTRIES: usize = 256;
 
 /// Decoded media by media key, shared across renders, with an approximate byte budget. An entry holds
-/// the source bytes it was decoded from, so a hit needs the same allocation (`Arc::ptr_eq`), and that
-/// allocation cannot be freed and its address reused while the entry lives.
+/// the picture it was decoded from (a `Pin`), so a hit needs the same picture, and that allocation
+/// (or spill file) cannot be freed and its identity reused while the entry lives.
 struct MediaCache<T> {
     map: HashMap<String, Entry<T>>,
     bytes: usize,
 }
 
 struct Entry<T> {
-    src: Arc<Vec<u8>>,
+    src: wordcraft_doc::media::Pin,
     val: T,
     size: usize,
 }
 
 impl<T: Clone> MediaCache<T> {
-    fn get(&self, key: &str, src: &Arc<Vec<u8>>) -> Option<T> {
+    fn get(&self, key: &str, src: &wordcraft_doc::media::Pin) -> Option<T> {
         let e = self.map.get(key)?;
-        Arc::ptr_eq(&e.src, src).then(|| e.val.clone())
+        (e.src == *src).then(|| e.val.clone())
     }
 
     /// Stores `val` (about `size` bytes) with its source, whose bytes the entry keeps alive and so counts
     /// too. Clears the cache first when the budget or entry cap is hit; an entry larger than the whole
     /// budget is not kept.
-    fn insert(&mut self, key: &str, src: &Arc<Vec<u8>>, val: T, size: usize) {
-        let size = size.saturating_add(src.len());
+    fn insert(&mut self, key: &str, src: &wordcraft_doc::media::Pin, val: T, size: usize) {
+        let size = size.saturating_add(src.memory_len());
         if size > CACHE_BYTES {
             return;
         }
@@ -269,19 +269,21 @@ impl Vector {
 /// The metafile picture for a media key. None when the bytes are not a metafile or do not parse, so
 /// the caller falls back to the raster path (and the grey box).
 fn vector_for(doc: &Document, key: &str) -> Option<Arc<Vector>> {
-    let bytes = doc.media.get(key)?;
-    if !wordcraft_metafile::is_metafile(bytes) {
+    // A metafile starts with its signature: the first bytes decide, without reading a picture kept on disk.
+    if !wordcraft_metafile::is_metafile(&doc.media.head(key, 64)?) {
         return None;
     }
-    if let Some(v) = lock(vectors()).get(key, bytes) {
+    let pin = doc.media.pin(key)?;
+    if let Some(v) = lock(vectors()).get(key, &pin) {
         return v;
     }
-    let v = build_vector(bytes).map(Arc::new);
+    let bytes = doc.media.get(key)?;
+    let v = build_vector(&bytes).map(Arc::new);
     if v.is_none() {
         log::warn!("picture `{key}` is a metafile that could not be read");
     }
     let size = v.as_ref().map_or(0, |v| v.bytes());
-    lock(vectors()).insert(key, bytes, v.clone(), size);
+    lock(vectors()).insert(key, &pin, v.clone(), size);
     v
 }
 
@@ -362,7 +364,7 @@ const MAX_BACKGROUND_PIXELS: u64 = 64 * 1024 * 1024;
 fn draw_page_picture(ctx: &mut RenderContext, doc: &Document, page: &Page, view: Affine) {
     let Some(pic) = &doc.settings.page_picture else { return };
     let Some(bytes) = doc.media.get(&pic.media) else { return };
-    match image_size(bytes) {
+    match image_size(&bytes) {
         Some((w, h)) if w > 0 && h > 0 && (w as u64) * (h as u64) <= MAX_BACKGROUND_PIXELS => {}
         _ => return,
     }
@@ -386,13 +388,15 @@ fn draw_page_picture(ctx: &mut RenderContext, doc: &Document, page: &Page, view:
 }
 
 fn pixmap_for(doc: &Document, key: &str) -> Option<Arc<Pixmap>> {
-    let bytes = doc.media.get(key)?;
-    if let Some(v) = lock(images()).get(key, bytes) {
+    let pin = doc.media.pin(key)?;
+    if let Some(v) = lock(images()).get(key, &pin) {
         return v;
     }
-    let pm = decode_pixmap(bytes).map(Arc::new);
+    // A picture kept on disk is read back for the decode only, and not held after it.
+    let bytes = doc.media.get(key)?;
+    let pm = decode_pixmap(&bytes).map(Arc::new);
     let size = pm.as_ref().map_or(0, |p| p.width() as usize * p.height() as usize * 4);
-    lock(images()).insert(key, bytes, pm.clone(), size);
+    lock(images()).insert(key, &pin, pm.clone(), size);
     pm
 }
 

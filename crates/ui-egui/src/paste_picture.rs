@@ -174,7 +174,7 @@ mod tests {
         assert_eq!((r["width"].as_f64(), r["height"].as_f64()), (Some(30.0), Some(15.0)));
         assert_eq!(pictures(&mut a), 1);
         let media = a.session.doc.media.values().next().unwrap();
-        assert_eq!(wordcraft_render::image_size(media), Some((40, 20)));
+        assert_eq!(wordcraft_render::image_size(&media), Some((40, 20)));
         a.run("edit.undo", json!({})).unwrap();
         assert_eq!(pictures(&mut a), 0);
         // Pasted text that names picture files only becomes pictures when files were copied.

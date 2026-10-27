@@ -605,6 +605,20 @@ pub fn save_path(path: &std::path::Path, doc: &Document) -> Result<(), String> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&str>, opts: &ExportOptions) -> Result<(), String> {
     crate::file_access::check_write(&path.to_string_lossy())?;
+    // WHIQ: a Word package (no password) is written straight into the file: the XML is built in
+    // memory, the pictures are streamed from the document (from disk, for those kept there), so a
+    // save never holds them all. The bytes are those of `save_bytes`; the same root check, atomic
+    // replace and `OLD_` policy.
+    if password.is_none()
+        && let Some(flavor) = wordcraft_docx::Flavor::from_ext(&ext_of(&path.to_string_lossy()))
+    {
+        return write_file_with(&path.to_string_lossy(), &mut |f| {
+            use std::io::Write;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
+            wordcraft_docx::write_to(doc, flavor, &mut w).map_err(|e| std::io::Error::other(e.to_string()))?;
+            w.flush()
+        });
+    }
     let bytes = save_bytes_with(&path.to_string_lossy(), doc, password, opts)?;
     safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }

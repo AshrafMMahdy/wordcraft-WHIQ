@@ -457,7 +457,7 @@ fn images_round_trip() {
     let mut expect = vec![inline];
     expect.extend(floats);
     assert_eq!(got.objects, expect);
-    assert_eq!(r.media.get(&key).map(|b| b.as_slice()), Some(png.as_slice()));
+    assert_eq!(r.media.get(&key).as_deref().map(|b| b.as_slice()), Some(png.as_slice()));
     assert_eq!(r.media.len(), 1);
 }
 
@@ -1204,7 +1204,7 @@ fn groups_round_trip() {
     match &children[0].obj {
         InlineObject::Image { media, w, h, alt, .. } => {
             assert_eq!((*w, *h, alt.as_str()), (60.0, 40.0, "A picture"));
-            assert_eq!(r.media.get(media).map(|m| m.as_slice()), Some(tiny_png().as_slice()));
+            assert_eq!(r.media.get(media).as_deref().map(|m| m.as_slice()), Some(tiny_png().as_slice()));
         }
         o => panic!("{o:?}"),
     }
@@ -2613,7 +2613,7 @@ fn page_background_picture_round_trips() {
     let r = rt(&d);
     let pic = r.settings.page_picture.as_ref().expect("picture kept");
     assert_eq!((pic.fill_type.as_str(), pic.title.as_str()), ("tile", "Paper"));
-    assert_eq!(r.media.get(&pic.media).map(|b| b.as_slice()), Some(png.as_slice()));
+    assert_eq!(r.media.get(&pic.media).as_deref().map(|b| b.as_slice()), Some(png.as_slice()));
     assert_eq!(r.settings.page_color, d.settings.page_color);
     // Saved again, it is still there.
     assert!(rt(&r).settings.page_picture.is_some());

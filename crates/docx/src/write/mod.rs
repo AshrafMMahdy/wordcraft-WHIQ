@@ -153,9 +153,24 @@ pub fn write_as(doc: &Document, flavor: Flavor) -> Result<Vec<u8>, DocxError> {
     zip_entries(&write_parts(doc, flavor)?)
 }
 
+/// WHIQ: [`write_as`] written to `w` (a file) as the package is made: the XML parts are built in
+/// memory, the pictures are streamed from the document's media map into the zip, so a picture
+/// kept on disk is never held in memory by a save. The bytes are those of [`write_as`].
+pub fn write_to<W: std::io::Write + std::io::Seek>(doc: &Document, flavor: Flavor, w: W) -> Result<W, DocxError> {
+    let mut deferred = BTreeMap::new();
+    let entries = write_parts_ex(doc, flavor, Some(&mut deferred))?;
+    crate::package::zip_into(w, &entries, &deferred, &doc.media)
+}
+
 /// The parts of the package [`write_as`] zips, in order, `[Content_Types].xml` first: (part name
 /// without the leading `/`, bytes).
 pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String, Vec<u8>)>, DocxError> {
+    write_parts_ex(doc, flavor, None)
+}
+
+/// [`write_parts`]; with `deferred`, a picture's entry is left empty and named in it (part name to
+/// media key) for the zip writer to stream.
+fn write_parts_ex(doc: &Document, flavor: Flavor, mut deferred: Option<&mut BTreeMap<String, String>>) -> Result<Vec<(String, Vec<u8>)>, DocxError> {
     // A range field must be whole in the file: drop markers that lost their partner in editing.
     let balanced;
     let doc = if doc.has_unbalanced_field_ranges() {
@@ -460,10 +475,17 @@ pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String,
         if !wr.used_media.contains(key) {
             continue;
         }
-        if let Some(bytes) = doc.media.get(key) {
+        if doc.media.contains_key(key) {
             let ext = file.rsplit('.').next().unwrap_or("bin").to_ascii_lowercase();
             media_types.insert(ext, content_type_for(file));
-            entries.push((format!("word/media/{file}"), bytes.to_vec()));
+            let name = format!("word/media/{file}");
+            match deferred.as_deref_mut() {
+                Some(d) => {
+                    d.insert(name.clone(), key.clone());
+                    entries.push((name, Vec::new()));
+                }
+                None => entries.push((name, doc.media.get(key).map(|b| b.to_vec()).unwrap_or_default())),
+            }
         }
     }
 
@@ -631,7 +653,7 @@ fn sniff(bytes: &[u8]) -> &'static str {
 impl Writer<'_> {
     fn assign_media(&mut self) {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (key, bytes) in &self.doc.media {
+        for key in self.doc.media.keys() {
             let clean: String = key.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).take(80).collect();
             let has_known_ext = clean.rsplit_once('.').is_some_and(|(s, _)| !s.is_empty()) && content_type_for(&clean) != "application/octet-stream";
             let mut base = if has_known_ext && !clean.starts_with('.') {
@@ -639,7 +661,7 @@ impl Writer<'_> {
             } else {
                 let stem = clean.trim_matches('.');
                 let stem = if stem.is_empty() { "image" } else { stem };
-                format!("{stem}.{}", sniff(bytes))
+                format!("{stem}.{}", sniff(&self.doc.media.head(key, 512).unwrap_or_default()))
             };
             let (stem, ext) = base.rsplit_once('.').map(|(s, e)| (s.to_string(), e.to_string())).unwrap_or((base.clone(), "bin".into()));
             let mut i = 1;

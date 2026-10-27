@@ -594,6 +594,11 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             if let Some(b) = limits.max_memory_bytes {
                 wordcraft_engine::doc::memory::set_budget(b);
             }
+            // WHIQ: spill files (pictures kept on disk) a killed process left behind go.
+            let swept = wordcraft_engine::doc::media::sweep_stale(std::time::Duration::from_secs(24 * 3600));
+            if swept > 0 {
+                eprintln!("wordcraft-cli: removed {swept} stale spill file(s) from {}", wordcraft_engine::doc::media::spill_dir().display());
+            }
             limits.test_hooks = std::env::var("WORDCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1");
             limits.keep_old = !rest.iter().any(|a| a == "--automation-no-old-copies");
             let shared = wordcraft_mcp::runtime::SharedState::default();

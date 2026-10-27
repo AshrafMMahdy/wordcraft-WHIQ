@@ -987,6 +987,8 @@ pub fn serve(
                 checkpoints.finish();
                 autosave_shared(&shared, "signal");
                 let _ = output.flush();
+                // WHIQ: exit skips destructors: this process's spill files go now.
+                wordcraft_doc::media::remove_own();
                 std::process::exit(0);
             }
             None => {

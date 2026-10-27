@@ -124,7 +124,7 @@ fn inline_officeart_picture_with_crop_and_alt_text() {
     assert_eq!(*crop, [0.25, 0.0, 0.0, 0.0]);
     assert_eq!(alt, "Logo");
     assert_eq!(float.wrap, Wrap::Inline);
-    assert_eq!(doc.media.get(media).map(|b| b.as_slice()), Some(png.as_slice()));
+    assert_eq!(doc.media.get(media).as_deref().map(|b| b.as_slice()), Some(png.as_slice()));
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn floating_picture_from_the_blip_store_keeps_position_and_wrap() {
     let Some(InlineObject::Image { media, w, h, float, .. }) = p0.objects.first() else { panic!("no image: {:?}", p0.objects) };
     assert_eq!((*w, *h), (144.0, 72.0));
     assert_eq!((float.wrap, float.h_rel, float.v_rel, float.x, float.y), (Wrap::Square, Anchor::Page, Anchor::Margin, 72.0, 36.0));
-    assert_eq!(doc.media.get(media).map(|b| b.as_slice()), Some(png.as_slice()));
+    assert_eq!(doc.media.get(media).as_deref().map(|b| b.as_slice()), Some(png.as_slice()));
 }
 
 #[test]

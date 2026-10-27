@@ -289,7 +289,8 @@ pub fn rss_source() -> &'static str {
 
 /// A portable estimate of the memory the open document holds: its media, kept parts and text.
 pub fn doc_bytes(doc: &Document) -> u64 {
-    let media: u64 = doc.media.values().map(|m| m.len() as u64).sum();
+    // Pictures kept on disk (spill files) are not memory.
+    let media: u64 = doc.media.memory_bytes();
     let kept: u64 = doc.passthrough.values().map(|b| b.len() as u64).sum();
     let text: u64 = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.len() as u64 * 8).sum();
     media + kept + text

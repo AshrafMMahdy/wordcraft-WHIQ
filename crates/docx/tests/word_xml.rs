@@ -239,7 +239,7 @@ fn picture_package(data: &str, extra: &str) -> String {
 #[test]
 fn flat_opc_binary_data_reads_the_same_in_cdata_and_character_references() {
     let png = tiny_png_b64();
-    let media = |data: &str| read_xml(picture_package(data, "").as_bytes()).map(|d| d.media.values().cloned().collect::<Vec<_>>());
+    let media = |data: &str| read_xml(picture_package(data, "").as_bytes()).map(|d| d.media.values().collect::<Vec<_>>());
     let plain = media(&png).unwrap();
     assert_eq!(plain.len(), 1);
     let (head, tail) = png.split_at(png.len() / 2);
