@@ -718,7 +718,8 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
     if out.is_empty() {
         out.push(para_block(Paragraph::new()));
     }
-    // The cover block.
+    // The cover block (its length: a TOC asked for without a [TOC] line goes after it).
+    let mut cover_len = 0usize;
     if cover {
         let mut cover_blocks: Blocks = Vec::new();
         let styled = |text: &str, style: &str| {
@@ -741,7 +742,14 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
         cover_blocks.extend(out);
         out = cover_blocks;
         toc_at = toc_at.map(|t| t + n);
+        cover_len = n;
         doc.last_section.title_page = true;
+    }
+    // `toc: true` without a [TOC] line: the contents go at the top, after the title page when there
+    // is one (not above it), in a placeholder as a [TOC] line would leave.
+    if toc_at.is_none() && truthy("toc").unwrap_or(false) {
+        out.insert(cover_len.min(out.len()), para_block(Paragraph::with_text("", CharProps::default())));
+        toc_at = Some(cover_len.min(out.len().saturating_sub(1)));
     }
     // Table header rows: shaded, bold, repeated.
     let fill = theme.header_fill();
@@ -986,6 +994,42 @@ mod tests {
         assert_eq!(s.doc.core.title, "Annual Review");
         // Nothing of the markers is left.
         assert!(!s.doc.plain_text(StoryRef::Body).contains(MARK));
+    }
+
+    /// W1: `{title, toc: true}` (no [TOC] line) puts the contents after the title page, on a page of
+    /// its own, and the body after it on the next.
+    #[test]
+    fn whiq_a_toc_asked_for_goes_after_the_title_page() {
+        for subtitle in [None, Some("Rev C")] {
+            let mut s = Session::new(Document::new());
+            let mut p = json!({"markdown": "# One\n\nText.\n\n## Two\n\nMore.\n", "title": "Polaris DC-1 Contract Analysis", "toc": true});
+            if let Some(sub) = subtitle {
+                p["subtitle"] = json!(sub);
+            }
+            let r = s.run("file.importMarkdown", &p).unwrap();
+            assert_eq!((r["toc"].as_bool(), r["cover"].as_bool()), (Some(true), Some(true)), "{r}");
+            let paras: Vec<&Paragraph> = s.doc.body.iter().filter_map(|b| b.as_para()).collect();
+            let style = |k: usize| paras[k].props.style.clone().unwrap_or_default();
+            assert_eq!(style(0), "Title", "the cover comes first");
+            assert_eq!(paras[0].plain_text(), "Polaris DC-1 Contract Analysis");
+            let cover = 1 + usize::from(subtitle.is_some());
+            if subtitle.is_some() {
+                assert_eq!(style(1), "Subtitle");
+            }
+            let first_toc = paras.iter().position(|p| p.props.style.as_deref().is_some_and(|x| x.starts_with("TOC") || x == "TOCHeading")).unwrap();
+            assert!(first_toc >= cover, "the TOC is after the cover: {first_toc}");
+            assert!(!paras.iter().take(cover).any(|p| p.props.style.as_deref().is_some_and(|x| x.starts_with("TOC"))));
+            // The TOC starts a page; the first heading starts the next.
+            assert_eq!(paras[cover].props.page_break_before, Some(true), "the TOC on a page of its own");
+            let one = paras.iter().position(|p| p.plain_text() == "One").unwrap();
+            assert!(one > first_toc && paras[one].props.page_break_before == Some(true));
+            assert!(paras.iter().any(|p| p.plain_text() == "Text."), "no content lost");
+        }
+        // Without a title the TOC stays at the top; an empty first paragraph is kept.
+        let mut s = Session::new(Document::new());
+        s.run("file.importMarkdown", &json!({"markdown": "# One\n\nText.\n", "toc": true})).unwrap();
+        assert!(s.doc.body.first().and_then(|b| b.as_para()).is_some_and(|p| p.props.style.as_deref() != Some("Title")));
+        assert!(s.doc.plain_text(StoryRef::Body).contains("Text."));
     }
 
     #[test]

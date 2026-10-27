@@ -215,7 +215,7 @@ fn own_tools() -> Vec<Value> {
                 "path": s("A .md file instead (pictures are read relative to it)"),
                 "blocks": {"type": "array", "items": {"type": "object"}, "description": "Instead of Markdown, the document as blocks whose text is taken literally (\\n is a line break): {type: \"paragraph\", text, style?: name, heading?: 1-6} or {runs: [{text, bold?, italic?, underline?, strike?, color?, size?, font?}]}; {type: \"heading\", level, text}; {type: \"table\", rows: [[cell text or {text, runs}]], header?: true (the first row: shaded, bold, repeated)}; {type: \"page_break\"}; a string is a paragraph"},
                 "theme": {"type": "object", "description": "{fonts: {body, heading}, colors: {text, primary, accent, tableHeader, tableHeaderText}, logo: path, size: pt}"},
-                "toc": b("Add a table of contents at the top (also: a [TOC] line)"),
+                "toc": b("Add a table of contents at the top, after the title page when there is one (or where a [TOC] line is)"),
                 "cover": b("Cover block from title/subtitle/date/author (default when there is a title)"),
                 "title": s("Cover title (else front matter)"),
                 "subtitle": s("Cover subtitle"),
