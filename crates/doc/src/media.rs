@@ -479,10 +479,8 @@ mod tests {
         m.insert("c.png".into(), bytes(1000, 3));
         assert!(!m.is_spilled("c.png"));
         // A clone shares the file; the file goes with the last holder.
-        let path = match m.items.get("b.png") {
-            Some(Blob::Disk(f)) => f.path().to_path_buf(),
-            _ => unreachable!(),
-        };
+        let Some(Blob::Disk(f)) = m.items.get("b.png") else { panic!("b.png is on disk") };
+        let path = f.path().to_path_buf();
         let copy = m.clone();
         assert_eq!(copy, m);
         drop(m);
