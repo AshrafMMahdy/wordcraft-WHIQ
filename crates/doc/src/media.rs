@@ -98,8 +98,22 @@ fn claim(dir: &Path) {
         std::fs::create_dir_all(dir).ok()?;
         let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_NAME)).ok()?;
         f.try_lock().ok()?;
+        // The folder is ours now; whatever is in it belongs to a crashed process of the same PID.
+        empty_folder(dir);
         Some(f)
     });
+}
+
+/// Remove everything in `dir` but the lock file: what a crashed process with the same PID left.
+fn empty_folder(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if e.file_name() == LOCK_NAME {
+            continue;
+        }
+        let p = e.path();
+        let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+    }
 }
 
 impl SpillFile {
@@ -247,23 +261,27 @@ pub fn sweep_stale(_age: std::time::Duration) -> usize {
             continue;
         }
         if path.is_dir() {
-            let lock = path.join(LOCK_NAME);
-            let free = match std::fs::OpenOptions::new().read(true).write(true).open(&lock) {
-                // Free when we can take the lock (and then we hold it while the folder goes).
-                Ok(f) => f.try_lock().is_ok().then_some(f),
-                Err(_) => {
-                    let young = e
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.elapsed().ok())
-                        .is_none_or(|d| d < std::time::Duration::from_secs(60));
-                    if young { None } else { std::fs::File::open(&path).ok() }
+            // `held` keeps the lock while the folder goes; `free` says the folder is nobody's.
+            let mut held = None;
+            let free = match std::fs::OpenOptions::new().read(true).write(true).open(path.join(LOCK_NAME)) {
+                // Free when we can take the lock.
+                Ok(f) => {
+                    let got = f.try_lock().is_ok();
+                    held = got.then_some(f);
+                    got
                 }
+                // No lock file (a folder of an older build, or one still being made): free once it
+                // is not young. (A directory cannot be opened as a file on Windows, so no handle.)
+                Err(_) => !e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .is_none_or(|d| d < std::time::Duration::from_secs(60)),
             };
-            if free.is_some() {
+            if free {
                 n += std::fs::read_dir(&path).map(|r| r.flatten().filter(|x| x.file_name() != LOCK_NAME).count()).unwrap_or(0);
-                drop(free);
+                drop(held);
                 let _ = std::fs::remove_dir_all(&path);
             }
         } else if path.extension().is_some_and(|x| x == "part") {
