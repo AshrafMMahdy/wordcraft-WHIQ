@@ -1977,6 +1977,59 @@ const MAX_NOTE_PASSES: usize = 3;
 
 /// Lay out the whole document.
 pub fn layout(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions) -> DocLayout {
+    layout_with_totals(doc, cache, opts).0
+}
+
+/// WHIQ: pages as they are finished. A document is paginated once, and each page is handed over
+/// (`sink(index, page)`) the moment nothing can change it any more — with its header, footer,
+/// mirrored margins and turned text done — and given back right after, so a document of any length
+/// is laid out holding a few pages. The pages are exactly those [`layout`] gives (the tests lay
+/// the same documents out both ways and compare).
+///
+/// The sink returns `false` to stop (the pages after the last one wanted are not laid out). The
+/// answer is the number of pages handed over, or `None` when this document or these options are
+/// not laid out this way — the caller then uses [`layout`]: Print Markup balloons, footnotes
+/// numbered again on each page, headers or footers that refer to the page of a bookmark, any view
+/// but Print, or a window.
+pub fn layout_streaming(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions, sink: &mut dyn FnMut(usize, Page) -> bool) -> Option<usize> {
+    if !can_stream(doc, opts) {
+        return None;
+    }
+    // A document that shows page totals needs them before its first page is final: count the
+    // pages first (holding a few at a time), with the totals that last pass used.
+    let n = doc.sections().len();
+    let (totals, found) = if shows_page_totals(doc) {
+        let count = LayoutOptions { window: Some(PageWindow::COUNT), ..opts.clone() };
+        let (lay, used) = layout_with_totals(doc, cache, &count);
+        (used, Totals::of(&lay.pages, n))
+    } else {
+        (Totals::first_guess(n), Totals::first_guess(n))
+    };
+    let mut stream = PageStream { sink, sent: 0, stopped: false, found };
+    match layout_pass(doc, cache, opts, &HashMap::new(), &totals, false, Some(&mut stream)) {
+        Pass::Done(_) | Pass::Again(_) => Some(stream.sent),
+    }
+}
+
+/// Can [`layout_streaming`] lay this document out?
+pub fn can_stream(doc: &Document, opts: &LayoutOptions) -> bool {
+    let per_page = doc.sections().iter().any(|(_, s)| doc.note_options(s, false).num_restart == wordcraft_doc::section::NoteRestart::EachPage);
+    opts.view == ViewMode::Print && !opts.comment_balloons && opts.window.is_none() && !per_page && !headers_footers_refer_to_pages(doc)
+}
+
+/// What a streamed layout needs to finish its pages as they come.
+struct PageStream<'a> {
+    sink: &'a mut dyn FnMut(usize, Page) -> bool,
+    /// Pages handed over so far.
+    sent: usize,
+    /// The sink asked to stop.
+    stopped: bool,
+    /// The totals headers and footers show (the pages the whole layout has).
+    found: Totals,
+}
+
+/// [`layout`], and the totals assumed by the pass that gave the layout.
+fn layout_with_totals(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions) -> (DocLayout, Totals) {
     let t0 = now_ms();
     // Page totals shown in the body (`NUMPAGES`, `SECTIONPAGES`) are known only after
     // paginating: lay out again with the totals found until they hold (bounded). Footnotes
@@ -1988,7 +2041,7 @@ pub fn layout(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions) -> 
     let mut totals = Totals::first_guess(doc.sections().len());
     let mut passes = 0;
     let mut l = loop {
-        match layout_pass(doc, cache, opts, &note_pages, &totals, passes < MAX_TOTAL_PASSES) {
+        match layout_pass(doc, cache, opts, &note_pages, &totals, passes < MAX_TOTAL_PASSES, None) {
             Pass::Again(t) => {
                 totals = t;
                 passes += 1;
@@ -2008,35 +2061,19 @@ pub fn layout(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions) -> 
         }
     };
     l.ms = now_ms() - t0;
-    l
+    (l, totals)
 }
 
-/// One layout pass, numbering footnotes restarted on each page by `note_pages` ([`note_info`]),
-/// with `totals` assumed for the page totals in the body. With `may_repeat`, a pass whose body
-/// shows totals that turn out different asks to be done again.
-fn layout_pass(
-    doc: &Document,
-    cache: &mut LayoutCache,
-    opts: &LayoutOptions,
-    note_pages: &HashMap<u32, usize>,
+/// The state of a pass before its first paragraph.
+fn new_ctx<'a>(
+    doc: &'a Document,
+    cache: &'a mut LayoutCache,
+    opts: &'a LayoutOptions,
     totals: &Totals,
-    may_repeat: bool,
-) -> Pass {
-    let env = env_hash(doc, opts);
-    if env != cache.env {
-        cache.paras.clear();
-        cache.measures.clear();
-        cache.env = env;
-    }
-    cache.used.clear();
-    // Note references are counted as the body shows them.
-    let notes = note_info(doc, opts.hides_deleted(StoryRef::Body), note_pages);
-    let notes_hash = hash_of(&{
-        let mut v: Vec<_> = notes.iter().map(|(a, b)| (*a, b.n, b.fmt)).collect();
-        v.sort_by_key(|(a, ..)| *a);
-        v
-    });
-    let mut ctx = Ctx {
+    notes: Arc<HashMap<u32, fields::NoteNum>>,
+    notes_hash: u64,
+) -> Ctx<'a> {
+    Ctx {
         doc,
         cache,
         opts,
@@ -2047,7 +2084,7 @@ fn layout_pass(
             pages: totals.pages,
             section_pages: totals.section(0),
             section: 1,
-            notes: Arc::new(notes),
+            notes,
             title: doc.core.title.as_str().into(),
             author: doc.core.creator.as_str().into(),
             ..Default::default()
@@ -2064,12 +2101,52 @@ fn layout_pass(
         quiet_marks: Vec::new(),
         mirror: false,
         table_keys: Vec::new(),
-    };
+    }
+}
+
+/// One layout pass, numbering footnotes restarted on each page by `note_pages` ([`note_info`]),
+/// with `totals` assumed for the page totals in the body. With `may_repeat`, a pass whose body
+/// shows totals that turn out different asks to be done again.
+fn layout_pass(
+    doc: &Document,
+    cache: &mut LayoutCache,
+    opts: &LayoutOptions,
+    note_pages: &HashMap<u32, usize>,
+    totals: &Totals,
+    may_repeat: bool,
+    mut stream: Option<&mut PageStream<'_>>,
+) -> Pass {
+    let env = env_hash(doc, opts);
+    if env != cache.env {
+        cache.paras.clear();
+        cache.measures.clear();
+        cache.env = env;
+    }
+    cache.used.clear();
+    // Note references are counted as the body shows them.
+    let notes = note_info(doc, opts.hides_deleted(StoryRef::Body), note_pages);
+    let notes_hash = hash_of(&{
+        let mut v: Vec<_> = notes.iter().map(|(a, b)| (*a, b.n, b.fmt)).collect();
+        v.sort_by_key(|(a, ..)| *a);
+        v
+    });
+    let mut ctx = new_ctx(doc, cache, opts, totals, Arc::new(notes), notes_hash);
     let sections = doc.sections();
     let web = matches!(opts.view, ViewMode::Web | ViewMode::Draft | ViewMode::Outline);
     let read = opts.view == ViewMode::Read;
     let reflow = web || read;
     ctx.mirror = doc.settings.mirror_margins && !reflow;
+    // WHIQ: a streamed layout lays headers and footers out as pages are handed over, in a state of
+    // its own (the body's is mid-pagination).
+    let mut hcache = LayoutCache::new();
+    hcache.env = env;
+    let mut hctx = stream.is_some().then(|| {
+        let mut c = new_ctx(doc, &mut hcache, opts, totals, ctx.fields.notes.clone(), notes_hash);
+        c.mirror = ctx.mirror;
+        c.track_totals = false;
+        c
+    });
+    let hf_styles = (stream.is_some() && styleref::headers_use_styleref(doc)).then(|| hctx.as_mut().map(|c| c.cache.style_index(doc))).flatten();
     ctx.quiet_marks = sections
         .windows(2)
         .filter(|w| w[1].1.start == SectionStart::Continuous)
@@ -2307,6 +2384,18 @@ fn layout_pass(
                     break 'sections;
                 }
             }
+            // WHIQ: finished pages go to the sink (the last two can still change).
+            if let (Some(st), Some(hc)) = (stream.as_deref_mut(), hctx.as_mut()) {
+                let before = st.sent;
+                send_pages(pb.pages.len().saturating_sub(2), &mut pb.pages, st, hc, hf_styles.as_ref(), &sections);
+                if st.sent > before {
+                    ctx.cache.paras.clear();
+                    ctx.cache.measures.clear();
+                }
+                if st.stopped {
+                    break 'sections;
+                }
+            }
         }
         if let Some((first, snap)) = from {
             boxes_discarded += balance_columns(&mut ctx, &mut pb, (first, block), &snap, body_top);
@@ -2320,6 +2409,9 @@ fn layout_pass(
             }
             place_endnotes(&mut ctx, &mut pb, here, block.saturating_sub(1));
         }
+    }
+    if stream.as_ref().is_some_and(|s| s.stopped) {
+        return Pass::Done(DocLayout { pages: std::mem::take(&mut pb.pages), index: HashMap::new(), ms: 0.0, text_boxes: 0 });
     }
     if pb.pages.is_empty() {
         pb.new_page(0, sect_ref.margin_top);
@@ -2341,6 +2433,12 @@ fn layout_pass(
         pb.flush_notes();
     }
     pb.carry.clear();
+    // WHIQ: the pages left go to the sink, and the layout is what is left of the pages: their size
+    // and number.
+    if let (Some(st), Some(hc)) = (stream, hctx.as_mut()) {
+        send_pages(pb.pages.len(), &mut pb.pages, st, hc, hf_styles.as_ref(), &sections);
+        return Pass::Done(DocLayout { pages: std::mem::take(&mut pb.pages), index: HashMap::new(), ms: 0.0, text_boxes: ctx.boxes.total() });
+    }
     let mut pages = pb.pages;
     for p in &mut pages {
         if let Some((_, s)) = sections.get(p.section)
@@ -4075,15 +4173,18 @@ fn marks_key(marks: &fields::BookmarkPages) -> u64 {
     hash_of(&v)
 }
 
+/// What a page's header and footer are made from besides the page.
+struct HfPlan {
+    /// Pages in the document, and in each section.
+    total: u32,
+    totals: Totals,
+    even_odd: bool,
+    styles: Option<Arc<styleref::StyleIndex>>,
+}
+
 fn headers_footers(ctx: &mut Ctx, pages: &mut [Page], sections: &[(usize, &SectionProps)]) {
-    let total = pages.len() as u32;
-    // Pages per section.
-    let mut per_section: HashMap<usize, u32> = HashMap::new();
-    for p in pages.iter() {
-        *per_section.entry(p.section).or_default() += 1;
-    }
-    let even_odd = ctx.doc.settings.even_odd_headers;
     let styles = styleref::headers_use_styleref(ctx.doc).then(|| ctx.cache.style_index(ctx.doc));
+    let plan = HfPlan { total: pages.len() as u32, totals: Totals::of(pages, sections.len()), even_odd: ctx.doc.settings.even_odd_headers, styles };
     let mut first_of_section: HashSet<usize> = HashSet::new();
     let mut seen = HashSet::new();
     for (i, p) in pages.iter().enumerate() {
@@ -4092,90 +4193,146 @@ fn headers_footers(ctx: &mut Ctx, pages: &mut [Page], sections: &[(usize, &Secti
         }
     }
     for (i, page) in pages.iter_mut().enumerate() {
-        let Some((_, sect)) = sections.get(page.section) else { continue };
-        // Inherit header/footer references from earlier sections (Word's "link to previous").
-        let pick = |get: fn(&SectionProps) -> HeaderSet| -> Option<u32> {
-            let set = linked(sections, page.section, get);
-            if sect.title_page && first_of_section.contains(&i) {
-                return set.first;
-            }
-            if even_odd && page.number % 2 == 0 {
-                return set.even.or(set.default);
-            }
-            set.default
-        };
-        let hid = pick(|s| s.headers);
-        let fid = pick(|s| s.footers);
-        page.hf_slot = if sect.title_page && first_of_section.contains(&i) {
-            HfSlot::First
-        } else if even_odd && page.number % 2 == 0 {
-            HfSlot::Even
-        } else {
-            HfSlot::Default
-        };
-        ctx.fields.page = page.number;
-        ctx.fields.page_format = sect.page_num_format;
-        ctx.fields.pages = total;
-        ctx.fields.section_pages = per_section.get(&page.section).copied().unwrap_or(1);
-        ctx.fields.section = page.section as u32 + 1;
-        // STYLEREF: the body paragraphs on this page.
-        ctx.fields.styleref = styles.as_ref().map(|ix| {
-            let paths = page.items.iter().filter_map(|it| match it {
-                Placed::Lines { story: StoryRef::Body, path, .. } => Some(path),
-                _ => None,
-            });
-            (ix.clone(), ix.page_at(paths, page.first_block))
-        });
-        let w = sect.text_width();
-        let x = sect.margin_left + sect.gutter;
-        if let Some(id) = hid
-            && let Some(part) = ctx.doc.parts.get(&id)
-        {
-            let blocks = part.blocks.clone();
-            let frame = PageFrame { sect, origin: (x, sect.header), number: page.number, mirror: ctx.mirror };
-            let base = defining_width(sections, page.section, |s| s.headers, hid);
-            let mut items = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, Some(frame)).items);
-            for it in &mut items {
-                it.translate(x, sect.header);
-            }
-            page.header = items;
-            page.header_story = Some(id);
-        }
-        if let Some(id) = fid
-            && let Some(part) = ctx.doc.parts.get(&id)
-        {
-            let blocks = part.blocks.clone();
-            let base = defining_width(sections, page.section, |s| s.footers, fid);
-            // The footer's height fixes where it sits, which page-relative floats need.
-            let h = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, None).height);
-            let frame = PageFrame { sect, origin: (x, sect.page_h - sect.footer - h), number: page.number, mirror: ctx.mirror };
-            let mut items = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, Some(frame)).items);
-            for it in &mut items {
-                it.translate(x, sect.page_h - sect.footer - h);
-            }
-            page.footer = items;
-            page.footer_story = Some(id);
-        }
+        hf_page(ctx, page, first_of_section.contains(&i), &plan, sections);
     }
     ctx.fields.styleref = None;
+}
+
+/// The header and footer of one page (`first` when it is the first page of its section).
+fn hf_page(ctx: &mut Ctx, page: &mut Page, first: bool, plan: &HfPlan, sections: &[(usize, &SectionProps)]) {
+    let even_odd = plan.even_odd;
+    let Some((_, sect)) = sections.get(page.section) else { return };
+    // Inherit header/footer references from earlier sections (Word's "link to previous").
+    let pick = |get: fn(&SectionProps) -> HeaderSet| -> Option<u32> {
+        let set = linked(sections, page.section, get);
+        if sect.title_page && first {
+            return set.first;
+        }
+        if even_odd && page.number.is_multiple_of(2) {
+            return set.even.or(set.default);
+        }
+        set.default
+    };
+    let hid = pick(|s| s.headers);
+    let fid = pick(|s| s.footers);
+    page.hf_slot = if sect.title_page && first {
+        HfSlot::First
+    } else if even_odd && page.number.is_multiple_of(2) {
+        HfSlot::Even
+    } else {
+        HfSlot::Default
+    };
+    ctx.fields.page = page.number;
+    ctx.fields.page_format = sect.page_num_format;
+    ctx.fields.pages = plan.total;
+    ctx.fields.section_pages = plan.totals.sections.get(page.section).copied().unwrap_or(1);
+    ctx.fields.section = page.section as u32 + 1;
+    // STYLEREF: the body paragraphs on this page.
+    ctx.fields.styleref = plan.styles.as_ref().map(|ix| {
+        let paths = page.items.iter().filter_map(|it| match it {
+            Placed::Lines { story: StoryRef::Body, path, .. } => Some(path),
+            _ => None,
+        });
+        (ix.clone(), ix.page_at(paths, page.first_block))
+    });
+    let w = sect.text_width();
+    let x = sect.margin_left + sect.gutter;
+    if let Some(id) = hid
+        && let Some(part) = ctx.doc.parts.get(&id)
+    {
+        let blocks = part.blocks.clone();
+        let frame = PageFrame { sect, origin: (x, sect.header), number: page.number, mirror: ctx.mirror };
+        let base = defining_width(sections, page.section, |s| s.headers, hid);
+        let mut items = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, Some(frame)).items);
+        for it in &mut items {
+            it.translate(x, sect.header);
+        }
+        page.header = items;
+        page.header_story = Some(id);
+    }
+    if let Some(id) = fid
+        && let Some(part) = ctx.doc.parts.get(&id)
+    {
+        let blocks = part.blocks.clone();
+        let base = defining_width(sections, page.section, |s| s.footers, fid);
+        // The footer's height fixes where it sits, which page-relative floats need.
+        let h = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, None).height);
+        let frame = PageFrame { sect, origin: (x, sect.page_h - sect.footer - h), number: page.number, mirror: ctx.mirror };
+        let mut items = with_pct_base(ctx, base, |c| layout_box(c, StoryRef::Part(id), &blocks, &[], w, BoxContext::Other, 0, Some(frame)).items);
+        for it in &mut items {
+            it.translate(x, sect.page_h - sect.footer - h);
+        }
+        page.footer = items;
+        page.footer_story = Some(id);
+    }
+}
+
+/// Hands the pages from `st.sent` up to `upto` (finished, in `pages`) to the sink, each one with its
+/// text turned, header, footer and mirrored margins done, and leaves a shell (size, number,
+/// section) where each was.
+fn send_pages(
+    upto: usize,
+    pages: &mut [Page],
+    st: &mut PageStream<'_>,
+    hctx: &mut Ctx,
+    styles: Option<&Arc<styleref::StyleIndex>>,
+    sections: &[(usize, &SectionProps)],
+) {
+    let plan = HfPlan { total: st.found.pages, totals: st.found.clone(), even_odd: hctx.doc.settings.even_odd_headers, styles: styles.cloned() };
+    let mirrored = hctx.doc.settings.mirror_margins;
+    while st.sent < upto && !st.stopped {
+        let i = st.sent;
+        let first = i == 0 || i.checked_sub(1).and_then(|k| pages.get(k)).is_none_or(|prev| prev.section != pages.get(i).map_or(0, |p| p.section));
+        let Some(slot) = pages.get_mut(i) else { break };
+        let shell = Page {
+            w: slot.w,
+            h: slot.h,
+            section: slot.section,
+            number: slot.number,
+            body: slot.body,
+            first_block: slot.first_block,
+            ..Default::default()
+        };
+        let mut page = std::mem::replace(slot, shell);
+        if let Some((_, s)) = sections.get(page.section) {
+            vertical::turn_page(&mut page, s.text_direction, s);
+        }
+        hf_page(hctx, &mut page, first, &plan, sections);
+        if mirrored {
+            mirror_page(&mut page, sections);
+        }
+        st.sent += 1;
+        if !(st.sink)(i, page) {
+            st.stopped = true;
+        }
+    }
+    hctx.fields.styleref = None;
 }
 
 /// Mirrored margins: even pages have the inside margin (and gutter) on the right, so their
 /// header, text, notes and footer move to start at the outside margin. Page borders, measured
 /// from the page edge, stay.
 fn mirror_even_pages(pages: &mut [Page], sections: &[(usize, &SectionProps)]) {
-    for page in pages.iter_mut().filter(|p| p.number % 2 == 0) {
-        let Some((_, s)) = sections.get(page.section) else { continue };
-        let dx = s.margin_right - s.margin_left - s.gutter;
-        if dx.abs() < 0.001 || !dx.is_finite() {
-            continue;
-        }
-        let borders = page_border_rules(s).len();
-        for it in page.items.iter_mut().skip(borders).chain(page.header.iter_mut()).chain(page.footer.iter_mut()) {
-            it.translate(dx, 0.0);
-        }
-        page.body.x += dx;
+    for page in pages.iter_mut() {
+        mirror_page(page, sections);
     }
+}
+
+/// [`mirror_even_pages`] for one page.
+fn mirror_page(page: &mut Page, sections: &[(usize, &SectionProps)]) {
+    if !page.number.is_multiple_of(2) {
+        return;
+    }
+    let Some((_, s)) = sections.get(page.section) else { return };
+    let dx = s.margin_right - s.margin_left - s.gutter;
+    if dx.abs() < 0.001 || !dx.is_finite() {
+        return;
+    }
+    let borders = page_border_rules(s).len();
+    for it in page.items.iter_mut().skip(borders).chain(page.header.iter_mut()).chain(page.footer.iter_mut()) {
+        it.translate(dx, 0.0);
+    }
+    page.body.x += dx;
 }
 
 /// Is an object floating (not laid out inline)?
@@ -4210,6 +4367,8 @@ mod tests_grid;
 mod tests_numeral;
 #[cfg(test)]
 mod tests_pages;
+#[cfg(test)]
+mod tests_stream;
 #[cfg(test)]
 mod tests_styleref;
 #[cfg(test)]

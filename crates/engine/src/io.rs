@@ -619,6 +619,29 @@ pub fn save_path_with(path: &std::path::Path, doc: &Document, password: Option<&
             w.flush()
         });
     }
+    // WHIQ: an ODT or RTF is written straight into the file too: the pictures kept on disk are copied
+    // from their files into it, never read back into memory. The bytes are those of `save_bytes`.
+    if password.is_none() {
+        match ext_of(&path.to_string_lossy()).as_str() {
+            "odt" => {
+                return write_file_with(&path.to_string_lossy(), &mut |f| {
+                    use std::io::Write;
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
+                    wordcraft_formats::odt::export_to(doc, &mut w).map_err(std::io::Error::other)?;
+                    w.flush()
+                });
+            }
+            "rtf" => {
+                return write_file_with(&path.to_string_lossy(), &mut |f| {
+                    use std::io::Write;
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
+                    wordcraft_formats::rtf::export_to(doc, &mut w)?;
+                    w.flush()
+                });
+            }
+            _ => {}
+        }
+    }
     let bytes = save_bytes_with(&path.to_string_lossy(), doc, password, opts)?;
     safe_save::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }

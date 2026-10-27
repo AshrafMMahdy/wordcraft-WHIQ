@@ -1381,7 +1381,7 @@ pub fn inlines_html(inlines: &[Inline]) -> String {
                 o.push_str(&format!(
                     "<img src=\"data:{};base64,{}\" alt=\"{}\" width=\"{}\" height=\"{}\">",
                     mime_of(&img.ext),
-                    base64_encode(&img.data),
+                    base64_encode(&img.bytes()),
                     esc(&img.alt),
                     (img.w / 0.75).round(),
                     (img.h / 0.75).round()

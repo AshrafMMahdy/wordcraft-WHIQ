@@ -110,7 +110,9 @@ pub fn plan(v: &Value, total: usize, current: (usize, usize)) -> Result<PrintPla
     }
     let copies = p::u64(v, "copies").unwrap_or(1).clamp(1, u64::from(MAX_COPIES)) as u32;
     let chosen = pages.len();
-    let total_out = chosen.checked_mul(copies as usize).filter(|n| *n <= MAX_PRINT_PAGES);
+    // WHIQ: one copy of any number of pages is no more than the document has; the cap is for
+    // copies, which multiply the job.
+    let total_out = chosen.checked_mul(copies as usize).filter(|n| copies == 1 || *n <= MAX_PRINT_PAGES);
     let Some(total_out) = total_out else {
         return Err(bad(format!("{chosen} pages × {copies} copies is more than the {MAX_PRINT_PAGES} pages one print job can hold")));
     };
@@ -128,6 +130,46 @@ pub fn plan(v: &Value, total: usize, current: (usize, usize)) -> Result<PrintPla
 }
 
 impl Session {
+    /// WHIQ: [`Session::print_pdf`] without ever holding the document's layout: the pages are laid
+    /// out and drawn one after the other (`wordcraft_pdf::export_streaming`). `None` when the job
+    /// cannot be done that way (Print Markup balloons, a range that depends on where the caret is,
+    /// pages out of order or twice, a document whose headers refer to the page of a bookmark…).
+    fn print_pdf_streamed(&self, v: &Value, markup: &crate::io::ExportOptions) -> Option<Result<(Vec<u8>, PrintPlan), CmdError>> {
+        if matches!(p::str(v, "range").unwrap_or("all"), "current" | "selection") {
+            return None;
+        }
+        let lo = wordcraft_layout::LayoutOptions {
+            view: wordcraft_layout::ViewMode::Print,
+            comment_balloons: markup.markup && self.prefs.markup.comments,
+            ..Default::default()
+        };
+        if !wordcraft_layout::can_stream(&self.doc, &lo) {
+            return None;
+        }
+        let total = self.page_count(markup.markup);
+        let plan = match plan(v, total, (0, 0)) {
+            Ok(plan) => plan,
+            Err(e) => return Some(Err(e)),
+        };
+        // The pages go out in the order they are laid out.
+        if plan.pages.windows(2).any(|w| w[0] >= w[1]) {
+            return None;
+        }
+        crate::whiq_progress::report(1, 3, "pdf: laying out and drawing the pages");
+        if let Err(e) = crate::whiq_progress::check("stopped before the PDF was made; no file was written") {
+            return Some(Err(e));
+        }
+        let opts = wordcraft_pdf::PdfOptions {
+            pages: Some(plan.pages.clone()),
+            tagged: plan.copies <= 1,
+            include_markup: markup.markup,
+            comments: markup.comments,
+            ..Default::default()
+        };
+        let bytes = wordcraft_pdf::export_streaming(&self.doc, &lo, &opts)?;
+        Some(bytes.map(|b| (b, plan)).map_err(|e| CmdError::Failed(e.to_string())))
+    }
+
     /// The pages the caret (or selection) is on, in the output layout: (first, last).
     pub fn current_pages(&self, lay: &DocLayout) -> (usize, usize) {
         let (a, b) = self.sel.ordered();
@@ -141,6 +183,10 @@ impl Session {
     pub fn print_pdf(&self, v: &Value) -> Result<(Vec<u8>, PrintPlan), CmdError> {
         // Print Markup (File › Print) decides whether tracked changes and comments print.
         let markup = crate::cmd::file::export_options(self, v);
+        // WHIQ: a job of whole pages in order is laid out and written a page at a time.
+        if let Some(done) = self.print_pdf_streamed(v, &markup) {
+            return done;
+        }
         let lay = self.export_layout_with(markup.markup);
         // WHIQ: the next phase, and a safe point.
         crate::whiq_progress::report(1, 3, "pdf: drawing the pages");

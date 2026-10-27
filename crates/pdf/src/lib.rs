@@ -48,8 +48,9 @@ use wordcraft_doc::{Document, Path as DocPath, Rgb, StoryRef};
 use wordcraft_fonts::FaceRef;
 use wordcraft_geom::Rect;
 use wordcraft_layout::display::{DisplayOptions, Draw, Stroke as LineStyle, page_display};
+use wordcraft_layout::hit::{PieceCaret, piece_caret};
 use wordcraft_layout::wordart::ArtPaint;
-use wordcraft_layout::{DocLayout, LayoutCache, LayoutOptions, Page, Placed, layout};
+use wordcraft_layout::{DocLayout, LayoutCache, LayoutOptions, Page, Placed, layout, layout_streaming};
 use wordcraft_metafile::{Picture, PlacedItem};
 
 /// Largest page side we write (200", the PDF limit).
@@ -104,6 +105,10 @@ impl Default for PdfOptions {
 pub fn export(doc: &Document, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     write::guard(|| {
         let lo = LayoutOptions { hide_deleted: !opts.include_markup, comment_balloons: opts.comments, ..Default::default() };
+        // WHIQ: laid out and written a page at a time when the document and the pages asked for allow.
+        if let Some(done) = export_streaming(doc, &lo, opts) {
+            return done;
+        }
         let lay = layout(doc, &mut LayoutCache::new(), &lo);
         export_layout_inner(doc, &lay, opts)
     })
@@ -112,6 +117,195 @@ pub fn export(doc: &Document, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
 /// Write an existing layout of `doc` as PDF.
 pub fn export_layout(doc: &Document, lay: &DocLayout, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     write::guard(|| export_layout_inner(doc, lay, opts))
+}
+
+/// WHIQ: lay `doc` out with `lo` and write it as PDF a page at a time: each page is drawn the moment
+/// it is final and given back, so the layout of a document of any length is held a few pages at a
+/// time ([`wordcraft_layout::layout_streaming`]). The PDF is the one [`export_layout`] writes for
+/// the same layout.
+///
+/// `None` when the document cannot be laid out this way (Print Markup balloons, a view but Print,
+/// footnotes numbered again on each page, headers that refer to the page of a bookmark) or `opts.pages`
+/// is not in increasing order (a page printed twice has to be drawn twice): the caller lays the
+/// document out whole and uses [`export_layout`].
+///
+/// The PDF itself is built by Krilla, which holds the finished pages' content (compressed) and the
+/// pictures until it writes the file; the layout, the part that grows with the text, does not stay.
+pub fn export_streaming(doc: &Document, lo: &LayoutOptions, opts: &PdfOptions) -> Option<Result<Vec<u8>, PdfError>> {
+    if !wordcraft_layout::can_stream(doc, lo) {
+        return None;
+    }
+    let chosen: Option<Vec<usize>> = match &opts.pages {
+        Some(v) if v.windows(2).any(|w| w[0] >= w[1]) => return None,
+        Some(v) => Some(v.clone()),
+        None => None,
+    };
+    if chosen.as_ref().is_some_and(|v| v.is_empty()) {
+        return Some(Err(PdfError::NoPages));
+    }
+    Some(write::guard(|| export_streaming_inner(doc, lo, opts, chosen.as_deref())))
+}
+
+fn export_streaming_inner(doc: &Document, lo: &LayoutOptions, opts: &PdfOptions, chosen: Option<&[usize]>) -> Result<Vec<u8>, PdfError> {
+    let out_of: HashMap<usize, usize> = chosen.map(|v| v.iter().enumerate().map(|(o, p)| (*p, o)).collect()).unwrap_or_default();
+    let last = chosen.and_then(|v| v.last().copied());
+    let out = |page: usize| if chosen.is_some() { out_of.get(&page).copied() } else { Some(page) };
+    // Links to a bookmark further on need to know where it is before the page they are on is drawn.
+    let survey = if has_internal_links(doc) { Some(survey(doc, lo, &out, last)) } else { None };
+    let mut outlined = HashSet::new();
+    loop {
+        match write_attempt_streaming(doc, lo, opts, chosen, &out, survey.as_ref(), &outlined)? {
+            Attempt::Done(bytes) => return Ok(bytes),
+            Attempt::BadFont(id, msg) if outlined.len() < MAX_OUTLINED_FONTS && outlined.insert(id) => {
+                log::warn!("PDF: {msg}; its text is drawn as outlines");
+            }
+            Attempt::BadFont(_, msg) => return Err(PdfError::Write(msg)),
+        }
+    }
+}
+
+/// One try at writing the PDF a page at a time.
+fn write_attempt_streaming(
+    doc: &Document,
+    lo: &LayoutOptions,
+    opts: &PdfOptions,
+    chosen: Option<&[usize]>,
+    out: &dyn Fn(usize) -> Option<usize>,
+    survey: Option<&Survey>,
+    outlined: &HashSet<u32>,
+) -> Result<Attempt, PdfError> {
+    let last = chosen.and_then(|v| v.last().copied());
+    let settings = krilla::SerializeSettings { compress_content_streams: opts.compress, enable_tagging: opts.tagged, ..Default::default() };
+    let language = doc.styles.default_chr.lang.clone().filter(|l| !l.is_empty() && l.is_ascii());
+    let mut writer = Writer::new_with_language(settings, metadata(doc, opts), language);
+    let mut ex = Exporter {
+        doc,
+        lay: None,
+        opts,
+        out_index: HashMap::new(),
+        fonts: HashMap::new(),
+        font_error: None,
+        outlined,
+        cmaps: HashMap::new(),
+        images: HashMap::new(),
+        vectors: HashMap::new(),
+        tags: Vec::new(),
+        tag_index: HashMap::new(),
+        links: Vec::new(),
+        bookmarks: std::cell::OnceCell::new(),
+        survey,
+        outline_flat: Vec::new(),
+    };
+    let mut written = 0usize;
+    let mut failed: Option<PdfError> = None;
+    let pages = {
+        let pdf = writer.document_mut();
+        let mut sink = |i: usize, page: Page| {
+            let Some(o) = out(i) else { return last.is_none_or(|l| i < l) };
+            if let Err(e) = write_page(&mut ex, pdf, &page) {
+                failed = Some(e);
+                return false;
+            }
+            let items = ex.outline_items(&page, o);
+            ex.outline_flat.extend(items);
+            written += 1;
+            // Pages after the last one wanted need not be laid out.
+            last.is_none_or(|l| i < l)
+        };
+        layout_streaming(doc, &mut LayoutCache::new(), lo, &mut sink)
+    };
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // Pages asked for that the document does not have.
+    if let (Some(v), Some(n)) = (chosen, pages)
+        && let Some(bad) = v.iter().find(|p| **p >= n)
+    {
+        return Err(PdfError::BadPage(bad.saturating_add(1)));
+    }
+    if written == 0 {
+        return Err(PdfError::NoPages);
+    }
+    if let Some(o) = build_outline(&std::mem::take(&mut ex.outline_flat)) {
+        writer.document_mut().set_outline(o);
+    }
+    finish_attempt(writer, ex, opts)
+}
+
+/// Where the bookmarks are in output pages, found before the pages are drawn.
+#[derive(Default)]
+struct Survey {
+    bookmarks: HashMap<String, (usize, f32, f32)>,
+}
+
+/// Does any text link to a bookmark of the document (`#name`)?
+fn has_internal_links(doc: &Document) -> bool {
+    if doc.bookmarks().is_empty() {
+        return false;
+    }
+    let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(doc.parts.keys().map(|id| StoryRef::Part(*id))).collect();
+    stories.into_iter().any(|story| {
+        doc.para_paths(story)
+            .iter()
+            .filter_map(|path| doc.para(story, path))
+            .any(|p| p.runs.iter().any(|r| r.props.link.as_deref().is_some_and(|l| l.starts_with('#'))))
+    })
+}
+
+/// The positions [`Exporter::bookmark`] works out from a whole layout, worked out as the pages go by
+/// (and given back): the page and line each bookmark starts on, else the first exported page that
+/// shows its paragraph.
+fn survey(doc: &Document, lo: &LayoutOptions, out: &dyn Fn(usize) -> Option<usize>, last: Option<usize>) -> Survey {
+    let mut first: HashMap<String, wordcraft_doc::Pos> = HashMap::new();
+    for (n, pos) in doc.bookmarks() {
+        first.entry(n).or_insert(pos);
+    }
+    // Per paragraph: its bookmarks (name, offset) not yet found on a line, where each was found
+    // (page, left edge of the paragraph's first piece on that page, top of the line), and the
+    // first exported piece (the fallback).
+    let mut wanted: HashMap<DocPath, Vec<(String, usize)>> = HashMap::new();
+    for (n, pos) in &first {
+        wanted.entry(pos.path.clone()).or_default().push((n.clone(), pos.off));
+    }
+    let mut found: HashMap<String, (usize, f32, f32)> = HashMap::new();
+    let mut fallback: HashMap<DocPath, (usize, f32, f32)> = HashMap::new();
+    let mut edge: HashMap<DocPath, (usize, f32)> = HashMap::new();
+    let mut sink = |i: usize, page: Page| {
+        for it in &page.items {
+            let Placed::Lines { story: StoryRef::Body, path, x, y, .. } = it else { continue };
+            let Some(marks) = wanted.get_mut(path) else { continue };
+            let left = match edge.get(path) {
+                Some((p, ex)) if *p == i => *ex,
+                _ => {
+                    edge.insert(path.clone(), (i, *x));
+                    *x
+                }
+            };
+            if let Some(o) = out(i) {
+                let (px, py) = Fit::of(&page).point(*x, *y);
+                fallback.entry(path.clone()).or_insert((o, px, py));
+            }
+            marks.retain(|(name, off)| match piece_caret(i, it, *off) {
+                PieceCaret::Skip => true,
+                PieceCaret::Fail => false,
+                PieceCaret::At(c) => {
+                    if let Some(o) = out(i) {
+                        found.insert(name.clone(), (o, left, c.top));
+                    }
+                    false
+                }
+            });
+        }
+        last.is_none_or(|l| i < l)
+    };
+    layout_streaming(doc, &mut LayoutCache::new(), lo, &mut sink);
+    let mut bookmarks = HashMap::new();
+    for (name, pos) in &first {
+        if let Some(at) = found.get(name).or_else(|| fallback.get(&pos.path)) {
+            bookmarks.insert(name.clone(), *at);
+        }
+    }
+    Survey { bookmarks }
 }
 
 fn export_layout_inner(doc: &Document, lay: &DocLayout, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
@@ -159,7 +353,7 @@ fn write_attempt(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[us
 
     let mut ex = Exporter {
         doc,
-        lay,
+        lay: Some(lay),
         opts,
         out_index: pages.iter().enumerate().map(|(o, p)| (*p, o)).collect(),
         fonts: HashMap::new(),
@@ -172,36 +366,50 @@ fn write_attempt(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[us
         tag_index: HashMap::new(),
         links: Vec::new(),
         bookmarks: std::cell::OnceCell::new(),
+        survey: None,
+        outline_flat: Vec::new(),
     };
     if let Some(o) = ex.outline(pages) {
         pdf.set_outline(o);
     }
     for &pi in pages {
         let Some(page) = lay.pages.get(pi) else { return Err(PdfError::BadPage(pi.saturating_add(1))) };
-        let fit = Fit::of(page);
-        let (w, h) = (clamp_side(fit.paper_w), clamp_side(page.h));
-        let size = Size::from_wh(w, h).ok_or(PdfError::NoPages)?;
-        let mut kp = pdf.start_page_with(PageSettings::new(size));
-        let mut s = kp.surface();
-        ex.links.clear();
-        // A page with a markup area is scaled down to fit its paper with the area beside it.
-        let scaled = fit.k < 1.0;
-        if scaled {
-            s.push_transform(&Transform::from_row(fit.k, 0.0, 0.0, fit.k, 0.0, fit.dy));
-        }
-        // `w` is the document page's width: the page colour and watermark stay off the markup area.
-        ex.page(&mut s, page, w, h);
-        if scaled {
-            s.pop();
-        }
-        s.finish();
-        for a in ex.annotations(fit) {
-            kp.add_annotation(a);
-        }
-        kp.finish();
+        write_page(&mut ex, pdf, page)?;
     }
+    finish_attempt(writer, ex, opts)
+}
+
+/// Draws `page` as the next page of the PDF.
+fn write_page(ex: &mut Exporter<'_>, pdf: &mut krilla::Document, page: &Page) -> Result<(), PdfError> {
+    let fit = Fit::of(page);
+    let (w, h) = (clamp_side(fit.paper_w), clamp_side(page.h));
+    let size = Size::from_wh(w, h).ok_or(PdfError::NoPages)?;
+    let mut kp = pdf.start_page_with(PageSettings::new(size));
+    let mut s = kp.surface();
+    ex.links.clear();
+    // A page with a markup area is scaled down to fit its paper with the area beside it.
+    let scaled = fit.k < 1.0;
+    if scaled {
+        s.push_transform(&Transform::from_row(fit.k, 0.0, 0.0, fit.k, 0.0, fit.dy));
+    }
+    // `w` is the document page's width: the page colour and watermark stay off the markup area.
+    ex.page(&mut s, page, w, h);
+    if scaled {
+        s.pop();
+    }
+    s.finish();
+    for a in ex.annotations(fit) {
+        kp.add_annotation(a);
+    }
+    kp.finish();
+    Ok(())
+}
+
+/// The tag tree, the document and its fonts: what comes after the last page.
+fn finish_attempt(writer: Writer, mut ex: Exporter<'_>, opts: &PdfOptions) -> Result<Attempt, PdfError> {
+    let mut writer = writer;
     if opts.tagged {
-        pdf.set_tag_tree(ex.tag_tree());
+        writer.document_mut().set_tag_tree(ex.tag_tree());
     }
     if let Some(error) = ex.font_error {
         return Err(error);
@@ -645,7 +853,8 @@ struct TagEntry {
 
 struct Exporter<'a> {
     doc: &'a Document,
-    lay: &'a DocLayout,
+    /// The whole layout (an export of a layout that exists); a streamed export has none.
+    lay: Option<&'a DocLayout>,
     opts: &'a PdfOptions,
     /// Layout page index → output page index.
     out_index: HashMap<usize, usize>,
@@ -666,7 +875,15 @@ struct Exporter<'a> {
     /// link up by walking the whole document made a long document with a linked table of contents
     /// take seconds to export.
     bookmarks: std::cell::OnceCell<HashMap<String, wordcraft_doc::Pos>>,
+    /// Where the bookmarks are, found before the pages are drawn (a streamed export, whose pages
+    /// are gone once drawn).
+    survey: Option<&'a Survey>,
+    /// The outline entries of the pages drawn so far (a streamed export).
+    outline_flat: Vec<OutlineEntry>,
 }
+
+/// A heading for the outline: level, title, output page and position.
+type OutlineEntry = (u8, String, usize, f32, f32);
 
 /// What the content being drawn is, for tagging.
 #[derive(Clone, Copy, PartialEq)]
@@ -1414,6 +1631,10 @@ impl Exporter<'_> {
     /// Where a bookmark is: (output page, x, y) — the page and line its start lands on, which
     /// in a paragraph split across pages need not be the paragraph's first page.
     fn bookmark(&self, name: &str) -> Option<(usize, f32, f32)> {
+        if let Some(sv) = self.survey {
+            return sv.bookmarks.get(name).copied();
+        }
+        let lay = self.lay?;
         let marks = self.bookmarks.get_or_init(|| {
             let mut m = HashMap::new();
             for (n, pos) in self.doc.bookmarks() {
@@ -1422,18 +1643,17 @@ impl Exporter<'_> {
             m
         });
         let pos = marks.get(name)?.clone();
-        if let Some(c) = self.lay.caret(&pos)
+        if let Some(c) = lay.caret(&pos)
             && let Some(out) = self.out_index.get(&c.page)
         {
             // The left edge of the paragraph's piece on that page, at the top of the line.
-            let x = self
-                .lay
+            let x = lay
                 .index
                 .get(&(pos.story, pos.path.clone()))
                 .into_iter()
                 .flatten()
                 .filter(|(pi, _)| *pi == c.page)
-                .find_map(|(pi, ii)| match self.lay.pages.get(*pi).and_then(|p| p.items.get(*ii)) {
+                .find_map(|(pi, ii)| match lay.pages.get(*pi).and_then(|p| p.items.get(*ii)) {
                     Some(Placed::Lines { x, .. }) => Some(*x),
                     _ => None,
                 })
@@ -1445,10 +1665,11 @@ impl Exporter<'_> {
 
     /// The first output page showing a paragraph, with the top of its first line.
     fn locate(&self, story: StoryRef, path: &DocPath) -> Option<(usize, f32, f32)> {
-        let places = self.lay.index.get(&(story, path.clone()))?;
+        let lay = self.lay?;
+        let places = lay.index.get(&(story, path.clone()))?;
         for (pi, ii) in places {
             let Some(out) = self.out_index.get(pi) else { continue };
-            let Some(page) = self.lay.pages.get(*pi) else { continue };
+            let Some(page) = lay.pages.get(*pi) else { continue };
             let (x, y) = match page.items.get(*ii) {
                 Some(Placed::Lines { x, y, .. }) => Fit::of(page).point(*x, *y),
                 _ => (0.0, 0.0),
@@ -1482,54 +1703,30 @@ impl Exporter<'_> {
 
     /// The outline from body headings (outline levels 1–9) on the exported pages.
     fn outline(&self, pages: &[usize]) -> Option<Outline> {
-        let mut flat: Vec<(u8, String, usize, f32, f32)> = Vec::new();
+        let lay = self.lay?;
+        let mut flat: Vec<OutlineEntry> = Vec::new();
         for (out, pi) in pages.iter().enumerate() {
-            let Some(page) = self.lay.pages.get(*pi) else { continue };
-            for it in &page.items {
-                let Placed::Lines { story: StoryRef::Body, path, para, l0: 0, x, y, .. } = it else { continue };
-                let Some(p) = self.doc.para(StoryRef::Body, path) else { continue };
-                let Some(level) = self.doc.styles.resolve_para(&p.props).outline_level else { continue };
-                let title: String = self.title_text(p, para).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-                if title.is_empty() {
-                    continue;
-                }
-                let (x, y) = Fit::of(page).point(*x, *y);
-                flat.push((level.min(8), title, out, x, y));
-            }
+            let Some(page) = lay.pages.get(*pi) else { continue };
+            flat.extend(self.outline_items(page, out));
         }
-        if flat.is_empty() {
-            return None;
-        }
-        fn build(flat: &[(u8, String, usize, f32, f32)], i: &mut usize, level: u8) -> Vec<OutlineNode> {
-            let mut out = Vec::new();
-            while let Some((l, title, page, x, y)) = flat.get(*i) {
-                if *l < level {
-                    break;
-                }
-                *i += 1;
-                let mut node = OutlineNode::new(title.clone(), XyzDestination::new(*page, Point::from_xy(*x, *y)));
-                // Children: following entries with a deeper level.
-                if flat.get(*i).is_some_and(|n| n.0 > *l) {
-                    for c in build(flat, i, l + 1) {
-                        node.push_child(c);
-                    }
-                }
-                out.push(node);
+        build_outline(&flat)
+    }
+
+    /// The headings on one page, as outline entries of output page `out`.
+    fn outline_items(&self, page: &Page, out: usize) -> Vec<OutlineEntry> {
+        let mut flat = Vec::new();
+        for it in &page.items {
+            let Placed::Lines { story: StoryRef::Body, path, para, l0: 0, x, y, .. } = it else { continue };
+            let Some(p) = self.doc.para(StoryRef::Body, path) else { continue };
+            let Some(level) = self.doc.styles.resolve_para(&p.props).outline_level else { continue };
+            let title: String = self.title_text(p, para).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
+            if title.is_empty() {
+                continue;
             }
-            out
+            let (x, y) = Fit::of(page).point(*x, *y);
+            flat.push((level.min(8), title, out, x, y));
         }
-        let mut o = Outline::new();
-        let mut i = 0;
-        while i < flat.len() {
-            let before = i;
-            for n in build(&flat, &mut i, 0) {
-                o.push_child(n);
-            }
-            if i == before {
-                i += 1;
-            }
-        }
-        Some(o)
+        flat
     }
 
     fn watermark(&mut self, s: &mut Surface, wm: &wordcraft_doc::Watermark, w: f32, h: f32) {
@@ -1593,6 +1790,43 @@ impl Exporter<'_> {
         s.set_fill(None);
         s.pop();
     }
+}
+
+/// The outline tree of headings in document order.
+fn build_outline(flat: &[OutlineEntry]) -> Option<Outline> {
+    if flat.is_empty() {
+        return None;
+    }
+    fn build(flat: &[OutlineEntry], i: &mut usize, level: u8) -> Vec<OutlineNode> {
+        let mut out = Vec::new();
+        while let Some((l, title, page, x, y)) = flat.get(*i) {
+            if *l < level {
+                break;
+            }
+            *i += 1;
+            let mut node = OutlineNode::new(title.clone(), XyzDestination::new(*page, Point::from_xy(*x, *y)));
+            // Children: following entries with a deeper level.
+            if flat.get(*i).is_some_and(|n| n.0 > *l) {
+                for c in build(flat, i, l + 1) {
+                    node.push_child(c);
+                }
+            }
+            out.push(node);
+        }
+        out
+    }
+    let mut o = Outline::new();
+    let mut i = 0;
+    while i < flat.len() {
+        let before = i;
+        for n in build(flat, &mut i, 0) {
+            o.push_child(n);
+        }
+        if i == before {
+            i += 1;
+        }
+    }
+    Some(o)
 }
 
 /// A metafile picture, parsed once. The geometry comes placed by the metafile crate; the bitmaps are

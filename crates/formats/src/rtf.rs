@@ -91,6 +91,9 @@ struct Writer {
     lists: Vec<[bool; 9]>,
     /// Authors of tracked changes (`\revtbl` entries after "Unknown"), when the text has any.
     authors: Option<Vec<String>>,
+    /// Pictures kept on disk: their data is left out of the text, at a marker (`\u{1}n\u{2}`, which
+    /// no escaped text can hold) and streamed in when the text is written.
+    disk: Vec<wordcraft_doc::media::Picture>,
 }
 
 const HEAD_SIZES: [f32; 6] = [20.0, 16.0, 14.0, 12.0, 12.0, 11.0];
@@ -185,6 +188,30 @@ impl Writer {
     }
 
     fn picture(&mut self, img: &model::Img, out: &mut String) {
+        if let Some(d) = &img.disk
+            && let blip @ ("\\pngblip" | "\\jpegblip") = if img.ext == "png" {
+                "\\pngblip"
+            } else if matches!(img.ext.as_str(), "jpeg" | "jpg") {
+                "\\jpegblip"
+            } else {
+                ""
+            }
+        {
+            // Dimensions from the header, the data left on disk.
+            let (pw, ph) = d.open().ok().and_then(|r| model::image_px_from(std::io::BufReader::new(r))).unwrap_or((1, 1));
+            out.push_str(&format!(
+                "{{\\pict{blip}\\picw{pw}\\pich{ph}\\picwgoal{}\\pichgoal{}\n",
+                (img.w * 20.0).round() as i64,
+                (img.h * 20.0).round() as i64
+            ));
+            out.push('\u{1}');
+            out.push_str(&self.disk.len().to_string());
+            out.push('\u{2}');
+            out.push('}');
+            self.disk.push(d.clone());
+            return;
+        }
+        let img = &model::Img { data: img.bytes(), disk: None, ..img.clone() };
         let (data, blip) = match img.ext.as_str() {
             "png" => (img.data.to_vec(), "\\pngblip"),
             "jpeg" | "jpg" => (img.data.to_vec(), "\\jpegblip"),
@@ -487,12 +514,63 @@ pub fn iso_to_dttm(s: &str) -> Option<u32> {
 
 /// RTF text of a document.
 pub fn export(doc: &Document) -> String {
+    let mut out = Vec::new();
+    // Writing into memory cannot fail.
+    let _ = export_to(doc, &mut out);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// WHIQ: the RTF text of a document written into `w`: the pictures kept on disk are read a piece at
+/// a time into the text, never held whole. The text is that of [`export`].
+pub fn export_to(doc: &Document, w: &mut dyn std::io::Write) -> std::io::Result<()> {
     let flow = model::from_doc_tracked(doc);
     let base_font = doc.styles.default_chr.font.clone().unwrap_or_else(|| wordcraft_doc::styles::BODY_FONT.to_string());
-    let mut w = Writer { t: Tables { fonts: vec![base_font], colors: Vec::new() }, lists: Vec::new(), authors: None };
+    let mut wr = Writer { t: Tables { fonts: vec![base_font], colors: Vec::new() }, lists: Vec::new(), authors: None, disk: Vec::new() };
     let mut body = String::new();
-    w.blocks(&flow.blocks, false, "\\par", &mut body, 0);
-    export_with(&flow.meta, &w, &body, &doc.last_section)
+    wr.blocks(&flow.blocks, false, "\\par", &mut body, 0);
+    let text = export_with(&flow.meta, &wr, &body, &doc.last_section);
+    // Each marker is the picture's data: 64 bytes a line, in hex.
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find('\u{1}') {
+        w.write_all(rest.get(..at).unwrap_or_default().as_bytes())?;
+        let after = rest.get(at + 1..).unwrap_or_default();
+        let end = after.find('\u{2}').unwrap_or(after.len());
+        let pic = after.get(..end).and_then(|n| n.parse::<usize>().ok()).and_then(|n| wr.disk.get(n));
+        if let Some(pic) = pic {
+            write_hex(pic, w)?;
+        }
+        rest = after.get(end + 1..).unwrap_or_default();
+    }
+    w.write_all(rest.as_bytes())
+}
+
+/// A picture's bytes as RTF hex lines of 64 bytes.
+fn write_hex(pic: &wordcraft_doc::media::Picture, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut r = std::io::BufReader::new(pic.open()?);
+    let mut buf = [0u8; 64];
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            let k = r.read(buf.get_mut(n..).unwrap_or_default())?;
+            if k == 0 {
+                break;
+            }
+            n += k;
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let mut line = String::with_capacity(n * 2 + 1);
+        for b in buf.get(..n).unwrap_or_default() {
+            line.push_str(&format!("{b:02x}"));
+        }
+        line.push('\n');
+        w.write_all(line.as_bytes())?;
+        if n < buf.len() {
+            return Ok(());
+        }
+    }
 }
 
 fn export_with(m: &Meta, w: &Writer, body: &str, sec: &wordcraft_doc::SectionProps) -> String {

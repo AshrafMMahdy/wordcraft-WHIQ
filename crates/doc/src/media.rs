@@ -192,6 +192,81 @@ impl Blob {
     }
 }
 
+/// What a reader of a picture must be: bytes it can read and seek in.
+pub trait ReadSeek: Read + std::io::Seek {}
+impl<T: Read + std::io::Seek> ReadSeek for T {}
+
+/// One picture of a document, wherever it is kept: its bytes are not read until they are asked for,
+/// and a picture on disk can be copied out ([`Picture::copy_to`]) or read from ([`Picture::open`]) a
+/// piece at a time, so an export writes any number of pictures holding none whole.
+#[derive(Clone)]
+pub struct Picture {
+    blob: Blob,
+}
+
+impl Picture {
+    pub fn len(&self) -> u64 {
+        self.blob.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Is it kept on disk?
+    pub fn is_spilled(&self) -> bool {
+        matches!(self.blob, Blob::Disk(_))
+    }
+
+    /// The first `n` bytes (format sniffing).
+    pub fn head(&self, n: usize) -> Vec<u8> {
+        match &self.blob {
+            Blob::Mem(b) => b.get(..n.min(b.len())).unwrap_or_default().to_vec(),
+            Blob::Disk(f) => f.head(n),
+        }
+    }
+
+    /// Stream the bytes into `w`; returns the bytes copied.
+    pub fn copy_to(&self, w: &mut dyn Write) -> std::io::Result<u64> {
+        match &self.blob {
+            Blob::Mem(b) => {
+                w.write_all(b)?;
+                Ok(b.len() as u64)
+            }
+            Blob::Disk(f) => f.copy_to(w),
+        }
+    }
+
+    /// A reader on the bytes (a file on disk is read as it goes, not into memory).
+    pub fn open(&self) -> std::io::Result<Box<dyn ReadSeek + '_>> {
+        match &self.blob {
+            Blob::Mem(b) => Ok(Box::new(std::io::Cursor::new(b.as_slice()))),
+            Blob::Disk(f) => Ok(Box::new(std::io::BufReader::new(std::fs::File::open(f.path())?))),
+        }
+    }
+
+    /// The whole picture in memory (read back from disk when it is kept there).
+    pub fn bytes(&self) -> Arc<Vec<u8>> {
+        self.blob.load()
+    }
+}
+
+impl fmt::Debug for Picture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Picture({} bytes{})", self.len(), if self.is_spilled() { ", on disk" } else { "" })
+    }
+}
+
+impl PartialEq for Picture {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.blob, &other.blob) {
+            (Blob::Mem(x), Blob::Mem(y)) => Arc::ptr_eq(x, y) || x == y,
+            (Blob::Disk(x), Blob::Disk(y)) if Arc::ptr_eq(x, y) => true,
+            (a, b) => a.len() == b.len() && a.load() == b.load(),
+        }
+    }
+}
+
 /// A handle on one picture that tells whether it is still the same one: caches of decoded
 /// pictures key on it. It keeps the picture's allocation (or spill file) alive, so its identity
 /// cannot be reused while a cache holds it.
@@ -260,6 +335,11 @@ impl MediaMap {
     /// the caller drops them after drawing or encoding it).
     pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
         self.items.get(key).map(Blob::load)
+    }
+
+    /// The picture itself, for reading it a piece at a time (see [`Picture`]), without reading it.
+    pub fn picture(&self, key: &str) -> Option<Picture> {
+        self.items.get(key).map(|b| Picture { blob: b.clone() })
     }
 
     /// A handle that identifies this picture as it is now (see [`Pin`]), without reading it.

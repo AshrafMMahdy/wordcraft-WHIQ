@@ -1009,7 +1009,7 @@ fn bookmark_destination_is_the_page_of_its_start() {
     let outlined = HashSet::new();
     let ex = Exporter {
         doc: &d,
-        lay: &lay,
+        lay: Some(&lay),
         opts: &PdfOptions::default(),
         out_index: pages.iter().enumerate().map(|(o, p)| (*p, o)).collect(),
         fonts: HashMap::new(),
@@ -1022,6 +1022,8 @@ fn bookmark_destination_is_the_page_of_its_start() {
         tag_index: HashMap::new(),
         links: Vec::new(),
         bookmarks: std::cell::OnceCell::new(),
+        survey: None,
+        outline_flat: Vec::new(),
     };
     let (page, x, y) = ex.bookmark("target").unwrap();
     assert_eq!(page, 1, "the bookmark is on the second page");
@@ -1504,4 +1506,83 @@ fn bundled_unicode_glyphs_are_visible_and_extractable() {
     let bytes = export_layout(&d, &lay, &PdfOptions::default()).unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("/ToUnicode"));
     assert_eq!(squash(&extract_text(&bytes).concat()), TEXT);
+}
+
+// ---- WHIQ: a PDF written a page at a time is the PDF of the whole layout.
+
+fn long_with_links(paras: usize) -> Document {
+    let mut d = Document::new();
+    d.core.title = "Long".into();
+    d.core.created = "2024-05-06T07:08:09Z".into();
+    let mut b = Vec::new();
+    for i in 0..paras {
+        if i % 40 == 0 {
+            let mut h =
+                Paragraph::with_text(&format!("Chapter {}", i / 40), CharProps::default()).styled(if i % 80 == 0 { "Heading1" } else { "Heading2" });
+            let n = h.len();
+            h.insert_object(n, InlineObject::BookmarkStart { name: format!("ch{}", i / 40) }, &CharProps::default()).unwrap();
+            b.push(para_block(h));
+        }
+        let mut p = Paragraph::with_text(
+            &format!("Clause {i}. The contractor shall provide all labour, materials and plant for the works. "),
+            CharProps::default(),
+        );
+        if i % 25 == 0 {
+            // A link ahead (to a chapter far on) and one back.
+            let target = format!("#ch{}", (i / 40 + 3).min(paras / 40));
+            let n = p.len();
+            p.insert_text(n, "see ahead", &CharProps { link: Some(target), ..Default::default() }).unwrap();
+            let n = p.len();
+            p.insert_text(n, " or back", &CharProps { link: Some("#ch0".into()), ..Default::default() }).unwrap();
+        }
+        b.push(para_block(p));
+    }
+    d.body = b;
+    d
+}
+
+fn classic_and_streamed(d: &Document, opts: &PdfOptions) -> (Vec<u8>, Vec<u8>) {
+    let lo = LayoutOptions { hide_deleted: !opts.include_markup, comment_balloons: opts.comments, ..Default::default() };
+    let lay = layout(d, &mut LayoutCache::new(), &lo);
+    let classic = export_layout(d, &lay, opts).unwrap();
+    let streamed = export_streaming(d, &lo, opts).expect("streams").unwrap();
+    (classic, streamed)
+}
+
+#[test]
+fn a_streamed_pdf_is_the_pdf_of_the_whole_layout() {
+    let d = long_with_links(900);
+    let (a, b) = classic_and_streamed(&d, &PdfOptions::default());
+    assert!(a.len() > 10_000);
+    assert!(a == b, "streamed {} bytes, whole {} bytes", b.len(), a.len());
+    // Untagged, uncompressed.
+    let (a, b) = classic_and_streamed(&d, &PdfOptions { tagged: false, compress: false, ..Default::default() });
+    assert!(a == b);
+}
+
+#[test]
+fn the_sample_document_streams_the_same() {
+    let (a, b) = classic_and_streamed(&sample(), &PdfOptions::default());
+    assert!(a == b);
+}
+
+#[test]
+fn a_range_of_pages_streams_the_same_and_pages_out_of_order_do_not_stream() {
+    let d = long_with_links(900);
+    let lo = LayoutOptions::default();
+    let n = layout(&d, &mut LayoutCache::new(), &lo).pages.len();
+    assert!(n > 12, "{n}");
+    for pages in [vec![3, 4, 5, 9], vec![0], vec![n - 1], (0..n).step_by(2).collect::<Vec<_>>()] {
+        let opts = PdfOptions { pages: Some(pages.clone()), ..Default::default() };
+        let (a, b) = classic_and_streamed(&d, &opts);
+        assert!(a == b, "{pages:?}");
+    }
+    let twice = PdfOptions { pages: Some(vec![2, 2]), ..Default::default() };
+    assert!(export_streaming(&d, &lo, &twice).is_none(), "a page printed twice is drawn twice: not streamed");
+    let back = PdfOptions { pages: Some(vec![4, 1]), ..Default::default() };
+    assert!(export_streaming(&d, &lo, &back).is_none());
+    let past = PdfOptions { pages: Some(vec![1, n]), ..Default::default() };
+    assert_eq!(export_streaming(&d, &lo, &past).unwrap().unwrap_err(), PdfError::BadPage(n + 1));
+    let none = PdfOptions { pages: Some(vec![]), ..Default::default() };
+    assert_eq!(export_streaming(&d, &lo, &none).unwrap().unwrap_err(), PdfError::NoPages);
 }

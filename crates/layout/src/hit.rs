@@ -264,6 +264,34 @@ fn band_dist(v: f32, top: f32, h: f32) -> f32 {
     }
 }
 
+/// Where a position is in one piece of its paragraph (see [`piece_caret`]).
+pub enum PieceCaret {
+    /// The offset is not in the lines this piece shows.
+    Skip,
+    /// The piece shows it but its lines cannot say where.
+    Fail,
+    At(Caret),
+}
+
+/// WHIQ: [`DocLayout::caret`] for one piece (`it`, on page `pi`) of the paragraph, so a position
+/// can be found while pages go by, without the whole layout.
+pub fn piece_caret(pi: usize, it: &Placed, off: usize) -> PieceCaret {
+    let Placed::Lines { para, l0, l1, x, y, turn, .. } = it else { return PieceCaret::Skip };
+    let li = para.line_of(off);
+    if li < *l0 || li >= *l1 {
+        return PieceCaret::Skip;
+    }
+    let (Some(first), Some(l), Some(cx)) = (para.lines.get(*l0), para.lines.get(li), para.x_of(li, off)) else { return PieceCaret::Fail };
+    // In the lines' own frame (turned text turns it onto the page).
+    let top = l.top - first.top;
+    // Caret spans the text height (ascent + descent), not the full line spacing.
+    let (asc, desc) = para.caret_metrics(li);
+    let base = top + (l.baseline - l.top);
+    let ctop = (base - asc).max(top);
+    let r = crate::turn_rect(*turn, *x, *y, Rect::new(cx, ctop, 0.0, (base + desc - ctop).max(4.0)));
+    PieceCaret::At(Caret { page: pi, x: r.x, top: r.y, height: r.h, width: r.w })
+}
+
 impl DocLayout {
     /// The position nearest to (x, y) on `page`, in `story`.
     pub fn hit(&self, page: usize, x: f32, y: f32, story: StoryRef) -> Option<Pos> {
@@ -439,22 +467,11 @@ impl DocLayout {
 
     pub fn caret_on(&self, pos: &Pos, page_hint: usize) -> Option<Caret> {
         for (pi, it) in self.pieces(pos.story, &pos.path, page_hint) {
-            let Placed::Lines { para, l0, l1, x, y, turn, .. } = it else { continue };
-            let li = para.line_of(pos.off);
-            if li < *l0 || li >= *l1 {
-                continue;
+            match piece_caret(pi, it, pos.off) {
+                PieceCaret::Skip => continue,
+                PieceCaret::Fail => return None,
+                PieceCaret::At(c) => return Some(c),
             }
-            let first = para.lines.get(*l0)?;
-            let l = para.lines.get(li)?;
-            let cx = para.x_of(li, pos.off)?;
-            // In the lines' own frame (turned text turns it onto the page).
-            let top = l.top - first.top;
-            // Caret spans the text height (ascent + descent), not the full line spacing.
-            let (asc, desc) = para.caret_metrics(li);
-            let base = top + (l.baseline - l.top);
-            let ctop = (base - asc).max(top);
-            let r = crate::turn_rect(*turn, *x, *y, Rect::new(cx, ctop, 0.0, (base + desc - ctop).max(4.0)));
-            return Some(Caret { page: pi, x: r.x, top: r.y, height: r.h, width: r.w });
         }
         None
     }

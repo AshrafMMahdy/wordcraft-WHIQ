@@ -90,7 +90,7 @@ struct Writer {
     tables: Vec<Vec<f32>>,
     /// Cell styles by shading.
     cell_styles: Vec<Option<Rgb>>,
-    pictures: Vec<(String, std::sync::Arc<Vec<u8>>, String)>,
+    pictures: Vec<(String, PictureData, String)>,
     /// `text:changed-region` elements written so far.
     regions: Vec<String>,
     /// The insertion open in the body, and its region id.
@@ -199,7 +199,11 @@ impl Writer {
     fn picture(&mut self, img: &model::Img) -> String {
         let ext = if img.ext == "jpeg" { "jpg".to_string() } else { img.ext.clone() };
         let name = format!("Pictures/image{}.{}", self.pictures.len() + 1, ext);
-        self.pictures.push((name.clone(), img.data.clone(), mime_of(&img.ext).to_string()));
+        let data = match &img.disk {
+            Some(d) => PictureData::Disk(d.clone()),
+            None => PictureData::Mem(img.data.clone()),
+        };
+        self.pictures.push((name.clone(), data, mime_of(&img.ext).to_string()));
         name
     }
 
@@ -815,8 +819,23 @@ fn meta_xml(m: &Meta) -> String {
     s
 }
 
+/// The bytes of a picture to be written into the package: in memory, or kept on disk and copied
+/// across a piece at a time.
+enum PictureData {
+    Mem(std::sync::Arc<Vec<u8>>),
+    Disk(wordcraft_doc::media::Picture),
+}
+
 /// Write an `.odt` package.
 pub fn export(doc: &Document) -> Result<Vec<u8>, String> {
+    let mut cur = Cursor::new(Vec::new());
+    export_to(doc, &mut cur)?;
+    Ok(cur.into_inner())
+}
+
+/// WHIQ: write an `.odt` package into `out` (a file): the pictures kept on disk are copied from their
+/// files into the package, never held. The bytes are those of [`export`].
+pub fn export_to<W: Write + std::io::Seek>(doc: &Document, out: W) -> Result<(), String> {
     let flow = model::from_doc_tracked(doc);
     let mut w = Writer::default();
     let mut body = String::new();
@@ -844,7 +863,7 @@ pub fn export(doc: &Document) -> Result<Vec<u8>, String> {
 
     let err = |e: zip::result::ZipError| format!("ODT: {e}");
     let ioerr = |e: std::io::Error| format!("ODT: {e}");
-    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut z = zip::ZipWriter::new(out);
     let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     z.start_file("mimetype", stored).map_err(err)?;
@@ -860,10 +879,15 @@ pub fn export(doc: &Document) -> Result<Vec<u8>, String> {
     }
     for (name, data, _) in &w.pictures {
         z.start_file(name.as_str(), stored).map_err(err)?;
-        z.write_all(data).map_err(ioerr)?;
+        match data {
+            PictureData::Mem(b) => z.write_all(b).map_err(ioerr)?,
+            PictureData::Disk(d) => {
+                d.copy_to(&mut z).map_err(ioerr)?;
+            }
+        }
     }
-    let cur = z.finish().map_err(err)?;
-    Ok(cur.into_inner())
+    z.finish().map_err(err)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------

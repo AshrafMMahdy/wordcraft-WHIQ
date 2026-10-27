@@ -293,7 +293,7 @@ The owner's rule: no tool is limited by file size. Measured over MCP stdio with 
 |---|---|---|
 | `inspect_document` | 975 MB, then the document is evicted | 114 MB, stays open |
 | `render_page` page 900 | 1,826 MB, then evicted | 111 MB (pagination stops after the page) |
-| `export_pdf` (1,343 pages) | (evicted before it) | 980 MB transient, 105 MB after; stays open |
+| `export_pdf` (1,343 pages) | (evicted before it) | 980 MB transient, 105 MB after; stays open (F7, below: laid out and written a page at a time) |
 | inspect past block 2,000 | unreachable (the engine answered the first 2,000 blocks, in silence) | every block, by `continue_from` |
 | 60 pictures, 119 MB `.docx` (`--max-memory-mb 400`, debug build): open / `save_document` / `render_page` | (not re-measured on this file: the pictures and the whole package were held in memory) | 71 / 72 / 179 MB; 65 MB of pictures in spill files; the saved file holds all 60 pictures byte for byte |
 
@@ -309,11 +309,19 @@ The owner's rule: no tool is limited by file size. Measured over MCP stdio with 
 | `--max-memory-mb` sets the readers' budget (`wordcraft_doc::memory::set_budget`). | `apps/wordcraft-cli/src/main.rs` | — |
 | **Pictures past their share live on disk** (F6). A document keeps its pictures in memory up to an eighth of the memory budget (at least 32 MiB); the next ones (from 256 KB) are inflated straight from the zip into spill files (`WORDCRAFT_SPILL_DIR`, else `wordcraft-spill` in the temp folder) and read back one at a time only when drawn, decoded, exported or crop-edited (`MediaMap`: `get`, `byte_len`, `head`, `pin`, `copy_to`; the decoded-picture cache keys on the picture's identity, not its bytes). A picture is no longer counted against, or refused by, the package's part and total limits (a ratio guard, 1,000:1 above 256 MB, stays for bombs). A `.docx` / `.docm` / `.dotx` / `.dotm` save streams into the file (`wordcraft_docx::write_to`, from `io::save_path_with`, with the same root check, atomic replace and `OLD_` policy): the XML parts are built in memory, the pictures stream from their spill files into the zip (zip64 above 4 GiB), and the bytes are those of the in-memory writer. A spill file goes with the last document or snapshot holding it; files a killed process left are removed at start (older than a day, or whose process is gone) and at SIGTERM. | `crates/doc/src/media.rs`, `crates/docx/src/package.rs` (`take_into`, `zip_into`), `read/mod.rs`, `write/mod.rs`, `crates/engine/src/io.rs`, `crates/render/src/lib.rs`, `crates/layout/src/lib.rs`, `apps/wordcraft-cli/src/main.rs` | `media` tests; `package` `whiq_a_picture_is_handed_to_the_media_map_past_the_part_limit`; `docx` `media_spill.rs`; `engine` `media_save.rs` |
 
-Not done: `export_pdf` still lays the whole document out for the PDF (980 MB transient on 1,343
-pages; given back after the call), and a PDF, ODT or RTF export reads its pictures back from
-disk into the output it builds in memory. A picture decodes whole to be drawn (one at a time).
-The XML of the document body is held in memory while it is read (limits: a share of the budget,
-reported with the route).
+| **PDF, ODT and RTF exports stream** (F7). `wordcraft_layout::layout_streaming` paginates once and hands each page to a sink the moment nothing can change it (the last two pages stay open: notes carry, columns balance), with its header, footer, mirrored margins and turned text done, and the page is dropped after the sink returns; a document that shows page totals is counted first (windowed, holding a few pages). `wordcraft_pdf::export_streaming` draws each page into the PDF as it arrives (`export` and `file.printPdf` use it: an `export_pdf` of whole pages in order, any range, odd or even pages); links to a bookmark further on are resolved by a first pass that only records where the bookmarks are; the outline and tag tree are completed after the last page. The PDF is byte for byte the one the whole layout gives. It falls back to the whole layout, said in the doc comments, for Print Markup balloons, page totals in the body of a document with footnotes numbered again on each page, headers or footers that refer to the page of a bookmark (`PAGEREF`), and pages printed twice or out of order (copies). A print job of one copy is no longer limited to 5,000 pages (the limit stays for copies). Krilla holds the finished pages (compressed) and the pictures until it writes the PDF, so memory grows by about 24 KB a page (the layout it replaces was about 330 KB a page). An ODT (`odt::export_to`) and an RTF (`rtf::export_to`) save straight into the file: a picture kept on disk is not read back into the export model (`Img::disk`, `media::Picture`) but copied from its file into the package or written as hex a piece at a time (a picture in another format than PNG or JPEG is decoded to be re-encoded as PNG for RTF, one at a time). | `crates/layout/src/lib.rs`, `hit.rs` (`piece_caret`), `crates/pdf/src/lib.rs`, `crates/engine/src/print.rs`, `io.rs`, `crates/doc/src/media.rs`, `crates/formats/src/model.rs`, `odt.rs`, `rtf.rs`, `html.rs` | `layout` `tests_stream` (the same pages as the whole layout: headers, footers, NUMPAGES, mirrored margins, title page, odd/even, sections, notes, tables, balanced columns); `pdf` `a_streamed_pdf_is_the_pdf_of_the_whole_layout` and range tests; `engine` `pdf_stream.rs`; `formats` `stream_pictures.rs` |
+
+F7 measured (`file.printPdf`, one process each, debug build, documents of 150-character paragraphs):
+
+| Pages | Whole layout (before) | Streamed (after) | The document alone |
+|---|---|---|---|
+| 1,351 (20,000 paragraphs) | 485 MB peak | 108 MB peak | 62 MB |
+| 2,229 (33,000 paragraphs) | 786 MB peak | 164 MB peak | 96 MB |
+
+Not done: a picture decodes whole to be drawn (one at a time), and Krilla keeps the pictures of a PDF
+in memory until it writes it, so a PDF of many large pictures still holds them. The XML of the
+document body is held in memory while it is read (limits: a share of the budget, reported with the
+route).
 
 ## Interface labels
 

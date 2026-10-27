@@ -57,7 +57,11 @@ pub struct RevMark {
 /// An embedded picture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Img {
+    /// The picture's bytes; empty for one kept on disk, which is `disk` (read it with
+    /// [`Img::bytes`], or stream it).
     pub data: Arc<Vec<u8>>,
+    /// The picture when it is kept on disk (see [`wordcraft_doc::media::Picture`]).
+    pub disk: Option<wordcraft_doc::media::Picture>,
     /// File extension (`png`, `jpeg`…).
     pub ext: String,
     /// Display size, points.
@@ -889,8 +893,16 @@ fn flow_paras_in(doc: &Document, p: &Paragraph, tracked: bool) -> Vec<Para> {
                     if !buf.is_empty() {
                         out.push_text(&std::mem::take(&mut buf), &f);
                     }
+                    // WHIQ: a picture kept on disk is not read back here: the exporters stream it.
+                    if let Some(pic) = doc.media.picture(media).filter(wordcraft_doc::media::Picture::is_spilled) {
+                        let ext = media_ext(media, &pic.head(32));
+                        out.inlines.push(Inline::Image(Img { ext, data: Arc::new(Vec::new()), disk: Some(pic), w: *w, h: *h, alt: alt.clone() }));
+                        continue;
+                    }
                     match doc.media.get(media) {
-                        Some(data) => out.inlines.push(Inline::Image(Img { ext: media_ext(media, &data), data, w: *w, h: *h, alt: alt.clone() })),
+                        Some(data) => {
+                            out.inlines.push(Inline::Image(Img { ext: media_ext(media, &data), data, disk: None, w: *w, h: *h, alt: alt.clone() }))
+                        }
                         None if !alt.is_empty() => buf.push_str(alt),
                         None => {}
                     }
@@ -1049,6 +1061,21 @@ pub fn decode_bounded(data: &[u8]) -> Option<image::DynamicImage> {
     reader.decode().ok()
 }
 
+impl Img {
+    /// The picture's bytes, read back from disk when it is kept there.
+    pub fn bytes(&self) -> Arc<Vec<u8>> {
+        match &self.disk {
+            Some(d) => d.bytes(),
+            None => self.data.clone(),
+        }
+    }
+}
+
+/// Pixel size of a picture read from `r` (only as far as its header).
+pub fn image_px_from(r: impl std::io::BufRead + std::io::Seek) -> Option<(u32, u32)> {
+    image::ImageReader::new(r).with_guessed_format().ok()?.into_dimensions().ok()
+}
+
 /// A picture from bytes with an optional display size (points); the natural size (96 dpi) is
 /// used otherwise, shrunk to fit a 6.5" column.
 pub fn make_img(data: impl Into<Arc<Vec<u8>>>, w: Option<f32>, h: Option<f32>, alt: &str) -> Option<Img> {
@@ -1066,7 +1093,7 @@ pub fn make_img(data: impl Into<Arc<Vec<u8>>>, w: Option<f32>, h: Option<f32>, a
         h *= 468.0 / w;
         w = 468.0;
     }
-    Some(Img { data, ext: ext.to_string(), w: w.clamp(1.0, 1584.0), h: h.clamp(1.0, 1584.0), alt: alt.to_string() })
+    Some(Img { data, disk: None, ext: ext.to_string(), w: w.clamp(1.0, 1584.0), h: h.clamp(1.0, 1584.0), alt: alt.to_string() })
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
