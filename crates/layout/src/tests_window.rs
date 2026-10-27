@@ -3,7 +3,8 @@
 use super::*;
 
 fn long_doc(paras: usize) -> Document {
-    let text: Vec<String> = (0..paras).map(|i| format!("Clause {i}. The contractor shall provide all labour, materials and plant for the works.")).collect();
+    let text: Vec<String> =
+        (0..paras).map(|i| format!("Clause {i}. The contractor shall provide all labour, materials and plant for the works.")).collect();
     Document::from_text(&text.join("\n"))
 }
 

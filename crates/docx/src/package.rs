@@ -226,11 +226,7 @@ impl Package {
     fn open_reader_limited(r: Box<dyn ReadSeek>, max_part: u64, max_total: u64) -> Result<Package, DocxError> {
         let mut zip = zip::ZipArchive::new(r).map_err(|e| DocxError::Zip(e.to_string()))?;
         if zip.len() > max_entries() {
-            return Err(DocxError::Limit(format!(
-                "{} zip entries, more than this process indexes ({}); {ROUTE}",
-                zip.len(),
-                max_entries()
-            )));
+            return Err(DocxError::Limit(format!("{} zip entries, more than this process indexes ({}); {ROUTE}", zip.len(), max_entries())));
         }
         let mut entries = BTreeMap::new();
         for i in 0..zip.len() {
@@ -297,10 +293,7 @@ impl Package {
             return None;
         }
         if buf.len() as u64 > room {
-            fail(format!(
-                "the document unpacks past what this process holds in memory ({} MB, reached at part {name}); {ROUTE}",
-                z.max_total >> 20
-            ));
+            fail(format!("the document unpacks past what this process holds in memory ({} MB, reached at part {name}); {ROUTE}", z.max_total >> 20));
             return None;
         }
         z.total.set(z.total.get().saturating_add(buf.len() as u64));
@@ -597,5 +590,4 @@ mod tests {
         assert_eq!(pkg.take("word/media/big.png").map(|b| b.len()), Some(4000));
         assert!(pkg.failure().is_none());
     }
-
 }

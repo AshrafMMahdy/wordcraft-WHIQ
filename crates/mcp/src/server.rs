@@ -448,12 +448,17 @@ impl Server {
                     "next_step": format!("saved. The document had been closed by the server ({reason}); the save wrote its work from {source}. Call open_document {{\"path\": \"{}\"}} to edit it further", abs(&target)),
                 });
                 if !kept.is_empty() {
-                    v["previous_files_renamed"] = json!(kept.iter().map(|(d, o)| json!({"path": d.to_string_lossy(), "previous": o.to_string_lossy()})).collect::<Vec<_>>());
+                    v["previous_files_renamed"] =
+                        json!(kept.iter().map(|(d, o)| json!({"path": d.to_string_lossy(), "previous": o.to_string_lossy()})).collect::<Vec<_>>());
                 }
                 crate::whiq::json_result(v, &[])
             }
             Err(e) => crate::whiq::error_result(
-                &crate::contract::ToolError::new(crate::contract::code::FAILED, e, "check the path and the write root, or open the recovered file and save it"),
+                &crate::contract::ToolError::new(
+                    crate::contract::code::FAILED,
+                    e,
+                    "check the path and the write root, or open the recovered file and save it",
+                ),
                 &[],
             ),
         })

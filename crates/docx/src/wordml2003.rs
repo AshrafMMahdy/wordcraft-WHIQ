@@ -185,7 +185,10 @@ impl Conv {
                 let text = k.text();
                 let b64: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
                 if (b64.len() / 4 * 3) as u64 > max_part() {
-                    return Err(DocxError::Limit(format!("picture {name} is larger than one part this process holds in memory ({} MB)", max_part() >> 20)));
+                    return Err(DocxError::Limit(format!(
+                        "picture {name} is larger than one part this process holds in memory ({} MB)",
+                        max_part() >> 20
+                    )));
                 }
                 let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64.trim_end_matches('=')) else {
                     log::warn!("wordml2003: skipping picture {name}: invalid base64");

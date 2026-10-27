@@ -291,7 +291,11 @@ fn store(
     let name = name.trim_start_matches('/');
     let len = bytes.len() as u64;
     if len > max_part() {
-        return Err(DocxError::Limit(format!("part {name} is {} MB, more than one part this process holds in memory ({} MB)", len >> 20, max_part() >> 20)));
+        return Err(DocxError::Limit(format!(
+            "part {name} is {} MB, more than one part this process holds in memory ({} MB)",
+            len >> 20,
+            max_part() >> 20
+        )));
     }
     *total = total.saturating_add(len);
     if *total > max_total() {

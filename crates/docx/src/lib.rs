@@ -30,8 +30,8 @@ pub use crypt::{
 };
 pub use flat::{XmlKind, sniff_xml, write as write_flat};
 pub use fonts::embedded_fonts;
-pub use read::{read, read_reader};
 pub use package::ReadSeek;
+pub use read::{read, read_reader};
 pub use smart_art::smart_art_items;
 pub use wordml2003_write::write as write_wordml2003;
 pub use write::{write, write_as};

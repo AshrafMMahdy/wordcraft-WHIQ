@@ -126,7 +126,11 @@ pub fn read_with_password(bytes: &[u8], password: Option<&str>) -> Result<Docume
     let other = if which { "0Table" } else { "1Table" };
     let mut table = stream(&mut comp, named).or_else(|| stream(&mut comp, other)).unwrap_or_default();
     if table.len() as u64 > max_stream() {
-        return Err(DocbinError::Limit(format!("the Table stream is {} MB, more than this process reads into memory ({} MB)", table.len() >> 20, max_stream() >> 20)));
+        return Err(DocbinError::Limit(format!(
+            "the Table stream is {} MB, more than this process reads into memory ({} MB)",
+            table.len() >> 20,
+            max_stream() >> 20
+        )));
     }
     let mut data = stream(&mut comp, "Data").unwrap_or_default();
     if data.len() as u64 > max_stream() {

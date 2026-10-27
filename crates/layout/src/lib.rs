@@ -4198,8 +4198,6 @@ pub fn now_ms() -> f64 {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod tests_window;
-#[cfg(test)]
 mod tests_bidi;
 #[cfg(test)]
 mod tests_complex;
@@ -4215,3 +4213,5 @@ mod tests_styleref;
 mod tests_textbox;
 #[cfg(test)]
 mod tests_vertical;
+#[cfg(test)]
+mod tests_window;
