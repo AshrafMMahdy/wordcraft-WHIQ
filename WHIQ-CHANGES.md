@@ -295,7 +295,7 @@ The owner's rule: no tool is limited by file size. Measured over MCP stdio with 
 | `render_page` page 900 | 1,826 MB, then evicted | 111 MB (pagination stops after the page) |
 | `export_pdf` (1,343 pages) | (evicted before it) | 980 MB transient, 105 MB after; stays open |
 | inspect past block 2,000 | unreachable (the engine answered the first 2,000 blocks, in silence) | every block, by `continue_from` |
-| 60 pictures, 119 MB `.docx` (`--max-memory-mb 400`, debug build): open / `save_document` / `render_page` | (the whole package and a second copy of each picture in memory) | 71 / 72 / 179 MB; 65 MB of pictures in spill files; the saved file holds all 60 pictures byte for byte |
+| 60 pictures, 119 MB `.docx` (`--max-memory-mb 400`, debug build): open / `save_document` / `render_page` | (not re-measured on this file: the pictures and the whole package were held in memory) | 71 / 72 / 179 MB; 65 MB of pictures in spill files; the saved file holds all 60 pictures byte for byte |
 
 | Change | Where | Tested by |
 |---|---|---|
