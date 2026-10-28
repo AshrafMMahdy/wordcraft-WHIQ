@@ -56,11 +56,19 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 /// The spill folder of THIS process: a folder of its own (`pid-<pid>`) under the spill base, which
 /// is `WORDCRAFT_SPILL_DIR`, else `wordcraft/spill` in the user's data folder (not the temporary
 /// folder, which cleaners empty), else the temporary folder. A lock file in it is held open (and
-/// locked) for as long as the process lives: that is what tells another process it is in use.
+/// locked) for as long as the process lives: that is what tells another process it is in use. When
+/// another process holds that lock (a sweeper, for a moment) the claim waits, then takes
+/// `pid-<pid>-<random>`.
 pub fn spill_dir() -> PathBuf {
-    let dir = spill_base().join(format!("pid-{}", std::process::id()));
-    claim(&dir);
-    dir
+    let base = spill_base();
+    let pid = std::process::id();
+    match CLAIM.get_or_init(|| {
+        let waits: Vec<_> = CLAIM_WAITS_MS.iter().map(|ms| std::time::Duration::from_millis(*ms)).collect();
+        claim_folder(&base, pid, &waits)
+    }) {
+        Some((dir, _)) => dir.clone(),
+        None => base.join(format!("pid-{pid}")),
+    }
 }
 
 static BASE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -89,19 +97,42 @@ pub fn spill_base() -> PathBuf {
 
 const LOCK_NAME: &str = "lock";
 
-/// The lock of this process's spill folder, held until it exits.
-static CLAIM: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+/// The folder this process claimed and the lock on it, held until it exits.
+static CLAIM: std::sync::OnceLock<Option<(PathBuf, std::fs::File)>> = std::sync::OnceLock::new();
 
-/// Create `dir` and lock its lock file (once per process).
-fn claim(dir: &Path) {
-    CLAIM.get_or_init(|| {
+/// Waits between tries to take the lock of `pid-<pid>` when someone else holds it for a moment (a
+/// sweeper looking at the folder of a dead process that had our PID).
+const CLAIM_WAITS_MS: [u64; 7] = [10, 20, 40, 80, 160, 320, 640];
+
+/// Claim a spill folder for process `pid` under `base`: `pid-<pid>` when its lock can be taken
+/// (retrying after each of `waits`, the holder being a sweeper that lets go in a moment), else a
+/// fresh `pid-<pid>-<random>`. The folder is emptied once locked (what is in it is a crashed
+/// process's). A process never runs without the lock of its own folder.
+fn claim_folder(base: &Path, pid: u32, waits: &[std::time::Duration]) -> Option<(PathBuf, std::fs::File)> {
+    let lock_in = |dir: &Path| -> Option<std::fs::File> {
         std::fs::create_dir_all(dir).ok()?;
         let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_NAME)).ok()?;
         f.try_lock().ok()?;
-        // The folder is ours now; whatever is in it belongs to a crashed process of the same PID.
         empty_folder(dir);
         Some(f)
-    });
+    };
+    let own = base.join(format!("pid-{pid}"));
+    for wait in std::iter::once(&std::time::Duration::ZERO).chain(waits) {
+        std::thread::sleep(*wait);
+        if let Some(f) = lock_in(&own) {
+            return Some((own, f));
+        }
+    }
+    static SALT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let r = nanos ^ SALT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed).rotate_left(17);
+        let dir = base.join(format!("pid-{pid}-{:08x}", r as u32));
+        if let Some(f) = lock_in(&dir) {
+            return Some((dir, f));
+        }
+    }
+    None
 }
 
 /// Remove everything in `dir` but the lock file: what a crashed process with the same PID left.
@@ -698,6 +729,42 @@ impl<'de> serde::Deserialize<'de> for MediaMap {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_claim_while_another_handle_holds_the_lock_still_gets_a_locked_folder() {
+        let base = std::env::temp_dir().join(format!("wc-claim-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pid = 4_000_010;
+        let own = base.join(format!("pid-{pid}"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("junk.part"), b"x").unwrap();
+        let hold = || {
+            let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(own.join(LOCK_NAME)).unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        // A sweeper holds the lock for good: no wait helps, so the claim takes a fresh folder, locked.
+        let sweeper = hold();
+        let (dir, held) = claim_folder(&base, pid, &[std::time::Duration::from_millis(5)]).unwrap();
+        assert_ne!(dir, own);
+        assert!(dir.file_name().unwrap().to_string_lossy().starts_with("pid-4000010-"));
+        let second = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(LOCK_NAME)).unwrap();
+        assert!(matches!(second.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "the fresh folder is locked by the claimer");
+        assert!(own.join("junk.part").exists(), "the folder the other handle holds is left alone");
+        drop((held, second));
+        // The sweeper lets go in a moment: the retry gets pid-<pid> itself, emptied.
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(sweeper);
+        });
+        let waits = [std::time::Duration::from_millis(50); 40];
+        let (dir, held) = claim_folder(&base, pid, &waits).unwrap();
+        t.join().unwrap();
+        assert_eq!(dir, own);
+        assert!(!own.join("junk.part").exists());
+        drop(held);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     fn bytes(n: usize, v: u8) -> Arc<Vec<u8>> {
         Arc::new(vec![v; n])
