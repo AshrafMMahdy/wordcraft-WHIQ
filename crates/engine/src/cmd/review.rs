@@ -350,6 +350,7 @@ fn resolve_para(
             para.format(a, b, &|c| {
                 c.ins = None;
                 c.del = None;
+                c.moved_from = None;
                 fmt_revisions::resolve_char(c, accept);
             })?;
         }

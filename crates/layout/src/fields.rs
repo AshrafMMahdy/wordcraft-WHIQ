@@ -117,9 +117,10 @@ pub fn format_switch(instr: &str) -> Option<NumFormat> {
 /// The light grey behind a field shown as its code.
 pub const FIELD_SHADING: wordcraft_doc::props::Rgb = wordcraft_doc::props::Rgb(0xD9, 0xD9, 0xD9);
 
-/// What a field shows in code view: its instruction in braces, `{ PAGE }`.
+/// What a field shows in code view: its instruction in braces, `{ PAGE }` (WHIQ: fields nested in
+/// it in braces too, `{ IF { PAGE } = { NUMPAGES } … }`).
 pub fn field_code_text(instr: &str) -> String {
-    format!("{{ {} }}", instr.trim())
+    format!("{{ {} }}", wordcraft_doc::fields::instr_code(instr).trim())
 }
 
 /// Display text for a field and whether it depends on the page it lands on.

@@ -239,7 +239,9 @@ pub fn lines(n: &Node) -> Vec<String> {
 
 /// Containers a save may merge or split without changing anything a reader sees (their
 /// contents are compared: child elements by name, text by paragraph).
-const CONTAINERS: &[&str] = &["w:r", "w:t", "w:rPr", "w:pPr", "w:instrText"];
+/// WHIQ: deleted text and code too (a save that merges two runs of deleted text, as it merges
+/// two runs of text, loses nothing: the text is compared by paragraph).
+const CONTAINERS: &[&str] = &["w:r", "w:t", "w:rPr", "w:pPr", "w:instrText", "w:delText", "w:delInstrText"];
 
 /// A run's properties (`w:r/w:rPr`): compared per character ([`run_format_losses`]), since a
 /// save may merge runs that look the same.

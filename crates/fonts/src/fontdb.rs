@@ -183,6 +183,11 @@ impl FontFace {
     pub fn named(&self, family: &str) -> bool {
         self.family.eq_ignore_ascii_case(family) || self.legacy_family.eq_ignore_ascii_case(family)
     }
+    /// WHIQ: built into the binary (the bundled fonts and craft-fonts), not loaded from the system
+    /// or added by the user.
+    pub fn embedded(&self) -> bool {
+        matches!(self.bytes, FontBytes::Static(_))
+    }
     /// Does the face map `c` to a glyph?
     pub fn covers(&self, c: char) -> bool {
         let cp = c as u32;
@@ -572,7 +577,9 @@ fn fallback_order(faces: &[Arc<FontFace>], exclude: u32, rtl: bool) -> Vec<&Arc<
     let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
     let rank =
         |f: &FontFace| if rtl { RTL_FALLBACKS.iter().position(|n| f.family.eq_ignore_ascii_case(n)).unwrap_or(RTL_FALLBACKS.len()) } else { 0 };
-    order.sort_by_key(|f| (rank(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
+    // WHIQ (corpus gate W3): embedded faces first for right-to-left text (see `loaded_fallback`).
+    order
+        .sort_by_key(|f| (rtl && !f.embedded(), rank(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
     order
 }
 
@@ -1515,18 +1522,23 @@ impl FontDb {
         let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
         // Right-to-left letters prefer a font made for the script, so a word isn't split across
         // fonts (that breaks Arabic joining).
+        let rtl = crate::is_rtl(c) || arabic_block(c);
         let rank = |f: &FontFace| {
-            if crate::is_rtl(c) || arabic_block(c) {
-                RTL_FALLBACKS.iter().position(|n| f.family.eq_ignore_ascii_case(n)).unwrap_or(RTL_FALLBACKS.len())
-            } else {
-                0
-            }
+            if rtl { RTL_FALLBACKS.iter().position(|n| f.family.eq_ignore_ascii_case(n)).unwrap_or(RTL_FALLBACKS.len()) } else { 0 }
         };
+        // WHIQ (corpus gate W3): an embedded face (craft-fonts' Noto Sans Arabic) comes first for
+        // right-to-left letters it has. A system font loaded later (Noto Naskh Arabic, once a
+        // paragraph asks for Traditional Arabic) used to outrank it from then on, so the same
+        // document laid out again came out on fewer pages (`export_pdf`: "page 341 does not
+        // exist"), depending on what had loaded before; and every machine draws it the same.
+        let installed = |f: &FontFace| rtl && !f.embedded();
         // Complex scripts (Myanmar, Khmer, Indic…): a font with OpenType layout tables, preferring
         // the script's own families, so syllables reorder and stack (#604).
         let complex = crate::needs_layout_tables(c);
         let shaping = |f: &FontFace| if complex { (!f.has_layout_tables(), crate::fallback_rank(c, &f.family)) } else { (false, 0) };
-        order.sort_by_key(|f| (rank(f), shaping(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
+        order.sort_by_key(|f| {
+            (installed(f), rank(f), shaping(f), !f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32)
+        });
         (order.into_iter().find(|f| f.covers(c)).cloned(), faces.len())
     }
 

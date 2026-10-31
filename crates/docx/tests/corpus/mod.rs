@@ -462,6 +462,81 @@ pub fn unknown_attributes() -> Vec<u8> {
     )
 }
 
+/// WHIQ (corpus gate W1): fields nested in another field's code (ECMA-376 §17.16.1): a footer's
+/// `{ IF { PAGE } = { NUMPAGES } "last page" "" }` (the last-page footer of a set of minutes), each
+/// nested field with its cached result; a field nested two deep and a locked, dirty nested field.
+pub fn nested_fields() -> Vec<u8> {
+    let r = |inner: &str| format!("<w:r>{inner}</w:r>");
+    let begin = |attrs: &str| r(&format!(r#"<w:fldChar w:fldCharType="begin"{attrs}/>"#));
+    let instr = |t: &str| r(&format!(r#"<w:instrText xml:space="preserve">{t}</w:instrText>"#));
+    let sep = r(r#"<w:fldChar w:fldCharType="separate"/>"#);
+    let end = r(r#"<w:fldChar w:fldCharType="end"/>"#);
+    let text = |t: &str| r(&format!(r#"<w:t xml:space="preserve">{t}</w:t>"#));
+    let simple = |code: &str, result: &str| format!("{}{}{sep}{}{end}", begin(""), instr(code), text(result));
+    let last_page = format!(
+        "<w:p>{}{}{}{}{}{}{sep}{}{end}</w:p>",
+        begin(""),
+        instr(" IF "),
+        simple(" PAGE ", "1"),
+        instr(" = "),
+        simple(" NUMPAGES ", "1"),
+        instr(r#" "last page" "" "#),
+        text("last page"),
+    );
+    let deep = format!(
+        "<w:p>{}{}{}{}{}{}{}{sep}{}{end}{}{sep}{}{end}</w:p>",
+        text("Deep: "),
+        begin(""),
+        instr(" QUOTE "),
+        begin(r#" w:fldLock="1" w:dirty="true""#),
+        instr(" IF "),
+        simple(" SECTION ", "1"),
+        instr(r#" > 0 "yes" "no" "#),
+        text("yes"),
+        instr(r#" \* Upper "#),
+        text("YES"),
+    );
+    let body = format!(r#"<w:p><w:r><w:t>Minutes.</w:t></w:r></w:p>{last_page}{deep}"#);
+    package(MAIN, &body, &[], &[], vec![])
+}
+
+/// WHIQ (corpus gate W2): a tracked move of a heading and the table under it, whose move ranges end
+/// in the table after its last row (ECMA-376 §17.13.5.22–27 allow range markup between rows, and
+/// that is where Word ends a move that takes in a whole table), with text deleted at both ends of
+/// the move (`w:del` inside `w:moveFrom` and `w:moveTo`).
+pub fn tracked_move_table() -> Vec<u8> {
+    let side = |to: bool, start: u32| {
+        let kind = if to { "moveTo" } else { "moveFrom" };
+        let wrap = |id: u32, inner: &str| format!(r#"<w:{kind} w:id="{id}" w:author="Ada" w:date="{DATE}">{inner}</w:{kind}>"#);
+        let run = |t: &str| format!(r#"<w:r><w:t xml:space="preserve">{t}</w:t></w:r>"#);
+        let del = |id: u32, t: &str| {
+            format!(r#"<w:del w:id="{id}" w:author="Ben" w:date="{DATE}"><w:r><w:delText xml:space="preserve">{t}</w:delText></w:r></w:del>"#)
+        };
+        let cell = |id: u32, t: &str| format!(r#"<w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr><w:p>{}</w:p></w:tc>"#, wrap(id, &run(t)));
+        format!(
+            concat!(
+                r#"<w:p><w:{kind}RangeStart w:id="{r}" w:author="Ada" w:date="{d}" w:name="move7"/>{head}</w:p>"#,
+                r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="3000"/></w:tblGrid>"#,
+                r#"<w:tr>{c1}{c2}</w:tr><w:tr>{c3}{c4}</w:tr><w:{kind}RangeEnd w:id="{r}"/></w:tbl>"#,
+            ),
+            kind = kind,
+            r = start,
+            d = DATE,
+            head = wrap(start + 1, &format!("{}{}", run("Order of injection"), del(start + 2, ":"))),
+            c1 = cell(start + 3, "Preparation"),
+            c2 = cell(start + 4, "Time"),
+            c3 = cell(start + 5, "Standard"),
+            c4 = cell(start + 6, "29.39"),
+        )
+    };
+    let body = format!(
+        r#"<w:p><w:r><w:t>Method.</w:t></w:r></w:p>{}<w:p><w:r><w:t>Between the two ends.</w:t></w:r></w:p>{}<w:p><w:r><w:t>After.</w:t></w:r></w:p>"#,
+        side(true, 10),
+        side(false, 30),
+    );
+    package(MAIN, &body, &[], &[], vec![])
+}
+
 /// A small theme (ECMA-376 Part 1 §20.1.6): colour and font schemes, no format scheme details.
 const THEME: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Corpus"><a:themeElements>"#,
@@ -493,5 +568,7 @@ pub fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         ("block-alternate-content.docx", block_alternate()),
         ("custom-xml-tables.docx", custom_xml_tables()),
         ("unknown-attributes.docx", unknown_attributes()),
+        ("nested-fields.docx", nested_fields()),
+        ("tracked-move-table.docx", tracked_move_table()),
     ]
 }

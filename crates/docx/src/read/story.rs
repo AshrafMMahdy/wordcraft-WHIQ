@@ -41,6 +41,8 @@ pub struct RunCtx {
     link: Option<String>,
     ins: Option<u32>,
     del: Option<u32>,
+    /// WHIQ (corpus gate W2): the enclosing `w:moveFrom`'s revision, inside a `w:del` in it.
+    moved_from: Option<u32>,
     /// WHIQ: the enclosing hyperlink's attributes the writer leaves out (`keep.rs`, `^h`).
     link_attrs: Option<String>,
 }
@@ -588,6 +590,12 @@ impl Reader<'_> {
             }
             "w:del" | "w:moveFrom" => {
                 let mut c = ctx.clone();
+                // WHIQ (corpus gate W2): text deleted inside a move's source keeps the move too.
+                if k.name == "w:del"
+                    && let Some(from) = ctx.del.filter(|d| self.doc.move_name(Some(*d)).is_some())
+                {
+                    c.moved_from = Some(from);
+                }
                 c.del = Some(if k.name == "w:moveFrom" { self.move_revision(false, k, false) } else { self.revision(RevisionKind::Delete, k) });
                 self.read_inline_children(sc, pb, k, rels, &c, depth + 1);
             }
@@ -690,12 +698,20 @@ impl Reader<'_> {
         p.link = ctx.link.clone();
         p.ins = ctx.ins;
         p.del = ctx.del;
+        p.moved_from = ctx.moved_from;
         p.fmt_change = self.rpr_change(rpr);
         crate::keep::add(&mut p.ext_attrs, ctx.link_attrs.as_deref().unwrap_or(""));
         p
     }
     fn run_props_none(&self, ctx: &RunCtx) -> CharProps {
-        CharProps { link: ctx.link.clone(), ins: ctx.ins, del: ctx.del, ext_attrs: ctx.link_attrs.clone(), ..Default::default() }
+        CharProps {
+            link: ctx.link.clone(),
+            ins: ctx.ins,
+            del: ctx.del,
+            moved_from: ctx.moved_from,
+            ext_attrs: ctx.link_attrs.clone(),
+            ..Default::default()
+        }
     }
 
     fn read_run(&mut self, sc: &mut StoryCtx, pb: &mut PB, r: &El, rels: &Rels, ctx: &RunCtx, depth: usize) {
@@ -754,7 +770,8 @@ impl Reader<'_> {
                     if f.sizes.len() < 64 {
                         f.sizes.push((f.instr.len(), props.size));
                     }
-                    f.instr.push_str(&k.text());
+                    // WHIQ: the nesting markers (`fields::NEST_BEGIN`…) are the reader's alone.
+                    f.instr.push_str(&wordcraft_doc::fields::strip_nest_markers(&k.text()));
                 }
             }
             "w:tab" | "w:ptab" => self.emit_text(sc, pb, "\t", props),
@@ -1044,19 +1061,24 @@ impl Reader<'_> {
                 Item::Obj(o) => result.push_str(o.plain_text()),
             }
         }
+        if let Some(parent) = sc.fields.last_mut()
+            && !parent.spilled
+            && parent.phase == Phase::Instr
+        {
+            // WHIQ (corpus gate W1): a field in another's code stays a field — its code and cached
+            // result, between markers the writer turns back into a field — instead of its result
+            // frozen into the outer code (`IF { PAGE } = { NUMPAGES }` was read as `IF 1 = 1`).
+            if parent.instr.len() < MAX_INSTR {
+                parent.instr.push_str(&wordcraft_doc::fields::nest(&f.instr, &result, f.locked, f.dirty));
+            }
+            return;
+        }
         let (instr, result) = match enclosure(&f) {
             // Word writes no result for enclosed characters: the text is their plain text.
             Some(e) => (e.instr(), if result.is_empty() { e.text } else { result }),
             None => (f.instr.trim().to_string(), result),
         };
         let obj = InlineObject::Field { instr, result, locked: f.locked, dirty: f.dirty, code: false, form: f.form };
-        if let Some(parent) = sc.fields.last_mut()
-            && !parent.spilled
-            && parent.phase == Phase::Instr
-        {
-            parent.instr.push_str(obj.plain_text());
-            return;
-        }
         self.emit_obj(sc, pb, obj, &f.props);
     }
 
@@ -1749,8 +1771,15 @@ impl Reader<'_> {
                 .collect();
         }
         let mut rows = Vec::new();
-        collect(t, "w:tr", &mut rows, &mut Vec::new(), &mut Vec::new(), 0);
+        let mut after_rows = Vec::new();
+        collect(t, "w:tr", &mut rows, &mut Vec::new(), &mut Vec::new(), &mut after_rows, 0);
         for g in rows.into_iter().take(MAX_ROWS) {
+            // WHIQ (corpus gate W2): a move range starting or ending between rows counts there,
+            // in reading order (a range left open made the whole move plain deletions and
+            // insertions).
+            for m in &g.marks {
+                self.move_range(m);
+            }
             let tr = g.el;
             let mut row = Row { props: tr.child("w:trPr").map(trpr).unwrap_or_default(), cells: Vec::new(), controls: g.controls, wraps: g.wraps };
             row.props.ext_xml = tr.child("w:trPr").and_then(|p| super::passthrough::table_ext(p, "tr"));
@@ -1763,8 +1792,12 @@ impl Reader<'_> {
             crate::write::props::trpr(&mut sim, &row.props, None);
             row.props.ext_attrs = crate::keep::join(&[&keep_below(tr, &["w:tblPrEx", "w:trPr"], &sim.s), &crate::keep::capture_tag("^w", tr, &[])]);
             let mut tcs = Vec::new();
-            collect(tr, "w:tc", &mut tcs, &mut Vec::new(), &mut Vec::new(), 0);
+            let mut after_cells = Vec::new();
+            collect(tr, "w:tc", &mut tcs, &mut Vec::new(), &mut Vec::new(), &mut after_cells, 0);
             for g in tcs.into_iter().take(MAX_COLS) {
+                for m in &g.marks {
+                    self.move_range(m);
+                }
                 let tc = g.el;
                 let (mut props, hcont) = tc
                     .child("w:tcPr")
@@ -1787,9 +1820,15 @@ impl Reader<'_> {
                 self.flush_pending(sc, &mut blocks);
                 row.cells.push(Cell { props, blocks, controls: g.controls, wraps: g.wraps });
             }
+            for m in after_cells {
+                self.move_range(m);
+            }
             if !row.cells.is_empty() {
                 table.rows.push(row);
             }
+        }
+        for m in after_rows {
+            self.move_range(m);
         }
         if table.rows.is_empty() {
             return None;
@@ -1870,6 +1909,15 @@ struct Gathered<'a> {
     el: &'a El,
     controls: ControlWrap,
     wraps: OpaqueWrap,
+    /// WHIQ (corpus gate W2): the move-range markers between the element before and this one.
+    marks: Vec<&'a El>,
+}
+
+/// WHIQ (corpus gate W2): move-range markers a table or row may hold between its rows or cells
+/// (ECMA-376 §17.13.5: range markup is allowed there; Word ends a move that takes in a whole
+/// table after its last row).
+fn is_move_mark(name: &str) -> bool {
+    matches!(name, "w:moveFromRangeStart" | "w:moveFromRangeEnd" | "w:moveToRangeStart" | "w:moveToRangeEnd")
 }
 
 /// Gather `name` children (rows, cells), looking through `w:sdt`/`w:customXml` wrappers; each
@@ -1882,13 +1930,18 @@ fn collect<'a>(
     out: &mut Vec<Gathered<'a>>,
     pending: &mut Vec<ContentControl>,
     pending_wraps: &mut Vec<WrapTag>,
+    marks: &mut Vec<&'a El>,
     depth: usize,
 ) {
     if depth > 8 {
         return;
     }
     for k in e.els() {
-        if k.name == name {
+        if is_move_mark(&k.name) {
+            if marks.len() < 64 {
+                marks.push(k);
+            }
+        } else if k.name == name {
             let open = std::mem::take(pending);
             // A pending wrapper's `inner` holds how many controls were open before it: the rest
             // are inside it.
@@ -1896,14 +1949,19 @@ fn collect<'a>(
             for t in &mut wraps {
                 t.inner = (open.len() as u32).saturating_sub(t.inner);
             }
-            out.push(Gathered { el: k, controls: ControlWrap { open, close: 0 }, wraps: OpaqueWrap { open: wraps, close: Vec::new() } });
+            out.push(Gathered {
+                el: k,
+                controls: ControlWrap { open, close: 0 },
+                wraps: OpaqueWrap { open: wraps, close: Vec::new() },
+                marks: std::mem::take(marks),
+            });
         } else if k.name == "w:sdt" {
             if let Some(c) = k.child("w:sdtContent") {
                 let mut ctl = super::sdt::sdt_pr(k.child("w:sdtPr"), true);
                 ctl.end_pr_xml = super::sdt::sdt_end_pr(k.child("w:sdtEndPr"));
                 let before = out.len();
                 pending.push(ctl);
-                collect(c, name, out, pending, pending_wraps, depth + 1);
+                collect(c, name, out, pending, pending_wraps, marks, depth + 1);
                 let grew = out.len() > before;
                 match out.last_mut() {
                     Some(g) if grew => g.controls.close = g.controls.close.saturating_add(1),
@@ -1926,7 +1984,7 @@ fn collect<'a>(
                     inner: before_it,
                 });
             }
-            collect(k, name, out, pending, pending_wraps, depth + 1);
+            collect(k, name, out, pending, pending_wraps, marks, depth + 1);
             if let Some((_, close)) = tags {
                 let grew = out.len() > before;
                 match out.last_mut() {

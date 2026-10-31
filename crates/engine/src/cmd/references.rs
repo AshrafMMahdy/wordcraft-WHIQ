@@ -874,7 +874,9 @@ pub fn update_fields(s: &mut Session) -> Result<(), CmdError> {
                     && let Some(t) = s.doc.table(StoryRef::Body, &tp)
                 {
                     let default_lang = super::default_lang(s);
-                    let text = match super::table_formula::evaluate_field_with(t, Some(&s.doc), default_lang.as_deref(), r, c, instr) {
+                    // WHIQ: a field nested in the formula counts as its result.
+                    let formula = wordcraft_doc::fields::instr_flat(instr);
+                    let text = match super::table_formula::evaluate_field_with(t, Some(&s.doc), default_lang.as_deref(), r, c, &formula) {
                         Ok(text) => text,
                         Err(e) => format!("!{e}"),
                     };

@@ -105,6 +105,65 @@ fn kept_markup_gives_way_to_edits() {
     assert!(xml.contains(r#"w:themeColor="background1""#), "{xml}");
 }
 
+/// WHIQ (corpus gate W2): a move whose ranges end between a table's rows (where Word ends a move
+/// that takes in a table) stays a move on save — `w:moveFrom` / `w:moveTo` with their named ranges
+/// — instead of plain deletions and insertions (Open-XML-PowerTools' RA001: 30 move marks lost).
+#[test]
+fn moves_ending_in_a_table_stay_moves_on_save() {
+    let before = corpus::tracked_move_table();
+    let doc = wordcraft_docx::read(&before).unwrap();
+    let moves: Vec<_> = doc.revisions.iter().filter(|r| r.move_name.as_deref() == Some("move7")).collect();
+    assert_eq!(moves.len(), 2, "one revision for each end of the move: {:?}", doc.revisions);
+    let saved = wordcraft_docx::write(&doc).unwrap();
+    let xml = String::from_utf8(zip_part(&saved, "word/document.xml")).unwrap();
+    for tag in ["<w:moveFrom ", "<w:moveTo "] {
+        assert!(xml.matches(tag).count() >= 5, "{tag}: {xml}");
+    }
+    for tag in ["<w:moveFromRangeStart ", "<w:moveToRangeStart "] {
+        assert!(xml.contains(tag), "{tag}: {xml}");
+        assert!(xml.matches(tag).count() == xml.matches(&tag.replace("Start", "End")).count(), "balanced {tag}: {xml}");
+    }
+    assert!(xml.contains(r#"w:name="move7""#), "{xml}");
+    assert_eq!(xml.matches("<w:del ").count(), 2, "the text deleted at each end stays deleted: {xml}");
+    let report = roundtrip::compare(&before, &saved).unwrap();
+    assert!(report.lossless(), "{:?}", report.summary());
+}
+
+/// WHIQ (corpus gate W1): a field in another field's code stays a field on save, with its code and
+/// cached result: `{ IF { PAGE } = { NUMPAGES } "last page" "" }` was written `IF 1 = 1 "last page"
+/// ""` (the nested fields frozen to their results, so the footer showed on every page in Word).
+#[test]
+fn nested_fields_stay_fields_on_save() {
+    let before = corpus::nested_fields();
+    let doc = wordcraft_docx::read(&before).unwrap();
+    let saved = wordcraft_docx::write(&doc).unwrap();
+    let xml = String::from_utf8(zip_part(&saved, "word/document.xml")).unwrap();
+    assert!(!xml.contains("IF 1 = 1"), "nested fields frozen to their results: {xml}");
+    assert_eq!(xml.matches(r#"w:fldCharType="begin""#).count(), 6, "six fields, three of them nested: {xml}");
+    assert_eq!(xml.matches(r#"w:fldCharType="begin""#).count(), xml.matches(r#"w:fldCharType="end""#).count(), "{xml}");
+    for code in [" PAGE ", " NUMPAGES ", " SECTION ", " QUOTE "] {
+        assert!(xml.contains(&format!(r#"<w:instrText xml:space="preserve">{code}</w:instrText>"#)), "{code}: {xml}");
+    }
+    assert!(xml.contains(r#"w:fldCharType="begin" w:fldLock="1" w:dirty="true""#), "the nested field keeps its lock and dirty flag: {xml}");
+    // The shown result is the outer field's; the code view shows the nesting as Word does.
+    let text: String = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.plain_text()).collect::<Vec<_>>().join("|");
+    assert!(text.contains("last page") && text.contains("Deep: YES"), "{text}");
+    let codes: Vec<String> = doc
+        .body
+        .iter()
+        .filter_map(|b| b.as_para())
+        .flat_map(|p| p.objects.iter())
+        .filter_map(|o| match o {
+            wordcraft_doc::InlineObject::Field { instr, .. } => Some(wordcraft_doc::fields::instr_code(instr)),
+            _ => None,
+        })
+        .collect();
+    assert!(codes.iter().any(|c| c == r#"IF { PAGE } = { NUMPAGES } "last page" """#), "{codes:?}");
+    assert!(codes.iter().any(|c| c == r#"QUOTE { IF { SECTION } > 0 "yes" "no" } \* Upper"#), "{codes:?}");
+    let report = roundtrip::compare(&before, &saved).unwrap();
+    assert!(report.lossless(), "{:?}", report.summary());
+}
+
 fn zip_part(pkg: &[u8], name: &str) -> Vec<u8> {
     use std::io::Read;
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(pkg)).unwrap();

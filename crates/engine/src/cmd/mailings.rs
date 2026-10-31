@@ -819,7 +819,9 @@ fn keyword(instr: &str) -> String {
 
 /// Evaluate a merge-related field for a record (None = not a merge field).
 fn act(s: &Session, instr: &str, row: usize) -> Option<Act> {
-    let t = instr.trim();
+    // WHIQ: a merge field nested in an IF read from a file is in braces, as these rules write it.
+    let code = wordcraft_doc::fields::instr_code(instr);
+    let t = code.trim();
     if let Some(n) = mergefield_name(t) {
         return Some(Act::Text(value(s, row, &n)));
     }

@@ -381,6 +381,12 @@ pub struct CharProps {
     /// Tracked deletion: index into `Document::revisions`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub del: Option<u32>,
+    /// WHIQ (corpus gate W2): the move this text was moved away in when it was also deleted
+    /// (`w:del` inside `w:moveFrom`, ECMA-376 §17.13.5.22): index into `Document::revisions`, a
+    /// revision with a `move_name`. `del` holds the deletion; without one it means nothing (the
+    /// review commands clear it with the deletion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<u32>,
     /// Tracked formatting change (`w:rPrChange`): the formatting before it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fmt_change: Option<Box<PropChange<CharProps>>>,
@@ -451,7 +457,7 @@ impl CharProps {
     pub fn minus(mut self, base: &CharProps) -> CharProps {
         drop_same_fields!(self, base; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
             shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
-            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, ext_xml, ext_attrs);
+            cs, font_cs, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, moved_from, ext_xml, ext_attrs);
         self
     }
 
@@ -462,7 +468,7 @@ impl CharProps {
     pub fn overlay(&mut self, patch: &CharProps) {
         overlay_fields!(self, patch; style, font, size, bold, italic, underline, underline_color, strike, double_strike, color, highlight,
             shading, border, vert_align, caps, small_caps, hidden, spacing, scale, position, kern, outline, shadow, emboss, engrave, lang, no_proof, rtl,
-            cs, font_cs, font_ea, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, fmt_change, ext_xml, ext_attrs);
+            cs, font_cs, font_ea, size_cs, bold_cs, italic_cs, lang_bidi, link, ins, del, moved_from, fmt_change, ext_xml, ext_attrs);
         if let Some(p) = &patch.text_effects {
             self.text_effects.get_or_insert_with(Default::default).overlay(p);
         }
@@ -477,11 +483,18 @@ impl CharProps {
     /// Clear direct formatting but keep what isn't "formatting" (links, revisions, character style
     /// is cleared too, as Word's Clear Formatting does).
     pub fn cleared(&self) -> CharProps {
-        CharProps { link: self.link.clone(), ins: self.ins, del: self.del, fmt_change: self.fmt_change.clone(), ..Default::default() }
+        CharProps {
+            link: self.link.clone(),
+            ins: self.ins,
+            del: self.del,
+            moved_from: self.moved_from,
+            fmt_change: self.fmt_change.clone(),
+            ..Default::default()
+        }
     }
     /// Just the formatting: without the link, revision marks and tracked formatting change.
     pub fn formatting(&self) -> CharProps {
-        CharProps { link: None, ins: None, del: None, fmt_change: None, ..self.clone() }
+        CharProps { link: None, ins: None, del: None, moved_from: None, fmt_change: None, ..self.clone() }
     }
 }
 

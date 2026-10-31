@@ -135,7 +135,8 @@ impl Writer<'_> {
 
     /// The moves (revision, destination?) in `props`.
     fn moves_of(&self, props: &CharProps) -> Vec<(u32, bool)> {
-        [(props.del, false), (props.ins, true)]
+        let [(from, _), (ins, _), (del, _)] = self.rev_wrappers(props);
+        [(from, false), (del, false), (ins, true)]
             .into_iter()
             .filter_map(|(r, to)| r.filter(|r| self.doc.move_name(Some(*r)).is_some()).map(|r| (r, to)))
             .collect()
@@ -513,8 +514,20 @@ impl Writer<'_> {
         w.close("w:rPrChange");
     }
 
+    /// WHIQ (corpus gate W2): the move deleted text was moved away in (`w:moveFrom` around its
+    /// `w:del`), when it is one (and the text still deleted).
+    fn moved_from(&self, props: &CharProps) -> Option<u32> {
+        props.moved_from.filter(|m| props.del.is_some() && props.del != Some(*m) && self.doc.move_name(Some(*m)).is_some())
+    }
+
+    /// The tracked-change wrappers of a run, outermost first: the move it left in, its insertion,
+    /// its deletion.
+    fn rev_wrappers(&self, props: &CharProps) -> [(Option<u32>, &'static str); 3] {
+        [(self.moved_from(props), "w:del"), (props.ins, "w:ins"), (props.del, "w:del")]
+    }
+
     fn rev_open(&mut self, w: &mut W, props: &CharProps) {
-        for (idx, tag) in [(props.ins, "w:ins"), (props.del, "w:del")] {
+        for (idx, tag) in self.rev_wrappers(props) {
             let Some(idx) = idx else { continue };
             if self.rev_kind(Some(idx)) == Some(RevisionKind::Format) {
                 continue;
@@ -531,7 +544,9 @@ impl Writer<'_> {
     }
 
     fn rev_close(&mut self, w: &mut W, props: &CharProps) {
-        for (idx, tag) in [(props.del, "w:del"), (props.ins, "w:ins")] {
+        let mut wrappers = self.rev_wrappers(props);
+        wrappers.reverse();
+        for (idx, tag) in wrappers {
             if let Some(i) = idx
                 && self.rev_kind(idx) != Some(RevisionKind::Format)
             {
@@ -1039,7 +1054,7 @@ impl Writer<'_> {
             }
         });
         let instr_text = format!(" {} ", instr.trim());
-        run(w, &|w| w.leaf(if del { "w:delInstrText" } else { "w:instrText" }, &[("xml:space", "preserve")], &instr_text));
+        code_runs(w, &instr_text, del, props, 0);
         run(w, &|w| w.empty("w:fldChar", &[("w:fldCharType", "separate")]));
     }
 
@@ -1424,6 +1439,53 @@ impl Writer<'_> {
 }
 
 /// `w:sectPr` content after the header and footer references.
+/// WHIQ (corpus gate W1): a field's code as `w:instrText` runs, each field nested in it written
+/// back as a field (begin, its own code, separate, its cached result, end; see
+/// `wordcraft_doc::fields::NEST_BEGIN`).
+fn code_runs(w: &mut W, code: &str, del: bool, props: &CharProps, depth: usize) {
+    use wordcraft_doc::fields::{InstrPart, MAX_NEST, instr_parts, strip_nest_markers};
+    let run = |w: &mut W, f: &dyn Fn(&mut W)| {
+        w.open("w:r", &[]);
+        rpr(w, props);
+        f(w);
+        w.close("w:r");
+    };
+    let text = |w: &mut W, t: &str| {
+        let t = strip_nest_markers(t);
+        if !t.is_empty() {
+            run(w, &|w| w.leaf(if del { "w:delInstrText" } else { "w:instrText" }, &[("xml:space", "preserve")], &t));
+        }
+    };
+    if depth >= MAX_NEST || !wordcraft_doc::fields::has_nested(code) {
+        // Too deep to nest further (never from a file): the code as text, its fields' results in it.
+        let flat = if depth >= MAX_NEST { wordcraft_doc::fields::instr_flat(code) } else { code.to_string() };
+        return run(w, &|w| w.leaf(if del { "w:delInstrText" } else { "w:instrText" }, &[("xml:space", "preserve")], &strip_nest_markers(&flat)));
+    }
+    for part in instr_parts(code) {
+        match part {
+            InstrPart::Text(t) => text(w, t),
+            InstrPart::Field { instr, result, locked, dirty } => {
+                run(w, &|w| {
+                    let mut attrs: Vec<(&str, &str)> = vec![("w:fldCharType", "begin")];
+                    if locked {
+                        attrs.push(("w:fldLock", "1"));
+                    }
+                    if dirty {
+                        attrs.push(("w:dirty", "true"));
+                    }
+                    w.empty("w:fldChar", &attrs);
+                });
+                code_runs(w, instr, del, props, depth + 1);
+                run(w, &|w| w.empty("w:fldChar", &[("w:fldCharType", "separate")]));
+                if !result.is_empty() {
+                    run(w, &|w| w.leaf(if del { "w:delText" } else { "w:t" }, &[("xml:space", "preserve")], result));
+                }
+                run(w, &|w| w.empty("w:fldChar", &[("w:fldCharType", "end")]));
+            }
+        }
+    }
+}
+
 pub(crate) fn sectpr_body(w: &mut W, s: &SectionProps, ext: Option<&crate::xml::El>) {
     // WHIQ: kept properties go where CT_SectPr puts them.
     let kept = |w: &mut W, names: &[&str]| {

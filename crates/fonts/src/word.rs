@@ -227,6 +227,16 @@ pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
             return *r;
         }
     }
+    let r = resolve_in(db, family, bold, italic);
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if c.0 == generation {
+        c.1.insert(key, r);
+    }
+    r
+}
+
+/// [`resolve`] in the font database `db`, without the memo.
+pub fn resolve_in(db: &FontDb, family: &str, bold: bool, italic: bool) -> Resolved {
     let base = charset_base_family(family);
     let (fam, substituted) = if db.has_family(family) {
         (family.to_string(), false)
@@ -238,12 +248,7 @@ pub fn resolve(family: &str, bold: bool, italic: bool) -> Resolved {
         (s.to_string(), true)
     };
     let face = db.face(&fam, style_name(bold, italic));
-    let r = Resolved { synth_bold: bold && face.weight < 600.0, synth_italic: italic && !face.italic, substituted, face: FaceRef::of(&face) };
-    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if c.0 == generation {
-        c.1.insert(key, r);
-    }
-    r
+    Resolved { synth_bold: bold && face.weight < 600.0, synth_italic: italic && !face.italic, substituted, face: FaceRef::of(&face) }
 }
 
 /// A line's (ascent, descent) from hhea values, both positive: the line gap goes above the ascent.
@@ -291,6 +296,89 @@ mod tests {
         // A negative gap adds nothing; the most negative descender doesn't overflow.
         assert_eq!(hhea_line(1000, -300, -50), (1000.0, 300.0));
         assert_eq!(hhea_line(1000, i16::MIN, 0), (1000.0, 32768.0));
+    }
+
+    /// WHIQ (corpus gate W6): the document fonts nobody may bundle (Aptos, Calibri) resolve to the
+    /// embedded metric-compatible stand-in, so their Arabic falls to the embedded Arabic face,
+    /// whatever the host has installed. On Windows they fell to the system Arial, which has
+    /// Arabic letters, so the platform's Arabic smoke line was set in Arial instead of the Noto
+    /// Sans Arabic `server_status` names. Here a font folder holding only DejaVu Sans (also a
+    /// stand-in in the list, also with Arabic) plays the Windows Arial.
+    #[test]
+    fn office_fonts_resolve_to_embedded_faces_and_their_arabic_to_the_embedded_arabic_face() {
+        let Some(arabic) = crate::CRAFT_FONTS.iter().find(|f| f.scripts.contains(&"Arab")) else {
+            eprintln!("skipped: built without craft-fonts (set CRAFT_FONTS_DIR)");
+            return;
+        };
+        let Some(dejavu) =
+            crate::system_font_dirs().into_iter().flat_map(|d| walk(&d, 0)).find(|p| p.file_name().is_some_and(|n| n == "DejaVuSans.ttf"))
+        else {
+            assert!(std::env::var_os("WORDCRAFT_REQUIRE_SCRIPT_FONTS").is_none(), "DejaVuSans.ttf is not installed");
+            eprintln!("skipped: DejaVuSans.ttf is not installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("wordcraft-w6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&dejavu, dir.join("DejaVuSans.ttf")).unwrap();
+        let db = FontDb::with_font_dirs(vec![dir.clone()]);
+        assert!(db.has_family("DejaVu Sans"), "the stand-in for the host's Arial is installed");
+        for family in ["Aptos", "Calibri", "Arial", "Times New Roman"] {
+            let r = resolve_in(&db, family, false, false);
+            assert!(crate::CRAFT_FONTS.iter().any(|f| f.family == r.face.family), "{family} → {} (not embedded)", r.face.family);
+            let c = 'م';
+            let drawn =
+                if r.face.covers(c) { r.face.family.clone() } else { db.fallback_for(c, r.face.id()).map(|f| f.family.clone()).unwrap_or_default() };
+            assert_eq!(drawn, arabic.family, "Arabic in {family}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WHIQ (corpus gate W3): the face Arabic falls back to does not change once a system font
+    /// of the script loads. The 342-page Arabic `.doc` asks for Traditional Arabic part way
+    /// through; on Linux that loads Noto Naskh Arabic (its stand-in), which then outranked the
+    /// embedded Noto Sans Arabic for every later fallback, so the document laid out again (the
+    /// PDF after its page count) came out shorter and `export_pdf` failed "page 341 does not
+    /// exist" — with N depending on what had loaded before. Windows has no Noto Naskh: it passed.
+    #[test]
+    fn arabic_fallback_stays_the_same_when_a_system_arabic_font_loads() {
+        let Some(arabic) = crate::CRAFT_FONTS.iter().find(|f| f.scripts.contains(&"Arab")) else {
+            eprintln!("skipped: built without craft-fonts (set CRAFT_FONTS_DIR)");
+            return;
+        };
+        let Some(naskh) = crate::system_font_dirs()
+            .into_iter()
+            .flat_map(|d| walk(&d, 0))
+            .find(|p| p.file_name().is_some_and(|n| n == "NotoNaskhArabic-Regular.ttf"))
+        else {
+            assert!(std::env::var_os("WORDCRAFT_REQUIRE_SCRIPT_FONTS").is_none(), "NotoNaskhArabic-Regular.ttf is not installed");
+            eprintln!("skipped: NotoNaskhArabic-Regular.ttf is not installed");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("wordcraft-w3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&naskh, dir.join("NotoNaskhArabic-Regular.ttf")).unwrap();
+        let db = FontDb::with_font_dirs(vec![dir.clone()]);
+        let latin = db.face("Source Serif 4", "Regular");
+        let before: Vec<String> =
+            "مرحبا بالعالم".chars().filter(|c| !c.is_whitespace()).map(|c| db.fallback_for(c, latin.id()).unwrap().family.clone()).collect();
+        assert!(before.iter().all(|f| f == arabic.family), "{before:?}");
+        // A paragraph in Traditional Arabic loads its stand-in.
+        let naskh_face = resolve_in(&db, "Traditional Arabic", false, false).face;
+        assert_eq!(naskh_face.family, "Noto Naskh Arabic", "the stand-in loaded by name");
+        let after: Vec<String> =
+            "مرحبا بالعالم".chars().filter(|c| !c.is_whitespace()).map(|c| db.fallback_for(c, latin.id()).unwrap().family.clone()).collect();
+        assert_eq!(before, after, "the Arabic fallback must not depend on what has loaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn walk(dir: &std::path::Path, depth: usize) -> Vec<std::path::PathBuf> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+        rd.flatten()
+            .flat_map(|e| {
+                let p = e.path();
+                if p.is_dir() && depth < 4 { walk(&p, depth + 1) } else { vec![p] }
+            })
+            .collect()
     }
 
     #[test]

@@ -685,7 +685,8 @@ fn unbalanced_fields_and_markers() {
     assert_eq!(
         p[1].objects,
         vec![InlineObject::Field {
-            instr: "IF X = \"y\"".into(),
+            // WHIQ (corpus gate W1): the nested field stays a field (it was frozen to `X`).
+            instr: format!("IF {} = \"y\"", wordcraft_doc::fields::nest("MERGEFIELD x", "X", false, false)),
             result: String::new(),
             locked: false,
             dirty: false,

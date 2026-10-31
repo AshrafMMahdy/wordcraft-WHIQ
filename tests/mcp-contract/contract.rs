@@ -727,6 +727,18 @@ fn arabic_paragraphs_are_right_to_left_and_exported_with_embedded_fonts() {
     // Subset fonts are named with a six-letter tag (`ABCDEF+Name`).
     let subset = s.split("/BaseFont").skip(1).any(|t| t.trim_start().trim_start_matches('/').chars().take(7).collect::<String>().ends_with('+'));
     assert!(subset, "fonts are embedded as subsets");
+    // WHIQ (corpus gate W6): the Arabic line (in the default font, Aptos) is set in the embedded
+    // Arabic face server_status names, whatever the host has (Windows set it in its Arial).
+    let st = m.ok("server_status", json!({}));
+    if let Some(arabic) = st["fonts"]["arabic"].as_str() {
+        let want = format!("+{}", arabic.replace(' ', ""));
+        assert!(
+            s.contains(&want),
+            "the PDF embeds {want}: {:?}",
+            s.split("/BaseFont").skip(1).map(|t| t.chars().take(40).collect::<String>()).collect::<Vec<_>>()
+        );
+        assert_eq!(st["fonts"]["default"], "Carlito", "the stand-in for Aptos and Calibri is embedded: {}", st["fonts"]);
+    }
 }
 
 /// The round trip through MCP: every corpus document (hand-written packages with tracked changes,

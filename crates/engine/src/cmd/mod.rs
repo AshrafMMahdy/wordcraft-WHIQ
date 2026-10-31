@@ -299,6 +299,8 @@ fn insert_text(s: &mut Session, text: &str, enter: bool) -> Result<(), CmdError>
     delete_selection(s)?;
     // Typed text is new: never deleted, and not a formatting change of the text around it.
     props.fmt_change = None;
+    // WHIQ: nor in the move the text beside it left in.
+    props.moved_from = None;
     if s.doc.settings.track_changes {
         props.ins = Some(new_revision(s, RevisionKind::Insert));
         props.del = None;

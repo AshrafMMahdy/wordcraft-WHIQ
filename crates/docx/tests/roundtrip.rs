@@ -113,6 +113,7 @@ fn every_char_prop_round_trips() {
         link: None,
         ins: None,
         del: None,
+        moved_from: None,
         fmt_change: None,
         // WHIQ: unmodelled run properties ride along as markup.
         ext_xml: Some("<w:webHidden/>".into()),

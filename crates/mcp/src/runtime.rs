@@ -440,7 +440,12 @@ pub fn fonts_json() -> Value {
         }
     }
     let arabic = all.iter().find(|f| f.scripts.contains(&"Arab")).map(|f| f.family);
-    let latin = all.iter().find(|f| f.scripts.contains(&"Latn") && !f.scripts.contains(&"Jpan") && !f.scripts.contains(&"Hans")).map(|f| f.family);
+    // WHIQ: the default text font (Aptos, as Word's) is set in its embedded stand-in, Carlito.
+    let latin = all
+        .iter()
+        .find(|f| f.family == "Carlito")
+        .or_else(|| all.iter().find(|f| f.scripts.contains(&"Latn") && !f.scripts.contains(&"Jpan") && !f.scripts.contains(&"Hans")))
+        .map(|f| f.family);
     json!({"source": "craft-fonts", "faces": all.len(), "families": families, "default": latin, "arabic": arabic})
 }
 

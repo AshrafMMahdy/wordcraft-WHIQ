@@ -122,14 +122,18 @@ pub fn resolve(s: &mut Session, names: &BTreeSet<String>, accept: bool) -> Resul
     for st in stories(s) {
         for path in s.doc.para_paths(st).into_iter().rev() {
             let Some(p) = s.doc.para(st, &path) else { continue };
-            let ranges: Vec<(usize, usize, bool, bool)> =
-                p.run_ranges().map(|(r, c)| (r.start, r.end, named(s, c.ins), named(s, c.del))).filter(|(_, _, ins, del)| *ins || *del).collect();
+            // WHIQ: text deleted inside a move's source (`CharProps::moved_from`) leaves the move.
+            let ranges: Vec<(usize, usize, bool, bool, bool)> = p
+                .run_ranges()
+                .map(|(r, c)| (r.start, r.end, named(s, c.ins), named(s, c.del), named(s, c.moved_from)))
+                .filter(|(_, _, ins, del, from)| *ins || *del || *from)
+                .collect();
             let (mark_ins, mark_del) = (named(s, p.mark.ins), named(s, p.mark.del));
             if ranges.is_empty() && !mark_ins && !mark_del {
                 continue;
             }
             let para = s.doc.para_mut(st, &path)?;
-            for (a, b, ins, del) in ranges.into_iter().rev() {
+            for (a, b, ins, del, from) in ranges.into_iter().rev() {
                 if (del && accept) || (ins && !accept) {
                     para.delete(a, b)?;
                 } else {
@@ -139,6 +143,9 @@ pub fn resolve(s: &mut Session, names: &BTreeSet<String>, accept: bool) -> Resul
                         }
                         if del {
                             c.del = None;
+                        }
+                        if from {
+                            c.moved_from = None;
                         }
                     })?;
                 }

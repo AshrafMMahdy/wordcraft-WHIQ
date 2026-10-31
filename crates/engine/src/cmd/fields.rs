@@ -60,7 +60,8 @@ impl FieldAt {
     fn json(&self) -> Value {
         json!({
             "pos": super::pos_json(&self.at),
-            "instr": self.instr,
+            // WHIQ: nested fields as Word shows them (`IF { PAGE } = { NUMPAGES } …`).
+            "instr": wordcraft_doc::fields::instr_code(&self.instr),
             "locked": self.locked,
             "range": self.end.is_some(),
             "code": self.code,
@@ -152,7 +153,8 @@ pub fn show_results(s: &mut Session) -> Result<(), CmdError> {
 /// Set the selected field's code (the first one, when several are selected), then update fields
 /// so its result follows.
 fn set_code(s: &mut Session, v: &Value) -> CmdResult {
-    let code = p::req_str(v, "code")?.trim().to_string();
+    // WHIQ: the nesting markers (`wordcraft_doc::fields::NEST_BEGIN`…) are the reader's alone.
+    let code = wordcraft_doc::fields::strip_nest_markers(p::req_str(v, "code")?.trim());
     if code.is_empty() || code.len() > MAX_CODE || code.contains(OBJ) {
         return Err(CmdError::Params("bad field code".into()));
     }
