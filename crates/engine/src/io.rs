@@ -515,6 +515,15 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     Err(format!("{path}: files are opened through the browser on the web"))
 }
 
+/// WHIQ: whether `a` and `b` name the same file (links and `.`/`..` resolved when both exist,
+/// else compared as written): an export must not write over the document it reads.
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.components().eq(b.components()),
+    }
+}
+
 /// [`read_file`] for a file that must be a regular file of at most `max` bytes, checked before
 /// anything is read (a font named by the user, which could be any size).
 #[cfg(not(target_arch = "wasm32"))]

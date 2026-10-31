@@ -18,7 +18,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("document.markdown", "Document as Markdown", "Agents", markdown)
             .params(
-                r#"{"part"?: 1-based, "partSize"?: characters of text a part holds (default 40000; no upper limit), "pages"?, "section"?, "markup"?: bool (tracked changes and comments in CriticMarkup, default true), "path"?: file to write (the whole document unless part, pages or section is given)} → {markdown | path, part, parts, nextPart, blocks, stats}"#,
+                r#"{"part"?: 1-based, "partSize"?: characters of text a part holds (default 40000; no upper limit), "pages"?, "section"?, "markup"?: bool (tracked changes and comments in CriticMarkup, default true), "out"?: the .md file to write (the whole document unless part, pages or section is given; never a document file or the document's own file)} → {markdown | out, part, parts, nextPart, blocks, stats}"#,
             )
             .pure(),
     ]
@@ -116,8 +116,28 @@ fn preview(s: &mut Session, v: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// WHIQ: `out` may not name a Word document or the document's own file: the Markdown would
+/// replace it (an agent reading a contract with `path` once wrote over it).
+fn check_out(s: &Session, out: &str) -> Result<(), CmdError> {
+    let ext = std::path::Path::new(out).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if matches!(ext.as_str(), "docx" | "dotx" | "docm" | "dotm" | "doc" | "dot" | "odt" | "rtf") {
+        return Err(CmdError::Params(format!(
+            "`out` {out} names a document file: give a .md file for the Markdown (the document itself is never replaced)"
+        )));
+    }
+    if let Some(own) = &s.path
+        && crate::io::same_file(own, std::path::Path::new(out))
+    {
+        return Err(CmdError::Params(format!("`out` {out} is the document being read: give another file for the Markdown")));
+    }
+    Ok(())
+}
+
 fn markdown(s: &mut Session, v: &Value) -> CmdResult {
-    let path = p::str(v, "path").map(str::trim).filter(|x| !x.is_empty());
+    let path = p::str(v, "out").map(str::trim).filter(|x| !x.is_empty());
+    if let Some(out) = path {
+        check_out(s, out)?;
+    }
     let mut o = options(s, v, wp::MARKDOWN_PART_CHARS);
     let named = window(s, v)?;
     // A file of the whole document unless a part or window is named.
@@ -135,7 +155,7 @@ fn markdown(s: &mut Session, v: &Value) -> CmdResult {
     match path {
         Some(path) => {
             crate::io::write_file(path, r.text.as_bytes()).map_err(CmdError::Failed)?;
-            out["path"] = json!(path);
+            out["out"] = json!(path);
             out["bytes"] = json!(r.text.len());
         }
         None => out["markdown"] = json!(r.text),
@@ -198,7 +218,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wc-md-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("all.md");
-        let r = s.run("document.markdown", &json!({"path": path.to_string_lossy()})).unwrap();
+        let r = s.run("document.markdown", &json!({"out": path.to_string_lossy()})).unwrap();
+        assert!(s.run("document.markdown", &json!({"out": dir.join("x.docx").to_string_lossy()})).is_err(), "never over a document");
         assert_eq!((r["parts"].clone(), r.get("markdown").is_none()), (json!(1), true), "{r}");
         let all = std::fs::read_to_string(&path).unwrap();
         assert!(all.starts_with("Paragraph 0 ") && all.trim_end().ends_with(&format!("Paragraph 499 {}", "lorem ipsum ".repeat(12).trim_end())));

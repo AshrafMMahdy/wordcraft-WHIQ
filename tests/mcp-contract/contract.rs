@@ -1173,7 +1173,7 @@ fn render_preview_and_export_markdown_draw_the_document_in_parts() {
     let w = m.ok("render_preview", json!({"pages": "2"}));
     assert!(w["pages"]["from"] == 2 && w["blocks"]["from"].as_u64().unwrap() > 0, "{}", w["blocks"]);
     // To a file, the whole document.
-    let f = m.ok("export_markdown", json!({"path": "long.md"}));
+    let f = m.ok("export_markdown", json!({"out": "long.md"}));
     assert_eq!(f["parts"], 1);
     assert_eq!(std::fs::read_to_string(d.path("long.md")).unwrap().matches("Paragraph ").count(), 1500);
     // A file drawn without opening it: the open document is untouched.
@@ -1376,4 +1376,36 @@ fn an_agent_works_a_word_document_like_a_person_in_word() {
     for kept in ["The roof is sound.", "| Store | 7 sq m |", "| Lab | 9 sq m |", "Fix the downpipe", "![Floor plan](picture:"] {
         assert!(md2.contains(kept), "`{kept}` is kept:\n{md2}");
     }
+}
+
+/// v0.7.4: `export_markdown {path}` READS the file (as render_preview does) and never writes it;
+/// `out` is where the Markdown goes, and it may not name a document or the file being read.
+#[test]
+fn export_markdown_reads_path_and_never_writes_over_it() {
+    let d = Dir::new("md-read");
+    let mut m = Mcp::start(&d.0, &[]);
+    m.ok("import_markdown", json!({"markdown": "# Contract\n\nThe Supplier shall deliver.\n", "cover": false, "footer": "none"}));
+    m.ok("save_document", json!({"path": "contract.docx"}));
+    m.ok("new_document", json!({}));
+    m.ok("type_text", json!({"text": "Open one"}));
+    let before = std::fs::read(d.path("contract.docx")).unwrap();
+    let r = m.ok("export_markdown", json!({"path": "contract.docx"}));
+    assert!(r["markdown"].as_str().unwrap().starts_with("# Contract\n\nThe Supplier shall deliver."), "{r}");
+    assert_eq!(r["read"], "contract.docx");
+    assert_eq!(std::fs::read(d.path("contract.docx")).unwrap(), before, "the file is byte for byte as it was");
+    assert!(!d.names().iter().any(|n| n.starts_with("OLD_")), "no OLD_ copy: nothing was written over: {:?}", d.names());
+    assert_eq!(m.ok("get_text", json!({}))["text"], "Open one", "the open document is untouched");
+    // `out` writes the Markdown; `output` means `out` here.
+    let w = m.ok("export_markdown", json!({"path": "contract.docx", "out": "contract.md"}));
+    assert_eq!(w["out"], "contract.md");
+    assert!(std::fs::read_to_string(d.path("contract.md")).unwrap().starts_with("# Contract"));
+    m.ok("export_markdown", json!({"path": "contract.docx", "output": "copy.md"}));
+    assert!(d.path("copy.md").exists());
+    // Never over a document, or over the file being read.
+    for out in ["contract.docx", "other.docx", "t.dotx", "m.docm"] {
+        let e = m.err("export_markdown", json!({"path": "contract.docx", "out": out}), "invalid_argument");
+        assert!(e["reason"].as_str().unwrap().contains("out"), "{e}");
+    }
+    assert_eq!(std::fs::read(d.path("contract.docx")).unwrap(), before);
+    m.err("export_markdown", json!({"path": "missing.docx"}), "not_found");
 }

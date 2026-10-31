@@ -85,7 +85,7 @@ fn files_meta(name: &str) -> Option<Value> {
     let (read, opens): (&[&str], bool) = match name {
         "open_document" | "import_markdown" => (&["path"], true),
         "new_document" => (&[], true),
-        "roundtrip_check" | "render_preview" => (&["path"], false),
+        "roundtrip_check" | "render_preview" | "export_markdown" => (&["path"], false),
         "compare_documents" => (&["revised", "original"], false),
         _ => return None,
     };
@@ -216,14 +216,15 @@ fn own_tools() -> Vec<Value> {
         def(
             "export_markdown",
             "Export Markdown",
-            "Read the document as Markdown, in parts for any size: headings, list labels, tables (GFM, merged cells noted under the table), pictures as ![alt](picture:name WxHpt), footnotes [^1], page breaks as <!-- pagebreak -->, and with markup (default) tracked changes and comments in CriticMarkup: {++inserted++}, {--deleted--}, {==commented text==}{>>C1 Author (date): comment<<}. part_size is the characters of text a part holds (default 40000, no upper limit); the answer says part, parts and next_part. With `path` the Markdown goes to that file instead (the whole document unless part, part_size, pages or section is given).",
+            "Read the document as Markdown, in parts for any size: headings, list labels, tables (GFM, merged cells noted under the table), pictures as ![alt](picture:name WxHpt), footnotes [^1], page breaks as <!-- pagebreak -->, and with markup (default) tracked changes and comments in CriticMarkup: {++inserted++}, {--deleted--}, {==commented text==}{>>C1 Author (date): comment<<}. part_size is the characters of text a part holds (default 40000, no upper limit); the answer says part, parts and next_part. `path` reads a file without opening it (the file is never changed); `out` writes the Markdown to a .md file instead of answering with it (the whole document unless part, part_size, pages or section is given).",
             json!({
                 "part": n("1-based part (default 1)"),
                 "part_size": n("Characters of text a part holds (default 40000; any larger number is honoured)"),
                 "pages": s("Instead of a part: the blocks that start on these printed pages, e.g. \"3-5\""),
                 "section": n("Instead of a part: 1-based section"),
                 "markup": b("Tracked changes and comments in CriticMarkup (default true); false: the text as if every change were accepted"),
-                "path": s("Write the Markdown to this .md file (inside the write root) instead of answering with it"),
+                "path": s("A file to read (.docx, .doc, .odt, .rtf…) without opening it: the open documents and the file are untouched. Default: the open document"),
+                "out": s("Write the Markdown to this .md file (inside the write root) instead of answering with it; never a document file (.docx, .dotx, .docm…) or the file being read"),
             }),
             &[],
         ),
@@ -603,13 +604,15 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                 }
             }
             let command = if preview { "document.preview" } else { "document.markdown" };
-            let file = if preview { st("path").map(str::trim).filter(|x| !x.is_empty()) } else { None };
-            if !preview && let Some(path) = st("path") {
-                p["path"] = json!(path);
+            // `path` is a file to read without opening it (both tools); `out` the Markdown file
+            // to write (export_markdown).
+            let file = st("path").map(str::trim).filter(|x| !x.is_empty());
+            if !preview && let Some(out) = st("out") {
+                p["out"] = json!(out);
             }
-            progress(0, 1, if preview { "drawing the preview" } else { "writing Markdown" });
+            progress(0, 1, if preview { "drawing the preview" } else { "reading as Markdown" });
             let r = match file {
-                Some(path) => preview_file(path, &p),
+                Some(path) => preview_file(path, command, &p),
                 None => exec(b, command, p),
             };
             r.map(|v| Out::Json(preview_shape(v))).map_err(|e| preview_error(&e, name, a))
@@ -1021,12 +1024,14 @@ fn preview_shape(mut v: Value) -> Value {
 }
 
 /// Draw the file at `path` without opening it in the server: a scratch session of its own.
-fn preview_file(path: &str, p: &Value) -> Result<Value, String> {
+fn preview_file(path: &str, command: &str, p: &Value) -> Result<Value, String> {
     let region = wordcraft_engine::Region::default();
     let (doc, _) = wordcraft_engine::io::open_path_in(std::path::Path::new(path), None, &region)?;
     let mut s = wordcraft_engine::Session::new(doc);
     s.path = Some(path.into());
-    s.run("document.preview", p).map_err(|e| e.to_string())
+    let mut r = s.run(command, p).map_err(|e| e.to_string())?;
+    r["read"] = json!(path);
+    Ok(r)
 }
 
 /// A preview or Markdown refusal: a part, page or section past the end is `out_of_range`.

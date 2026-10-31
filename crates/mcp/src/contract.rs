@@ -219,6 +219,9 @@ const ARG_SYNONYMS: &[(&str, &str)] = &[
     ("filename", "path"),
     ("filepath", "path"),
     ("file_path", "path"),
+    // WHIQ: a tool that reads `path` and writes `out` (export_markdown) takes these as `out`.
+    ("output", "out"),
+    ("destination", "out"),
     ("output", "path"),
     ("out", "path"),
     ("destination", "path"),
@@ -246,11 +249,13 @@ pub fn normalise_args(args: &Value, schema: &Value) -> Result<(Value, Vec<String
         Value::Null => {}
         Value::Object(m) => {
             for (k, v) in m {
+                // The first meaning of the alias that the tool takes (`output` is `out` where a
+                // tool has both `path` and `out`, else `path`).
                 let synonym = ARG_SYNONYMS
                     .iter()
-                    .find(|(a, _)| norm(a) == norm(k))
+                    .filter(|(a, _)| norm(a) == norm(k))
                     .map(|(_, to)| (*to).to_string())
-                    .filter(|to| names.iter().any(|n| n == to) && !m.contains_key(to));
+                    .find(|to| names.iter().any(|n| n == to) && !m.contains_key(to));
                 let key = if k == "background" {
                     // WordCraft's older name for the common `async`.
                     "async".to_string()

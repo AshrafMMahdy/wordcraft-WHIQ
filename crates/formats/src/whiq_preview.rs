@@ -731,7 +731,7 @@ impl<'a> Walker<'a> {
             let mut buf = String::new();
             let flush = |buf: &mut String, segs: &mut Vec<Seg>, rc: &ResolvedChar| {
                 if !buf.is_empty() {
-                    segs.push(Seg::Text { text: std::mem::take(buf), rc: Box::new(rc.clone()) });
+                    segs.push(Seg::Text { text: symbol_text(&rc.font, &std::mem::take(buf)), rc: Box::new(rc.clone()) });
                 }
             };
             for c in text.chars() {
@@ -883,7 +883,7 @@ impl<'a> Walker<'a> {
                 };
                 let shown: String = shown.chars().filter(|c| !c.is_control() || *c == '\t').collect();
                 if !shown.is_empty() {
-                    segs.push(Seg::Text { text: shown, rc: Box::new(rc.clone()) });
+                    segs.push(Seg::Text { text: symbol_text(&rc.font, &shown), rc: Box::new(rc.clone()) });
                 }
             }
             InlineObject::Equation { linear, display, math } => {
@@ -902,13 +902,13 @@ impl<'a> Walker<'a> {
             InlineObject::Opaque { text, .. } => {
                 if !text.is_empty() {
                     let t: String = text.chars().filter(|c| !c.is_control()).collect();
-                    segs.push(Seg::Text { text: t, rc: Box::new(rc.clone()) });
+                    segs.push(Seg::Text { text: symbol_text(&rc.font, &t), rc: Box::new(rc.clone()) });
                 }
             }
             other => {
                 let t: String = other.plain_text().chars().filter(|c| !c.is_control()).collect();
                 if !t.is_empty() {
-                    segs.push(Seg::Text { text: t, rc: Box::new(rc.clone()) });
+                    segs.push(Seg::Text { text: symbol_text(&rc.font, &t), rc: Box::new(rc.clone()) });
                 }
             }
         }
@@ -1261,10 +1261,12 @@ impl<'a> Walker<'a> {
         }
         let _ = write!(html, " style=\"{css}\">");
         if let Some((text, lv)) = &label {
-            let lc = doc.styles.resolve_char_in(Some(&style), ctx.chr, &lv.chr);
+            // The label's font: the paragraph mark's with the level's over it, as layout draws it.
+            let lc = doc.styles.resolve_char_in(Some(&style), ctx.chr, &p.mark.clone().overlaid(&lv.chr));
             let lcss = char_css(&lc, &base);
             let hang = if first < 0.0 { -first } else { 0.0 };
-            let _ = write!(html, "<span class=\"ln\" style=\"min-width:{}pt;{lcss}\">{}</span>", f(hang), esc(text));
+            let shown = label_text(text, &lc.font, lv.format == wordcraft_doc::section::NumFormat::Bullet);
+            let _ = write!(html, "<span class=\"ln\" style=\"min-width:{}pt;{lcss}\">{}</span>", f(hang), esc(&shown));
             if hang <= 0.0 {
                 html.push(' ');
             }
@@ -1805,10 +1807,13 @@ impl<'a> Walker<'a> {
         if let Some(l) = rp.outline_level {
             self.stats.headings += 1;
             let _ = write!(out, "{} ", "#".repeat((l as usize + 1).min(6)));
-        } else if let Some((text, _)) = &label {
+        } else if let Some((text, lv)) = &label {
             let lvl = p.props.numbering.or_else(|| self.numref(p)).map_or(0, |n| n.level.min(8) as usize);
             out.push_str(&"  ".repeat(lvl));
-            let bullet = text.chars().count() <= 1 && !text.chars().any(|c| c.is_alphanumeric());
+            // A bullet level is a Markdown bullet whatever its glyph (•, ▪, ◦, a Symbol or
+            // Wingdings character, a picture bullet).
+            let bullet =
+                lv.format == wordcraft_doc::section::NumFormat::Bullet || (text.chars().count() <= 1 && !text.chars().any(|c| c.is_alphanumeric()));
             if bullet {
                 out.push_str("- ");
             } else {
@@ -2165,12 +2170,47 @@ fn browser_picture(bytes: &[u8]) -> Option<(&'static str, Vec<u8>)> {
     Some(("image/png", out.into_inner()))
 }
 
+/// Text set in one of Word's symbol fonts (Symbol, Wingdings, Wingdings 2 and 3, Webdings) as
+/// the Unicode characters Word shows for its codes (U+F0B7 in Symbol: •, U+F0A7 in Wingdings: ▪,
+/// U+F0D8 in Wingdings: ➢…); other text unchanged.
+fn symbol_text(font: &str, text: &str) -> String {
+    wordcraft_doc::symbol_fonts::map_text(font, text)
+}
+
+/// A list label as Word shows it: a symbol-font bullet as its Unicode character; the classic
+/// second-level bullet, `o` in Courier New, as ◦; a private-use bullet whose font is not a
+/// symbol font (a damaged or hand-made list) read as Symbol, else Wingdings.
+fn label_text(text: &str, font: &str, bullet: bool) -> String {
+    if wordcraft_doc::symbol_fonts::is_symbol_font(font) {
+        return symbol_text(font, text);
+    }
+    if !bullet {
+        return text.to_string();
+    }
+    if text == "o" && font.trim().eq_ignore_ascii_case("courier new") {
+        return "◦".to_string();
+    }
+    text.chars()
+        .map(|c| match u32::from(c) {
+            0xF020..=0xF0FF => wordcraft_doc::symbol_fonts::symbol_char("Symbol", c)
+                .or_else(|| wordcraft_doc::symbol_fonts::symbol_char("Wingdings", c))
+                .unwrap_or('•'),
+            _ => c,
+        })
+        .collect()
+}
+
 fn clean_font(name: &str) -> String {
     name.chars().filter(|c| !matches!(c, '\'' | '"' | '\\' | '<' | '>' | ';' | '{' | '}') && !c.is_control()).take(64).collect()
 }
 
 /// `font-family` with open metric-compatible faces after a proprietary one, and a generic family.
 fn font_family(name: &str) -> String {
+    // Word's symbol fonts (proprietary, never installed with the page) are shown as the Unicode
+    // characters [`symbol_text`] maps their codes to, in fonts that have those characters.
+    if wordcraft_doc::symbol_fonts::is_symbol_font(name) {
+        return "'Segoe UI Symbol','Noto Sans Symbols 2','Noto Sans Symbols','DejaVu Sans',sans-serif".to_string();
+    }
     let n = clean_font(name);
     let lower = n.to_ascii_lowercase();
     let subst = match lower.as_str() {
@@ -2576,6 +2616,43 @@ mod tests {
         assert!(first > 0 && r.text.contains(&format!(">{}.</span>Item {first}", first + 1)), "{}", r.text);
         let m = render_markdown(&d, &o, Window::Part(2)).unwrap();
         assert!(m.text.starts_with(&format!("{}. Item {}", m.piece.from + 1, m.piece.from)), "{}", m.text);
+    }
+
+    #[test]
+    fn symbol_and_wingdings_bullets_show_as_word_shows_them() {
+        // Word writes its bullets in Symbol and Wingdings as private-use codes (U+F0B7 •,
+        // U+F0A7 ▪, U+F0D8 ⮚) and its second level as `o` in Courier New; a w:sym character in
+        // a run (Wingdings U+F0FC ✓) the same way.
+        let mut d = Document::new();
+        let mut levels = wordcraft_doc::numbering::levels_for(wordcraft_doc::numbering::ListKind::Bullet);
+        for (lv, (text, font)) in levels.iter_mut().zip([
+            ("\u{F0B7}", "Symbol"),
+            ("o", "Courier New"),
+            ("\u{F0A7}", "Wingdings"),
+            ("\u{F0D8}", "Wingdings"),
+            ("\u{F076}", "Wingdings"),
+        ]) {
+            lv.text = text.into();
+            lv.chr.font = Some(font.into());
+        }
+        let num = d.numbering.try_add_levels(None, levels).unwrap();
+        let item = |t: &str, level: u8| {
+            let mut p = Paragraph::with_text(t, CharProps::default());
+            p.props.numbering = Some(NumRef { num, level });
+            para_block(p)
+        };
+        let mut tick = Paragraph::with_text("Done ", CharProps::default());
+        tick.insert_text(tick.len(), "\u{F0FC}", &CharProps { font: Some("Wingdings".into()), ..Default::default() }).unwrap();
+        d.body = vec![item("First", 0), item("Second", 1), item("Third", 2), item("Fourth", 3), item("Fifth", 4), para_block(tick)];
+        let h = html(&d);
+        for (label, text) in [("•", "First"), ("◦", "Second"), ("▪", "Third"), ("⮚", "Fourth"), ("❖", "Fifth")] {
+            assert!(h.contains(&format!(">{label}</span>{text}")), "{label} {text}: {h}");
+        }
+        assert!(h.contains("Done <span style=\"font-family:'Segoe UI Symbol'") && h.contains(">✓</span>"), "{h}");
+        assert!(!h.chars().any(|c| ('\u{F000}'..='\u{F0FF}').contains(&c)), "no private-use character is left to show as a box");
+        assert!(!h.contains("font-family:'Symbol'") && !h.contains("font-family:'Wingdings'"));
+        let m = md(&d);
+        assert_eq!(m, "- First\n  - Second\n    - Third\n      - Fourth\n        - Fifth\n\nDone ✓", "{m}");
     }
 
     #[test]

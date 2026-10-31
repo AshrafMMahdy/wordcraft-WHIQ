@@ -491,7 +491,7 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             let mut s = open(&input)?;
             if cmd == "markdown" {
                 if let Some(o) = &output {
-                    params["path"] = json!(o);
+                    params["out"] = json!(o);
                 }
                 let mut r = s.run("document.markdown", &params).map_err(|e| e.to_string())?;
                 return match r.get_mut("markdown").map(serde_json::Value::take) {
