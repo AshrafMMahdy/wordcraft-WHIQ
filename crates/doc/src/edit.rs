@@ -314,6 +314,11 @@ impl Document {
         if a.story != b.story {
             return Vec::new();
         }
+        // WHIQ: a range inside one paragraph (every match of a Replace All) without listing every
+        // paragraph of the story.
+        if a.path == b.path && self.para(a.story, &a.path).is_some() {
+            return vec![a.path.clone()];
+        }
         self.para_paths(a.story).into_iter().filter(|p| *p >= a.path && *p <= b.path).collect()
     }
 

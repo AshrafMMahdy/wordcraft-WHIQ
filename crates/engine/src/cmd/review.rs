@@ -195,7 +195,8 @@ pub fn comment_range_at_caret(s: &Session) -> Option<u32> {
 }
 
 /// Comment anchored around the caret, else the first one in its paragraph.
-fn comment_at_caret(s: &Session) -> Option<u32> {
+// WHIQ: pub(crate) for review.edit's delete_comment.
+pub(crate) fn comment_at_caret(s: &Session) -> Option<u32> {
     let f = &s.sel.focus;
     let p = s.doc.para_at(f)?;
     comment_range_at_caret(s).or_else(|| {

@@ -21,7 +21,7 @@ use wordcraft_doc::{Path, Pos, Revision, RevisionKind, StoryRef};
 
 use crate::{CmdError, CmdResult, CommandSpec, Selection, Session, p};
 
-const EDIT_PARAMS: &str = r#"{"ops": [{"op": "replace" | "insert" | "insert_paragraph" | "delete_paragraph" | "delete" | "comment", "anchor" (or "find"): text to locate, "occurrence"?: n | "all" (replace, delete; default 1), "with"?: replacement (replace), "text"?: text to insert (insert, insert_paragraph; "\n" starts another paragraph) or the comment (comment), "position"?: "before" | "after" (insert, insert_paragraph; default after), "style"?: paragraph style (insert_paragraph), "matchCase"?: bool}], "tracked"?: bool (default true), "fuzzy"?: bool (default true), "minScore"?: 0.5–1 (fuzzy matches below are refused; default 0.8), "keepGoing"?: bool (apply the operations that can be, report the rest)} → {changes: [{index, op, status, match: {kind: exact|case|normalized|fuzzy, score, found, paragraph}, location, changeIds, commentId}], applied, failed}"#;
+const EDIT_PARAMS: &str = r#"{"ops": [{"op": "replace" | "insert" | "insert_paragraph" | "delete_paragraph" | "delete" | "comment", "anchor" (or "find"): text to locate, "occurrence"?: n | "all" (replace, delete; default 1), "with"?: replacement (replace), "text"?: text to insert (insert, insert_paragraph; "\n" starts another paragraph) or the comment (comment), "position"?: "before" | "after" (insert, insert_paragraph; default after), "style"?: paragraph style (insert_paragraph), "matchCase"?: bool} | WHIQ structure: {"op": "set_style", anchor, style} | {"op": "insert_table_row", "table"?: n (1-based) or anchor, "row"?: n (after it; default the anchor's or the last), "before"?: bool, "cells"?: [text]} | {"op": "delete_table_row", table or anchor, "row"?: n} | {"op": "set_cell", table or anchor, row, col, text} | {"op": "delete_table", table or anchor} | {"op": "delete_picture", "index"?: n | "alt"?: text | anchor} | {"op": "delete_comment", "id"?: n | anchor} | {"op": "delete_section_break", "section": n}], "tracked"?: bool (default true), "fuzzy"?: bool (default true), "minScore"?: 0.5–1 (fuzzy matches below are refused; default 0.8), "keepGoing"?: bool (apply the operations that can be, report the rest)} → {changes: [{index, op, status, match: {kind: exact|case|normalized|fuzzy, score, found, paragraph}, location, changeIds, commentId}], applied, failed}"#;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -40,32 +40,58 @@ pub fn specs() -> Vec<CommandSpec> {
 /// each of its characters is.
 struct Vis {
     path: Path,
-    chars: Vec<char>,
+    chars: std::sync::Arc<Vec<char>>,
     /// Byte offset and length in the paragraph's text of each visible character.
-    at: Vec<(usize, usize)>,
+    at: std::sync::Arc<Vec<(usize, usize)>>,
     len: usize,
+}
+
+type VisData = (std::sync::Arc<Vec<char>>, std::sync::Arc<Vec<(usize, usize)>>);
+
+thread_local! {
+    /// WHIQ: during one `review.edit` batch, each paragraph's visible text by its revision (and
+    /// length): an operation rebuilds only the paragraphs the ones before it changed, not the
+    /// whole document (300 operations on a 20,000-paragraph document read it once, not 300 times).
+    static VIS_CACHE: std::cell::RefCell<Option<std::collections::HashMap<(u64, usize, usize), VisData>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keep [`visible`]'s per-paragraph results for the batch running now (`on`), or drop them.
+fn vis_cache(on: bool) {
+    VIS_CACHE.with_borrow_mut(|c| *c = on.then(std::collections::HashMap::new));
+}
+
+fn vis_data(p: &wordcraft_doc::Paragraph) -> VisData {
+    let mut chars = Vec::with_capacity(p.text.len());
+    let mut at = Vec::with_capacity(p.text.len());
+    for (range, props) in p.run_ranges() {
+        if props.del.is_some() {
+            continue;
+        }
+        let Some(text) = p.text.get(range.clone()) else { continue };
+        for (i, c) in text.char_indices() {
+            if c == OBJ {
+                continue;
+            }
+            chars.push(c);
+            at.push((range.start + i, c.len_utf8()));
+        }
+    }
+    (std::sync::Arc::new(chars), std::sync::Arc::new(at))
 }
 
 fn visible(s: &Session) -> Vec<Vis> {
     let mut out = Vec::new();
-    for path in s.doc.para_paths(StoryRef::Body) {
-        let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
-        let mut v = Vis { path: path.clone(), chars: Vec::new(), at: Vec::new(), len: p.len() };
-        for (range, props) in p.run_ranges() {
-            if props.del.is_some() {
-                continue;
-            }
-            let Some(text) = p.text.get(range.clone()) else { continue };
-            for (i, c) in text.char_indices() {
-                if c == OBJ {
-                    continue;
-                }
-                v.chars.push(c);
-                v.at.push((range.start + i, c.len_utf8()));
-            }
+    VIS_CACHE.with_borrow_mut(|cache| {
+        for path in s.doc.para_paths(StoryRef::Body) {
+            let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
+            let key = (p.rev, p.text.len(), p.runs.len());
+            let (chars, at) = match cache.as_mut() {
+                Some(c) => c.entry(key).or_insert_with(|| vis_data(p)).clone(),
+                None => vis_data(p),
+            };
+            out.push(Vis { path, chars, at, len: p.len() });
         }
-        out.push(v);
-    }
+    });
     out
 }
 
@@ -333,6 +359,14 @@ fn edit(s: &mut Session, v: &Value) -> CmdResult {
     let keep_going = p::bool(v, "keepGoing").unwrap_or(false);
     let was_tracking = s.doc.settings.track_changes;
     s.doc.settings.track_changes = tracked || s.doc.settings.protection.as_deref() == Some("trackedChanges");
+    vis_cache(true);
+    let r = edit_ops(s, &ops, tracked, fuzzy, min_score, keep_going, was_tracking);
+    vis_cache(false);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edit_ops(s: &mut Session, ops: &[Value], tracked: bool, fuzzy: bool, min_score: f64, keep_going: bool, was_tracking: bool) -> CmdResult {
     let mut results: Vec<Value> = Vec::new();
     // (op index, its revisions, its comment)
     let mut owned: Vec<(usize, [u32; 2], Option<u32>)> = Vec::new();
@@ -387,6 +421,17 @@ fn apply(s: &mut Session, op: &Value, _index: usize, fuzzy: bool, min_score: f64
     let name = op_name(op);
     let anchor = text_of(op, &["anchor", "find", "target", "old", "search"]).unwrap_or("");
     let match_case = p::bool(op, "matchCase").or_else(|| p::bool(op, "match_case")).unwrap_or(false);
+    // WHIQ: tables, pictures, comments, section breaks and styles, by index or by anchor.
+    if STRUCTURAL.contains(&name.as_str()) {
+        return structural(s, op, &name, anchor, match_case, fuzzy, min_score);
+    }
+    // Text edits add no content control: when the body has none, its matches skip the checks.
+    let _hint = super::controls::assume_no_controls(s, StoryRef::Body);
+    apply_text(s, op, &name, anchor, match_case, fuzzy, min_score)
+}
+
+fn apply_text(s: &mut Session, op: &Value, name: &str, anchor: &str, match_case: bool, fuzzy: bool, min_score: f64) -> OpResult {
+    let name = name.to_string();
     if anchor.is_empty() {
         return Err((format!("`{name}` needs an `anchor` (the text to find)"), Vec::new()));
     }
@@ -484,7 +529,10 @@ fn apply(s: &mut Session, op: &Value, _index: usize, fuzzy: bool, min_score: f64
             }
             other => {
                 return Err((
-                    format!("unknown operation `{other}`: use replace, insert, insert_paragraph, delete_paragraph, delete or comment"),
+                    format!(
+                        "unknown operation `{other}`: use replace, insert, insert_paragraph, delete_paragraph, delete, comment, {}",
+                        STRUCTURAL.join(", ")
+                    ),
                     Vec::new(),
                 ));
             }
@@ -495,6 +543,258 @@ fn apply(s: &mut Session, op: &Value, _index: usize, fuzzy: bool, min_score: f64
     if chosen.len() > 1 {
         r["matches"] = json!(matches);
         r["locations"] = json!(locations);
+    }
+    Ok((r, revs, comment))
+}
+
+/// WHIQ: operations on the document's structure rather than on anchor text.
+const STRUCTURAL: &[&str] =
+    &["set_style", "insert_table_row", "delete_table_row", "set_cell", "delete_table", "delete_picture", "delete_comment", "delete_section_break"];
+
+type StepErr = (String, Vec<Value>);
+
+/// The paragraph `anchor` is in (the first match), or the error naming the closest text.
+fn anchor_pos(s: &Session, anchor: &str, match_case: bool, fuzzy: bool, min_score: f64) -> Result<(Pos, Value), StepErr> {
+    if anchor.is_empty() {
+        return Err(("needs an `anchor` (text to find) or an index".into(), Vec::new()));
+    }
+    let vis = visible(s);
+    let hits = locate(&vis, anchor, match_case, fuzzy, min_score);
+    let Some(h) = hits.first() else { return Err((format!("anchor `{anchor}` not found"), closest(&vis, anchor))) };
+    let (a, _) = h.range(&vis).ok_or_else(|| (format!("anchor `{anchor}` not found"), Vec::new()))?;
+    Ok((a, h.json(&vis)))
+}
+
+/// The table an operation names: `table` (1-based, body tables in order, nested ones after their
+/// table) or the innermost table holding `anchor`; with the row (0-based) the anchor is in.
+fn table_of(s: &Session, op: &Value, anchor: &str, mc: bool, fz: bool, ms: f64) -> Result<(Path, Option<usize>, Value), StepErr> {
+    if let Some(n) = p::u64(op, "table") {
+        let mut tables = Vec::new();
+        collect_tables(&s.doc.body, &[], &mut tables, 0);
+        let count = tables.len();
+        return tables
+            .into_iter()
+            .nth((n.max(1) - 1) as usize)
+            .map(|t| (t, None, Value::Null))
+            .ok_or_else(|| (format!("table {n} is out of range: the document has {count} tables"), Vec::new()));
+    }
+    let (a, m) = anchor_pos(s, anchor, mc, fz, ms)?;
+    let (tp, row, _) = a.path.cell().ok_or_else(|| (format!("anchor `{anchor}` is not in a table"), Vec::new()))?;
+    Ok((tp, Some(row), m))
+}
+
+fn collect_tables(bl: &wordcraft_doc::Blocks, prefix: &[u32], out: &mut Vec<Path>, depth: usize) {
+    for (i, b) in bl.iter().enumerate() {
+        if let wordcraft_doc::Block::Table(t) = &**b {
+            let mut here = prefix.to_vec();
+            here.push(i as u32);
+            out.push(Path(here.clone()));
+            if depth < 8 {
+                for (r, row) in t.rows.iter().enumerate() {
+                    for (c, cell) in row.cells.iter().enumerate() {
+                        let mut inner = here.clone();
+                        inner.extend([r as u32, c as u32]);
+                        collect_tables(&cell.blocks, &inner, out, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The first paragraph of cell (`row`, `col`) of the table at `tp`.
+fn cell_start(tp: &Path, row: usize, col: usize) -> Pos {
+    let mut v = tp.0.clone();
+    v.extend([row as u32, col as u32, 0]);
+    Pos { story: StoryRef::Body, path: Path(v), off: 0 }
+}
+
+/// Select the whole text of cell (`row`, `col`).
+fn select_cell_text(s: &mut Session, tp: &Path, row: usize, col: usize) -> Result<(), StepErr> {
+    let n = s.doc.table(StoryRef::Body, tp).and_then(|t| t.rows.get(row)).and_then(|r| r.cells.get(col)).map(|c| c.blocks.len());
+    let Some(n) = n else { return Err((format!("no cell at row {} column {}", row + 1, col + 1), Vec::new())) };
+    let a = cell_start(tp, row, col);
+    let mut last = a.path.clone();
+    last = last.with_last(n.saturating_sub(1));
+    let len = s.doc.para(StoryRef::Body, &last).map_or(0, |p| p.len());
+    s.sel = Selection { anchor: a, focus: Pos { story: StoryRef::Body, path: last, off: len } };
+    Ok(())
+}
+
+fn rows_of(s: &Session, tp: &Path) -> usize {
+    s.doc.table(StoryRef::Body, tp).map_or(0, |t| t.rows.len())
+}
+
+/// 1-based `key` of `op` as a 0-based index, or `fallback`.
+fn index(op: &Value, key: &str, fallback: Option<usize>) -> Option<usize> {
+    p::u64(op, key).map(|n| (n.max(1) - 1) as usize).or(fallback)
+}
+
+fn run_step(s: &mut Session, id: &str, v: &Value) -> Result<Value, StepErr> {
+    s.join_next_undo();
+    s.run(id, v).map_err(|e| (format!("{id}: {e}"), Vec::new()))
+}
+
+/// Every picture in the body in document order: (paragraph path, byte offset, alt text).
+fn pictures(s: &Session) -> Vec<(Path, usize, String)> {
+    let mut out = Vec::new();
+    for path in s.doc.para_paths(StoryRef::Body) {
+        let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
+        let mut k = 0usize;
+        for (off, c) in p.text.char_indices() {
+            if c != OBJ {
+                continue;
+            }
+            if let Some(o @ wordcraft_doc::para::InlineObject::Image { .. }) = p.objects.get(k)
+                && p.props_of_char(off).del.is_none()
+            {
+                out.push((path.clone(), off, o.alt_text().to_string()));
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+fn structural(s: &mut Session, op: &Value, name: &str, anchor: &str, mc: bool, fz: bool, ms: f64) -> OpResult {
+    let mut r = json!({"op": name});
+    let mut comment = None;
+    let tracked = s.doc.settings.track_changes;
+    let revs = if tracked && !matches!(name, "delete_comment" | "set_style" | "delete_section_break") { fresh_revisions(s) } else { [u32::MAX; 2] };
+    match name {
+        "set_style" => {
+            let style = p::str(op, "style").ok_or_else(|| ("`set_style` needs `style` (a paragraph style name or id)".to_string(), Vec::new()))?;
+            let (a, m) = anchor_pos(s, anchor, mc, fz, ms)?;
+            s.sel = Selection::caret(a.clone());
+            run_step(s, "para.style", &json!({"style": style}))?;
+            r["match"] = m;
+            r["location"] = loc(&a);
+        }
+        "insert_table_row" => {
+            let (tp, arow, m) = table_of(s, op, anchor, mc, fz, ms)?;
+            let n = rows_of(s, &tp);
+            // After `row` (1-based), else after the anchor's row, else at the end; `before: true`
+            // puts it above that row.
+            let at = index(op, "row", arow).unwrap_or(n.saturating_sub(1)).min(n.saturating_sub(1));
+            let above = p::bool(op, "before").unwrap_or(false);
+            s.sel = Selection::caret(cell_start(&tp, at, 0));
+            run_step(s, if above { "table.insertRowAbove" } else { "table.insertRowBelow" }, &json!({}))?;
+            let new_row = if above { at } else { at + 1 };
+            let cells: Vec<String> = op
+                .get("cells")
+                .and_then(Value::as_array)
+                .map(|v| v.iter().map(|c| c.as_str().map_or_else(|| c.to_string(), str::to_string)).collect())
+                .unwrap_or_default();
+            for (c, text) in cells.iter().enumerate() {
+                if text.is_empty() {
+                    continue;
+                }
+                select_cell_text(s, &tp, new_row, c)?;
+                super::type_text(s, &text.replace('\n', "\r")).map_err(|e| (e.to_string(), Vec::new()))?;
+            }
+            r["table"] = json!(tp.0);
+            r["row"] = json!(new_row + 1);
+            r["match"] = m;
+        }
+        "delete_table_row" => {
+            let (tp, arow, m) = table_of(s, op, anchor, mc, fz, ms)?;
+            let n = rows_of(s, &tp);
+            let row = index(op, "row", arow)
+                .ok_or_else(|| ("`delete_table_row` needs `row` (1-based) or an `anchor` in the row".to_string(), Vec::new()))?;
+            if row >= n {
+                return Err((format!("row {} is out of range: the table has {n} rows", row + 1), Vec::new()));
+            }
+            s.sel = Selection::caret(cell_start(&tp, row, 0));
+            run_step(s, "table.deleteRow", &json!({}))?;
+            r["table"] = json!(tp.0);
+            r["row"] = json!(row + 1);
+            r["match"] = m;
+        }
+        "set_cell" => {
+            let (tp, arow, m) = table_of(s, op, anchor, mc, fz, ms)?;
+            let row = index(op, "row", arow).ok_or_else(|| ("`set_cell` needs `row` and `col` (1-based)".to_string(), Vec::new()))?;
+            let col = index(op, "col", None)
+                .or_else(|| index(op, "column", None))
+                .ok_or_else(|| ("`set_cell` needs `col` (1-based)".to_string(), Vec::new()))?;
+            let text = text_of(op, &["text", "with", "value"]).unwrap_or("");
+            select_cell_text(s, &tp, row, col)?;
+            if s.sel.anchor == s.sel.focus && text.is_empty() {
+                // Nothing to replace.
+            } else if text.is_empty() {
+                super::delete_selection(s).map_err(|e| (e.to_string(), Vec::new()))?;
+            } else {
+                super::type_text(s, &text.replace('\n', "\r")).map_err(|e| (e.to_string(), Vec::new()))?;
+            }
+            r["table"] = json!(tp.0);
+            r["row"] = json!(row + 1);
+            r["col"] = json!(col + 1);
+            r["match"] = m;
+        }
+        "delete_table" => {
+            let (tp, _, m) = table_of(s, op, anchor, mc, fz, ms)?;
+            s.sel = Selection::caret(cell_start(&tp, 0, 0));
+            run_step(s, "table.deleteTable", &json!({}))?;
+            r["table"] = json!(tp.0);
+            r["match"] = m;
+        }
+        "delete_picture" => {
+            let list = pictures(s);
+            let count = list.len();
+            let alt = p::str(op, "alt").map(str::to_lowercase);
+            let chosen = match (index(op, "index", None), alt) {
+                (Some(i), _) => list.into_iter().nth(i),
+                (None, Some(a)) => list.into_iter().find(|(_, _, t)| t.to_lowercase().contains(&a)),
+                (None, None) if !anchor.is_empty() => {
+                    let (a, _) = anchor_pos(s, anchor, mc, fz, ms)?;
+                    list.into_iter().find(|(path, _, _)| *path == a.path)
+                }
+                _ => {
+                    return Err((
+                        "`delete_picture` needs `index` (1-based), `alt` (its alt text) or an `anchor` in its paragraph".into(),
+                        Vec::new(),
+                    ));
+                }
+            };
+            let (path, off, alt) = chosen.ok_or_else(|| (format!("no such picture: the document has {count}"), Vec::new()))?;
+            let a = Pos { story: StoryRef::Body, path: path.clone(), off };
+            s.sel = Selection { anchor: a.clone(), focus: Pos { off: off + OBJ.len_utf8(), ..a.clone() } };
+            super::delete_selection(s).map_err(|e| (e.to_string(), Vec::new()))?;
+            r["alt"] = json!(alt);
+            r["location"] = loc(&a);
+        }
+        "delete_comment" => {
+            let id = match p::u64(op, "id") {
+                Some(id) => id as u32,
+                None => {
+                    let (a, _) = anchor_pos(s, anchor, mc, fz, ms)?;
+                    s.sel = Selection::caret(a);
+                    super::review::comment_at_caret(s).ok_or_else(|| (format!("no comment on `{anchor}`"), Vec::new()))?
+                }
+            };
+            if !s.doc.comments.contains_key(&id) {
+                return Err((format!("no comment {id}"), Vec::new()));
+            }
+            run_step(s, "review.deleteComment", &json!({"id": id}))?;
+            comment = Some(id);
+            r["deleted"] = json!(id);
+        }
+        "delete_section_break" => {
+            let n = p::u64(op, "section")
+                .ok_or_else(|| ("`delete_section_break` needs `section` (1-based: the break ending that section)".to_string(), Vec::new()))?;
+            let secs: Vec<usize> = s.doc.sections().into_iter().map(|(i, _)| i).collect();
+            let k = (n.max(1) - 1) as usize;
+            if k + 1 >= secs.len() {
+                return Err((format!("section {n} has no break after it: the document has {} sections", secs.len()), Vec::new()));
+            }
+            let Some(&i) = secs.get(k) else { return Err(("no such section".into(), Vec::new())) };
+            let path = Path::top(i);
+            let p = s.doc.para_mut(StoryRef::Body, &path).map_err(|e| (e.to_string(), Vec::new()))?;
+            p.section = None;
+            p.touch();
+            r["section"] = json!(n);
+            r["sections"] = json!(secs.len() - 1);
+        }
+        _ => return Err((format!("unknown operation `{name}`"), Vec::new())),
     }
     Ok((r, revs, comment))
 }
@@ -524,7 +824,7 @@ fn entries(s: &Session) -> Vec<Entry> {
         let rev = c.rev.and_then(|r| s.doc.revisions.get(r as usize));
         let author = rev.map(|r| r.author.clone()).unwrap_or_default();
         let date = rev.map(|r| r.date.clone()).unwrap_or_default();
-        let text = s.doc.copy_range(&c.a, &c.b).plain_text();
+        let text = range_text(s, &c.a, &c.b);
         let key = format!("{}|{author}|{date}|{text}|{}", c.kind, Value::Array(c.props.clone()));
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in key.bytes() {
@@ -536,6 +836,34 @@ fn entries(s: &Session) -> Vec<Entry> {
         *n += 1;
         let id = if *n == 1 { base } else { format!("{base}-{n}") };
         out.push(Entry { id, kind: c.kind, rev: c.rev, author, date, text, a: c.a, b: c.b });
+    }
+    out
+}
+
+/// The text between `a` and `b`, as `copy_range(a, b).plain_text()` gives it (objects as their
+/// plain text), without building a document for a range inside one paragraph: a report of
+/// thousands of changes reads each change's text this way.
+fn range_text(s: &Session, a: &Pos, b: &Pos) -> String {
+    if a.path != b.path || a.story != b.story {
+        return s.doc.copy_range(a, b).plain_text();
+    }
+    let Some(p) = s.doc.para(a.story, &a.path) else { return String::new() };
+    let (from, to) = (a.off.min(b.off), a.off.max(b.off));
+    let mut out = String::new();
+    let mut k = 0usize;
+    for (i, c) in p.text.char_indices() {
+        let inside = i >= from && i < to;
+        if c == OBJ {
+            if inside && let Some(o) = p.objects.get(k) {
+                out.push_str(o.plain_text());
+            }
+            k += 1;
+        } else if inside {
+            out.push(c);
+        }
+        if i >= to {
+            break;
+        }
     }
     out
 }
@@ -649,6 +977,54 @@ mod tests {
         let mut s = Session::new(Document::from_text(text));
         s.author = "Reviewer".into();
         s
+    }
+
+    #[test]
+    fn a_locked_content_control_still_refuses_a_replace_all() {
+        // WHIQ: the controls hint skips the checks only for a body that has no controls.
+        let mut s = session("Fee: TEN dollars. Also TEN here.");
+        s.run("select.text", &json!({"text": "TEN", "occurrence": 1})).unwrap();
+        s.run("developer.plainText", &json!({"tag": "fee"})).unwrap();
+        s.run("developer.properties", &json!({"control": "fee", "lockEdit": true})).unwrap();
+        let before = s.doc.clone();
+        let e = s.run("review.edit", &json!({"ops": [{"op": "replace", "anchor": "TEN", "with": "TWELVE", "occurrence": "all"}]}));
+        assert!(e.is_err(), "{e:?}");
+        assert!(s.doc == before, "nothing changed");
+        // Without controls the same batch goes through.
+        let mut s = session("Fee: TEN dollars. Also TEN here.");
+        let r = s
+            .run("review.edit", &json!({"ops": [{"op": "replace", "anchor": "TEN", "with": "TWELVE", "occurrence": "all"}], "tracked": false}))
+            .unwrap();
+        assert_eq!(r["applied"], 1);
+        assert_eq!(s.doc.final_text(StoryRef::Body), "Fee: TWELVE dollars. Also TWELVE here.");
+    }
+
+    #[test]
+    fn structure_operations_edit_tables_pictures_comments_and_sections() {
+        let mut s = session("Intro\nAfter");
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
+        let r = s
+            .run(
+                "review.edit",
+                &json!({"tracked": false, "ops": [
+                    {"op": "set_cell", "table": 1, "row": 1, "col": 1, "text": "A1"},
+                    {"op": "set_cell", "table": 1, "row": 2, "col": 2, "text": "B2"},
+                    {"op": "insert_table_row", "table": 1, "cells": ["C1", "C2"]},
+                    {"op": "delete_table_row", "anchor": "B2"},
+                    {"op": "set_style", "anchor": "Intro", "style": "Heading 1"},
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(r["applied"], 5, "{r}");
+        let t = s.doc.body.iter().find_map(|b| b.as_table()).unwrap();
+        let cell = |r: usize, c: usize| t.rows[r].cells[c].blocks[0].as_para().unwrap().text.clone();
+        assert_eq!((t.rows.len(), cell(0, 0), cell(1, 0), cell(1, 1)), (2, "A1".into(), "C1".into(), "C2".into()));
+        assert_eq!(s.doc.body[0].as_para().unwrap().props.style.as_deref(), Some("Heading1"));
+        let e = s.run("review.edit", &json!({"ops": [{"op": "delete_table_row", "table": 9, "row": 1}]})).unwrap_err().to_string();
+        assert!(e.contains("table 9 is out of range"), "{e}");
+        let e = s.run("review.edit", &json!({"ops": [{"op": "delete_section_break", "section": 1}]})).unwrap_err().to_string();
+        assert!(e.contains("no break after it"), "{e}");
     }
 
     #[test]

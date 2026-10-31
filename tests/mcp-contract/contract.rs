@@ -642,6 +642,7 @@ fn annotations_say_what_each_tool_does() {
         "server_status",
         "job_status",
         "list_jobs",
+        "render_preview",
     ];
     for t in &tools {
         let name = t["name"].as_str().unwrap();
@@ -1111,4 +1112,268 @@ fn idle_eviction_and_evict_auto_save_and_name_the_file() {
     assert_eq!(e["recovered_path"], p.as_str());
     m.ok("open_document", json!({"path": p}));
     assert_eq!(text_of(&mut m), "Supervised");
+}
+
+// WHIQ (2026-10-30): the Preview pane is drawn by the engine (render_preview), and agents read
+// Word files through it as Markdown (export_markdown), in parts for any size.
+#[test]
+fn render_preview_and_export_markdown_draw_the_document_in_parts() {
+    let d = Dir::new("preview");
+    std::fs::write(d.path("chart.png"), corpus::PNG).unwrap();
+    let mut m = Mcp::start(&d.0, &[]);
+    let md = "# Findings\n\nThe roof is **sound**.\n\n| Room | Area |\n|---|---|\n| Hall | 40 m² |\n\n![Floor plan](chart.png)\n\n1. First step\n2. Second step\n\nمرحبا بالعالم\n";
+    std::fs::write(d.path("survey.md"), md).unwrap();
+    m.ok("import_markdown", json!({"path": "survey.md", "cover": false, "footer": "none"}));
+    let full = m.call("render_preview", json!({}));
+    assert_eq!(full["isError"], false, "{full}");
+    let sc = &full["structuredContent"];
+    let html = sc["html"].as_str().unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>") && html.contains("<div class=\"file-head\">") && html.contains("<div class=\"page\""));
+    assert!(html.contains(">Findings</h1>") && html.contains("font-weight:700") && html.contains("<table"));
+    assert!(html.contains("data:image/png;base64,"), "the picture is embedded");
+    assert!(html.contains(">1.</span>") && html.contains("<p dir=\"rtl\""), "list labels and RTL");
+    assert_eq!((sc["part"].as_u64(), sc["parts"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(sc["stats"]["pictures"], 1);
+    // The page is sent once: the text block carries the rest of the answer.
+    let text = full["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("<!DOCTYPE") && text.contains("\"html_in\""), "{text}");
+    // Markdown for reading.
+    let r = m.ok("export_markdown", json!({}));
+    let md = r["markdown"].as_str().unwrap();
+    assert!(md.starts_with("# Findings\n\nThe roof is **sound**."), "{md}");
+    assert!(
+        md.contains("| **Room** | **Area** |\n| --- | --- |\n| Hall | 40 m² |")
+            && md.contains("1. First step\n2. Second step")
+            && md.contains("![Floor plan](picture:"),
+        "{md}"
+    );
+    // A long document: parts of the caller's size, every one reachable, nothing cut.
+    m.ok("new_document", json!({}));
+    let lines: Vec<String> = (0..1500).map(|i| format!("Paragraph {i} {}", "with words ".repeat(10))).collect();
+    m.ok("type_text", json!({"text": lines.join("\n"), "paragraphs": true}));
+    let first = m.ok("export_markdown", json!({"part_size": 20000}));
+    let parts = first["parts"].as_u64().unwrap();
+    assert!(parts >= 8, "{first}");
+    assert_eq!(first["next_part"], 2);
+    let mut joined = String::new();
+    for n in 1..=parts {
+        let r = m.ok("export_markdown", json!({"part_size": 20000, "part": n}));
+        assert!(r.get("truncated").is_none(), "parts are never trimmed");
+        joined.push_str(r["markdown"].as_str().unwrap());
+        joined.push_str("\n\n");
+    }
+    assert_eq!(joined.matches("Paragraph ").count(), 1500);
+    let big = m.ok("export_markdown", json!({"part_size": 100_000_000u64}));
+    assert_eq!(big["parts"], 1, "no cap on the part size");
+    assert!(big["markdown"].as_str().unwrap().len() > 100_000, "past --max-result-bytes, whole");
+    let last = m.ok("render_preview", json!({"part_size": 20000, "part": parts}));
+    assert_eq!(last["next_part"], Value::Null);
+    let e = m.err("render_preview", json!({"part_size": 20000, "part": parts + 5}), "out_of_range");
+    assert!(e["reason"].as_str().unwrap().contains(&format!("{parts} parts")), "{e}");
+    let w = m.ok("render_preview", json!({"pages": "2"}));
+    assert!(w["pages"]["from"] == 2 && w["blocks"]["from"].as_u64().unwrap() > 0, "{}", w["blocks"]);
+    // To a file, the whole document.
+    let f = m.ok("export_markdown", json!({"path": "long.md"}));
+    assert_eq!(f["parts"], 1);
+    assert_eq!(std::fs::read_to_string(d.path("long.md")).unwrap().matches("Paragraph ").count(), 1500);
+    // A file drawn without opening it: the open document is untouched.
+    m.ok("save_document", json!({"path": "long.docx"}));
+    m.ok("new_document", json!({}));
+    m.ok("type_text", json!({"text": "Open one"}));
+    let pf = m.ok("render_preview", json!({"path": "long.docx", "part_size": 20000}));
+    assert!(pf["html"].as_str().unwrap().contains("<div class=\"file-head\">long.docx · part 1 of"));
+    assert_eq!(m.ok("get_text", json!({}))["text"], "Open one");
+    m.err("render_preview", json!({"path": "missing.docx"}), "not_found");
+}
+
+/// Many edits in one call: 300 review operations (replace all, paragraphs, comments, table rows
+/// and cells) and a batch of 300 commands.
+#[test]
+fn hundreds_of_edits_go_in_one_call() {
+    let d = Dir::new("bulk");
+    let mut m = Mcp::start(&d.0, &[]);
+    let mut md = String::from("# Register\n\n| Item | Owner |\n|---|---|\n| first | nobody |\n\n");
+    for i in 0..200 {
+        md.push_str(&format!("Clause {i}: the Contractor shall deliver item {i}.\n\n"));
+    }
+    m.ok("import_markdown", json!({"markdown": md, "cover": false, "footer": "none"}));
+    let mut ops = vec![json!({"op": "replace", "anchor": "Contractor", "with": "Supplier", "occurrence": "all"})];
+    for i in 0..100 {
+        ops.push(json!({"op": "insert_paragraph", "anchor": format!("Clause {i}:"), "text": format!("Note {i} added.")}));
+    }
+    for i in 100..200 {
+        ops.push(json!({"op": "comment", "anchor": format!("item {i}."), "text": format!("Check {i}")}));
+    }
+    for i in 0..98 {
+        ops.push(json!({"op": "insert_table_row", "table": 1, "cells": [format!("row {i}"), "owner"]}));
+    }
+    ops.push(json!({"op": "set_cell", "table": 1, "row": 2, "col": 2, "text": "Alice"}));
+    assert_eq!(ops.len(), 300);
+    let t0 = Instant::now();
+    let r = m.ok("review_edit", json!({"ops": ops}));
+    let took = t0.elapsed();
+    assert_eq!((r["applied"].as_u64(), r["failed"].as_u64()), (Some(300), Some(0)), "{}", &r.to_string()[..500.min(r.to_string().len())]);
+    eprintln!("review_edit, 300 operations: {took:?}");
+    let text = m.ok("export_markdown", json!({"part_size": 1_000_000}))["markdown"].as_str().unwrap().to_string();
+    assert_eq!(text.matches("{++Supplier++}{--Contractor--}").count(), 200, "replace all, tracked: {}", &text[..1500.min(text.len())]);
+    assert_eq!(text.matches("Note ").count(), 100);
+    assert_eq!(text.matches("{>>C").count(), 100);
+    assert!(text.contains("| {++row 97++} | {++owner++} |") && text.contains("| first | {++Alice++}{--nobody--} |"), "{}", &text[..600]);
+    let changes = m.ok("list_changes", json!({}));
+    assert!(changes["changes"].as_array().unwrap().len() >= 300);
+    // 300 commands in one batch.
+    let mut commands = vec![json!({"command": "caret.docEnd"})];
+    for i in 0..299 {
+        commands.push(if i % 3 == 0 {
+            json!({"command": "text.newParagraph"})
+        } else {
+            json!({"command": "text.insert", "params": {"text": format!("typed {i} ")}})
+        });
+    }
+    let t0 = Instant::now();
+    let b = m.ok("batch", json!({"commands": commands}));
+    eprintln!("batch, 300 commands: {:?}", t0.elapsed());
+    assert_eq!(b["ran"], 300);
+    assert!(m.ok("get_text", json!({"max_bytes": 4_000_000}))["text"].as_str().unwrap().contains("typed 298"));
+    // Not tracked: a plain replace-all of 200 places in one operation.
+    let r = m
+        .ok("review_edit", json!({"ops": [{"op": "replace", "anchor": "shall deliver", "with": "delivers", "occurrence": "all"}], "tracked": false}));
+    assert_eq!(r["applied"], 1);
+    let after = m.ok("export_markdown", json!({"part_size": 1_000_000}))["markdown"].as_str().unwrap().to_string();
+    assert_eq!(after.matches("delivers ").count(), 200);
+    assert!(!after.contains("shall deliver"));
+    assert!(!after.contains("{++delivers"));
+}
+
+/// The owner's checklist (2026-10-30): an agent works a Word document fully, as a person in Word
+/// does — read, create, edit, delete, search — on a real .docx saved and opened again.
+#[test]
+fn an_agent_works_a_word_document_like_a_person_in_word() {
+    let d = Dir::new("person");
+    std::fs::write(d.path("plan.png"), corpus::PNG).unwrap();
+    std::fs::write(d.path("photo.png"), corpus::PNG).unwrap();
+    let mut m = Mcp::start(&d.0, &[]);
+    let md = "# Site report\n\nThe roof is sound.\n\n## Rooms\n\n| Room | Area |\n|---|---|\n| Hall | 40 m² |\n| Office | 12 m² |\n| Store | 6 m² |\n\n![Floor plan](plan.png)\n\n1. Inspect the stair\n2. Fix the gutter\n\nObsolete paragraph to remove.\n";
+    m.ok("import_markdown", json!({"markdown": md, "cover": false, "header": "Acme Survey", "footer": "Page {page} of {pages}"}));
+    // CREATE — a caption under the picture, a footnote, a comment, a heading, a section, a TOC.
+    m.ok("select_text", json!({"text": "The roof is sound."}));
+    m.ok("execute", json!({"command": "caret.end"}));
+    m.ok("execute", json!({"command": "references.footnote", "params": {"text": "Checked on 30 October."}}));
+    let created = m.ok(
+        "review_edit",
+        json!({"tracked": false, "ops": [
+            {"op": "insert_paragraph", "anchor": "Inspect the stair", "position": "before", "text": "Actions", "style": "Heading 2"},
+            {"op": "comment", "anchor": "Fix the gutter", "text": "Before winter"},
+            {"op": "insert_paragraph", "anchor": "Obsolete paragraph", "text": "Appendix", "style": "Heading 1"},
+        ]}),
+    );
+    assert_eq!(created["applied"], 3, "{created}");
+    m.ok("select_text", json!({"text": "Appendix"}));
+    m.ok("execute", json!({"command": "caret.home"}));
+    m.ok("execute", json!({"command": "layout.break", "params": {"kind": "nextPage"}}));
+    m.ok("execute", json!({"command": "caret.docEnd"}));
+    m.ok("execute", json!({"command": "text.newParagraph"}));
+    m.ok("execute", json!({"command": "insert.picture", "params": {"path": "photo.png", "alt": "Site photo"}}));
+    m.ok("execute", json!({"command": "text.newParagraph"}));
+    m.ok("execute", json!({"command": "insert.table", "params": {"rows": 2, "cols": 2}}));
+    m.ok(
+        "review_edit",
+        json!({"tracked": false, "ops": [
+            {"op": "set_cell", "table": 2, "row": 1, "col": 1, "text": "Key"},
+            {"op": "set_cell", "table": 2, "row": 1, "col": 2, "text": "Value"},
+        ]}),
+    );
+    m.ok("execute", json!({"command": "caret.docStart"}));
+    m.ok("execute", json!({"command": "references.toc", "params": {}}));
+    // A real Word file: saved, closed, opened again.
+    m.ok("save_document", json!({"path": "report.docx"}));
+    m.ok("close_document", json!({}));
+    m.ok("open_document", json!({"path": "report.docx"}));
+
+    // READ — text in order with headings, lists, tables, footnotes, headers/footers, comments,
+    // pictures, fields; styles; a picture of a page.
+    let md = m.ok("export_markdown", json!({}))["markdown"].as_str().unwrap().to_string();
+    let at = |s: &str| md.find(s).unwrap_or_else(|| panic!("`{s}` not in:\n{md}"));
+    assert!(at("# Site report") < at("## Rooms") && at("## Rooms") < at("| Hall | 40 m² |"), "in order");
+    assert!(at("1. Inspect the stair\n2. {==Fix the gutter") > 0, "list labels, a tight list");
+    assert!(md.contains("> **Header:** Acme Survey") && md.contains("> **Footer:** Page"), "header and footer");
+    assert!(md.contains("[^1]") && md.contains("[^1]: Checked on 30 October."), "footnote");
+    assert!(md.contains("{>>C1") && md.contains("Before winter<<}"), "comment");
+    assert!(md.contains("![Floor plan](picture:") && md.contains("![Site photo](picture:"), "pictures with alt text");
+    assert!(md.contains("<!-- pagebreak -->"), "the section starts a new page");
+    assert!(md.contains("Site report") && md.to_lowercase().contains("contents") || md.contains("Rooms\t"), "the TOC field's text");
+    let styles: Vec<String> =
+        m.ok("inspect_document", json!({}))["blocks"].as_array().unwrap().iter().filter_map(|b| b["style"].as_str().map(str::to_string)).collect();
+    assert!(styles.iter().any(|s| s == "Heading1") && styles.iter().any(|s| s == "Heading2"), "{styles:?}");
+    let page = m.call("render_page", json!({"page": 1, "dpi": 40}));
+    assert_eq!(page["content"][0]["type"], "image");
+    let prev = m.ok("render_preview", json!({}));
+    assert!(
+        prev["html"].as_str().unwrap().contains("Acme Survey") && prev["stats"]["footnotes"] == 1 && prev["stats"]["comments"] == 1,
+        "{}",
+        prev["stats"]
+    );
+
+    // SEARCH — find text with its locations; find and replace, tracked and not.
+    let found = m.ok("find_anchor", json!({"anchor": "Office"}));
+    assert!(found["matches"].as_array().is_some_and(|v| !v.is_empty() && v[0]["path"].is_array()), "{found}");
+    let r = m.ok("review_edit", json!({"ops": [{"op": "replace", "anchor": "m²", "with": "sq m", "occurrence": "all"}]}));
+    assert_eq!(r["changes"][0]["matches"].as_array().map(Vec::len), Some(3), "tracked replace of every match");
+    m.ok("review_edit", json!({"tracked": false, "ops": [{"op": "replace", "anchor": "gutter", "with": "downpipe", "occurrence": "all"}]}));
+
+    // EDIT — text, styles, tables, accept / reject, in one batch where they can be.
+    let e = m.ok(
+        "review_edit",
+        json!({"ops": [
+            {"op": "insert", "anchor": "The roof is sound", "text": " and dry"},
+            {"op": "set_style", "anchor": "Appendix", "style": "Heading 2"},
+            {"op": "insert_table_row", "table": 1, "cells": ["Lab", "9 sq m"]},
+            {"op": "set_cell", "anchor": "Store", "col": 2, "text": "7 sq m"},
+        ]}),
+    );
+    assert_eq!(e["applied"], 4, "{e}");
+    let ch = m.ok("list_changes", json!({}));
+    let id_of = |want: &str| -> Vec<String> {
+        ch["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["text"].as_str().is_some_and(|t| t.contains(want)))
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let dry = id_of("and dry");
+    assert_eq!(dry.len(), 1, "{ch}");
+    m.ok("reject_changes", json!({"ids": dry}));
+    let sq = id_of("sq m");
+    assert!(!sq.is_empty());
+    let acc = m.ok("accept_changes", json!({"ids": sq}));
+    assert!(acc["resolved"].as_array().is_some_and(|v| !v.is_empty()), "{acc}");
+    let b = m.ok("batch", json!({"commands": [{"command": "caret.docStart"}, {"command": "para.heading1"}]}));
+    assert_eq!(b["ran"], 2);
+
+    // DELETE — a paragraph, a table row, a picture, a comment, a section.
+    m.ok("accept_changes", json!({"all": true}));
+    let del = m.ok(
+        "review_edit",
+        json!({"tracked": false, "ops": [
+            {"op": "delete_paragraph", "anchor": "Obsolete paragraph"},
+            {"op": "delete_table_row", "anchor": "Office"},
+            {"op": "delete_picture", "alt": "Site photo"},
+            {"op": "delete_comment", "anchor": "downpipe"},
+            {"op": "delete_section_break", "section": 1},
+        ]}),
+    );
+    assert_eq!(del["applied"], 5, "{del}");
+    m.ok("save_document", json!({"path": "report-2.docx"}));
+    m.ok("close_document", json!({}));
+    m.ok("open_document", json!({"path": "report-2.docx"}));
+    let md2 = m.ok("export_markdown", json!({}))["markdown"].as_str().unwrap().to_string();
+    for gone in ["Obsolete paragraph", "| Office", "Site photo", "{>>", "{++", "{--", "<!-- section break -->"] {
+        assert!(!md2.contains(gone), "`{gone}` is gone:\n{md2}");
+    }
+    assert!(!md2.contains("and dry"), "the rejected insertion is gone");
+    for kept in ["The roof is sound.", "| Store | 7 sq m |", "| Lab | 9 sq m |", "Fix the downpipe", "![Floor plan](picture:"] {
+        assert!(md2.contains(kept), "`{kept}` is kept:\n{md2}");
+    }
 }

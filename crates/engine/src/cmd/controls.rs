@@ -254,10 +254,40 @@ fn content_base(s: &Session, r: &ControlRange) -> CharProps {
 // ---------------------------------------------------------------------------------------------
 // Rules for typing and deleting
 
+// WHIQ: a batch that knows a story holds no content controls (checked once before it, and its
+// text edits cannot add one) skips the per-edit scans of the whole story: a Replace All of
+// 20,000 matches in `review.edit` scanned the body twice per match.
+thread_local! {
+    static NONE_IN: std::cell::Cell<Option<StoryRef>> = const { std::cell::Cell::new(None) };
+}
+
+/// Until the guard is dropped, the edits in `story` skip the content-control checks when the
+/// story has none now (the caller's text edits add none). Dropping it (also when unwinding) puts
+/// the hint before back.
+pub(crate) fn assume_no_controls(s: &Session, story: StoryRef) -> NoControlsHint {
+    let none = s.doc.control_ranges(story).is_empty();
+    NoControlsHint(NONE_IN.with(|c| c.replace(none.then_some(story))))
+}
+
+pub(crate) struct NoControlsHint(Option<StoryRef>);
+
+impl Drop for NoControlsHint {
+    fn drop(&mut self) {
+        NONE_IN.with(|c| c.set(self.0));
+    }
+}
+
+fn known_none(story: StoryRef) -> bool {
+    NONE_IN.with(|c| c.get() == Some(story))
+}
+
 /// Before text goes in at the selection: refuse what a locked or list-only control doesn't
 /// take; a control showing its placeholder gets the placeholder selected (so it is replaced)
 /// and stops showing it. Returns the formatting the text should get, when it changes.
 pub fn prepare_edit(s: &mut Session) -> Result<Option<CharProps>, CmdError> {
+    if known_none(s.sel.focus.story) && known_none(s.sel.anchor.story) {
+        return Ok(None);
+    }
     if s.sel.is_collapsed() {
         let at = s.doc.typing_pos(&s.sel.focus);
         if at != s.sel.focus {
@@ -323,6 +353,9 @@ pub fn check_delete(s: &mut Session, a: &Pos, b: &Pos) -> Result<(), CmdError> {
 /// Check a batch before editing, reading the story's control ranges only once. An empty
 /// control list needs no per-match work, including for large Replace All operations.
 pub fn check_deletions<'a>(s: &mut Session, story: StoryRef, deletions: impl IntoIterator<Item = (&'a Pos, &'a Pos)>) -> Result<(), CmdError> {
+    if known_none(story) {
+        return Ok(());
+    }
     let controls = s.doc.control_ranges(story);
     if controls.is_empty() {
         return Ok(());

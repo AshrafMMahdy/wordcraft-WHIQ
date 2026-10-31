@@ -19,6 +19,8 @@ pub mod odt;
 pub mod rtf;
 pub mod sheet;
 pub mod txt;
+// WHIQ: the Preview pane's page and the agent's Markdown, drawn from the model, in parts.
+pub mod whiq_preview;
 
 use wordcraft_doc::Document;
 

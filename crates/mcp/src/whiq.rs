@@ -56,7 +56,9 @@ const REPLACES: Ann = Ann { read_only: false, destructive: true, idempotent: tru
 fn ann(name: &str) -> Ann {
     match name {
         "list_commands" | "get_text" | "inspect_document" | "render_page" | "parity" | "screenshot" | "ui_inspect" | "server_status"
-        | "job_status" | "list_jobs" | "list_changes" | "find_anchor" | "roundtrip_check" => READ,
+        | "job_status" | "list_jobs" | "list_changes" | "find_anchor" | "roundtrip_check" | "render_preview" => READ,
+        // WHIQ: reads; with `path` it writes a Markdown file (an existing one is kept as OLD_).
+        "export_markdown" => STATE,
         // Stopping a call leaves the document as it was before it: asking twice is asking once.
         // Evicting auto-saves unsaved work first (nothing is lost) and leaves a blank document.
         "select_text" | "cancel" | "evict" => STATE,
@@ -83,7 +85,7 @@ fn files_meta(name: &str) -> Option<Value> {
     let (read, opens): (&[&str], bool) = match name {
         "open_document" | "import_markdown" => (&["path"], true),
         "new_document" => (&[], true),
-        "roundtrip_check" => (&["path"], false),
+        "roundtrip_check" | "render_preview" => (&["path"], false),
         "compare_documents" => (&["revised", "original"], false),
         _ => return None,
     };
@@ -134,7 +136,7 @@ fn common_props(name: &str) -> Vec<(&'static str, Value)> {
             s("The document to act on: the `document` handle open_document / new_document / import_markdown returned (default: the active one)"),
         ));
     }
-    if matches!(name, "save_document" | "export_pdf" | "execute" | "batch") || name.starts_with("review") {
+    if matches!(name, "save_document" | "export_pdf" | "export_markdown" | "execute" | "batch") || name.starts_with("review") {
         v.push(("overwrite", b("Replace an existing file at the path. Without it the existing file is kept as OLD_<name> and the response says so")));
     }
     v
@@ -192,6 +194,36 @@ fn own_tools() -> Vec<Value> {
                 "dpi": n("Resolution (default 96; 72 = one pixel per point)"),
                 "scale": n("Pixels per point (overrides dpi)"),
                 "markup": b("true: Print Markup (tracked changes marked up, comments in balloons beside the page); false (default): the printed page"),
+            }),
+            &[],
+        ),
+        def(
+            "render_preview",
+            "Render preview",
+            "The document as the Preview pane shows it: one self-contained HTML page (pictures as data URIs, charts as SVG, nothing fetched) drawn by WordCraft from its document model: headings and styles, fonts, colours, lists numbered as Word numbers them, tables with merged cells, shading and borders, pictures, headers and footers on each sheet, page and section breaks as new sheets, tracked insertions and deletions marked with author and date, comments and footnotes listed, right-to-left text. A long document comes in parts (about part_size characters of text each, a table split between rows): the answer says part, parts and next_part; ask for the next part, or a window by pages or section. The page is in structuredContent.html (the text block carries the rest of the answer). With `path`, a file is drawn without opening it (part and section windows).",
+            json!({
+                "part": n("1-based part (default 1)"),
+                "part_size": n("Characters of text a part holds (default 200000, about 60 pages); parts also end at the picture budget"),
+                "pages": s("Instead of a part: the blocks that start on these printed pages, e.g. \"3-5\""),
+                "section": n("Instead of a part: 1-based section"),
+                "markup": b("Show tracked changes and comments (default true); false: as if every change were accepted, no comments"),
+                "pictures": b("Embed pictures (default true); false: placeholders of their size"),
+                "picture_budget": n("Bytes of pictures a part embeds (default 12 MB); a part ends before passing it"),
+                "path": s("Draw this Word (or other) file instead of an open document, without opening it"),
+            }),
+            &[],
+        ),
+        def(
+            "export_markdown",
+            "Export Markdown",
+            "Read the document as Markdown, in parts for any size: headings, list labels, tables (GFM, merged cells noted under the table), pictures as ![alt](picture:name WxHpt), footnotes [^1], page breaks as <!-- pagebreak -->, and with markup (default) tracked changes and comments in CriticMarkup: {++inserted++}, {--deleted--}, {==commented text==}{>>C1 Author (date): comment<<}. part_size is the characters of text a part holds (default 40000, no upper limit); the answer says part, parts and next_part. With `path` the Markdown goes to that file instead (the whole document unless part, part_size, pages or section is given).",
+            json!({
+                "part": n("1-based part (default 1)"),
+                "part_size": n("Characters of text a part holds (default 40000; any larger number is honoured)"),
+                "pages": s("Instead of a part: the blocks that start on these printed pages, e.g. \"3-5\""),
+                "section": n("Instead of a part: 1-based section"),
+                "markup": b("Tracked changes and comments in CriticMarkup (default true); false: the text as if every change were accepted"),
+                "path": s("Write the Markdown to this .md file (inside the write root) instead of answering with it"),
             }),
             &[],
         ),
@@ -553,6 +585,35 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let path = st("path").unwrap_or("");
             exec(b, "document.textToFile", json!({"path": path})).map(Out::Json).map_err(|e| contract::classify(&e, "export_text", a, &[]))
         }
+        "render_preview" | "export_markdown" => {
+            // WHIQ: the Preview pane's page / the agent's Markdown, drawn by the engine.
+            let preview = name == "render_preview";
+            let mut p = json!({});
+            for (from, to) in [
+                ("part", "part"),
+                ("part_size", "partSize"),
+                ("pages", "pages"),
+                ("section", "section"),
+                ("markup", "markup"),
+                ("pictures", "pictures"),
+                ("picture_budget", "pictureBudget"),
+            ] {
+                if let Some(v) = a.get(from).filter(|v| !v.is_null()) {
+                    p[to] = v.clone();
+                }
+            }
+            let command = if preview { "document.preview" } else { "document.markdown" };
+            let file = if preview { st("path").map(str::trim).filter(|x| !x.is_empty()) } else { None };
+            if !preview && let Some(path) = st("path") {
+                p["path"] = json!(path);
+            }
+            progress(0, 1, if preview { "drawing the preview" } else { "writing Markdown" });
+            let r = match file {
+                Some(path) => preview_file(path, &p),
+                None => exec(b, command, p),
+            };
+            r.map(|v| Out::Json(preview_shape(v))).map_err(|e| preview_error(&e, name, a))
+        }
         "export_pdf" => {
             let path = st("path").unwrap_or("");
             let mut p = json!({"path": path, "markup": a.get("markup").and_then(Value::as_bool).unwrap_or(false)});
@@ -901,7 +962,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     match out {
         Ok(Out::Json(v)) => {
             let mut v = match name.as_str() {
-                "render_page" => v,
+                // WHIQ: these come in parts of the caller's size: never cut.
+                "render_page" | "render_preview" | "export_markdown" => v,
                 "inspect_document" => trim_window(v, from, max),
                 _ => trim(v, from, max),
             };
@@ -912,7 +974,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
                 v["previous_files_renamed"] = json!(kept_json);
                 v["notice"] = json!(notice);
             }
-            json_result(v, &warnings)
+            if name == "render_preview" { preview_result(v, &warnings) } else { json_result(v, &warnings) }
         }
         Ok(Out::Images(images, mut summary)) => {
             if !warnings.is_empty() {
@@ -933,6 +995,67 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
             error_result(&e, &warnings)
         }
     }
+}
+
+/// WHIQ: the engine's preview answer in the tool's terms (snake_case), for render_preview and
+/// export_markdown.
+fn preview_shape(mut v: Value) -> Value {
+    if let Some(m) = v.as_object_mut() {
+        for (from, to) in [("partSize", "part_size"), ("nextPart", "next_part")] {
+            if let Some(x) = m.remove(from) {
+                m.insert(to.into(), x);
+            }
+        }
+        if let Some(Value::Object(st)) = m.get_mut("stats") {
+            for (from, to) in [("picturesOmitted", "pictures_omitted"), ("pictureBytes", "picture_bytes"), ("formatChanges", "format_changes")] {
+                if let Some(x) = st.remove(from) {
+                    st.insert(to.into(), x);
+                }
+            }
+        }
+        if let Some(n) = m.get("next_part").and_then(Value::as_u64) {
+            m.insert("next_step".into(), json!(format!("call the same tool with part: {n} for the next part")));
+        }
+    }
+    v
+}
+
+/// Draw the file at `path` without opening it in the server: a scratch session of its own.
+fn preview_file(path: &str, p: &Value) -> Result<Value, String> {
+    let region = wordcraft_engine::Region::default();
+    let (doc, _) = wordcraft_engine::io::open_path_in(std::path::Path::new(path), None, &region)?;
+    let mut s = wordcraft_engine::Session::new(doc);
+    s.path = Some(path.into());
+    s.run("document.preview", p).map_err(|e| e.to_string())
+}
+
+/// A preview or Markdown refusal: a part, page or section past the end is `out_of_range`.
+fn preview_error(e: &str, name: &str, a: &Value) -> ToolError {
+    if e.contains("out of range") || e.contains("names no page") || e.contains("pages \"") {
+        let reason = e.strip_prefix("bad parameters: ").unwrap_or(e).to_string();
+        return ToolError::new(
+            code::OUT_OF_RANGE,
+            reason,
+            format!("call {name} with part: 1 (the answer says how many parts there are), or a smaller page range"),
+        );
+    }
+    contract::classify(e, name, a, &[])
+}
+
+/// render_preview's answer: the page in `structuredContent.html`; the text block carries the
+/// rest (the page is not sent twice).
+fn preview_result(v: Value, warnings: &[String]) -> Value {
+    let mut r = json_result(v, warnings);
+    if let Some(sc) = r.get("structuredContent").cloned() {
+        let mut summary = sc;
+        if let Some(m) = summary.as_object_mut()
+            && m.remove("html").is_some()
+        {
+            m.insert("html_in".into(), json!("structuredContent.html"));
+        }
+        r["content"] = json!([{"type": "text", "text": serde_json::to_string_pretty(&summary).unwrap_or_default()}]);
+    }
+    r
 }
 
 /// Test hook, reachable only with `WORDCRAFT_MCP_TEST_HOOKS=1` (never in normal use): an

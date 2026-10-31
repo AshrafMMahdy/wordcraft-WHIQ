@@ -323,6 +323,70 @@ in memory until it writes it, so a PDF of many large pictures still holds them. 
 document body is held in memory while it is read (limits: a share of the budget, reported with the
 route).
 
+## Preview, reading and bulk edits from the engine (2026-10-30, whiq-v0.7.3)
+
+The owner's decision (third ledger, item 13): the platform's Preview tab is drawn by the engines,
+not by the platform's own renderers (mammoth for Word), and its `read_document` reads Word files
+through the engine. WordCraft now draws the preview from its own document model and gives agents
+the document as Markdown, both in parts for any size, and takes structural edits (tables, pictures,
+comments, sections, styles) in the same batches as text edits.
+
+| Change | Where | Tested by |
+|---|---|---|
+| **`render_preview`** (new tool; command `document.preview`; CLI `wordcraft-cli preview <file> <out.html>`): one self-contained HTML page in the shape the platform's previewer returned (`<!DOCTYPE html>`, `.file-head`, `.page`, `.warn`, the same colours; nothing fetched), drawn from the model: paragraph and character styles resolved (fonts with open substitutes, sizes, colours, bold, italic, underline styles, strike, highlight, caps, spacing), headings as `h1`–`h6` with `data-style`, list labels counted as Word counts them (across parts), tables with column widths, `colspan` / `rowspan` from merged cells, cell shading, borders (cell, table-style region, table, inside), padding, vertical alignment, header rows repeated; pictures as data URIs (cropped, floated; TIFF and other raster formats as PNG; a metafile as a labelled placeholder), charts and diagrams as inline SVG from their drawing items, shapes as SVG, text boxes as boxes after their paragraph, equations as MathML, ruby; each section's page size and margins, headers and footers (first-page ones, inherited ones) on every sheet, page breaks, page-break-before and section breaks as new sheets, columns, page colour and watermark; tracked insertions, deletions, moves, formatting changes and paragraph marks marked with author and date (`markup: false`: as if accepted); comments highlighted with `[C1]` marks and listed with their replies; footnotes and endnotes numbered and listed; right-to-left paragraphs (`dir="rtl"`, set or from the first strong character; alignment by start and end). **Parts:** `part` of a plan that takes top-level blocks in order until `part_size` characters of text (default 200,000) or `picture_budget` bytes of pictures (default 12 MB); a table larger than a part is split between rows with its header rows repeated; or a window: `pages` (the blocks starting on those printed pages, laid out a few pages at a time) or `section`. The answer: `part`, `parts`, `next_part`, `blocks {from, to, total}`, `rows`, `stats` (paragraphs, headings, tables, pictures, pictures omitted, picture bytes, insertions, deletions, format changes, comments, footnotes, endnotes, characters); the page is in `structuredContent.html` and not repeated in the text block. `path` draws a file without opening it (the open documents untouched). Read-only; never trimmed (parts bound it). | `crates/formats/src/whiq_preview.rs` (new), `crates/engine/src/cmd/whiq_preview.rs` (new), `crates/mcp/src/whiq.rs`, `apps/wordcraft-cli/src/main.rs` | `whiq_preview::tests` (headings and styles, runs, a table with merged cells, a picture, tracked changes, comments and replies, Arabic, lists across parts, a long document in parts with a split table, headers / footers / page breaks, hostile numbers); `cmd::whiq_preview::tests`; contract `render_preview_and_export_markdown_draw_the_document_in_parts` |
+| **`export_markdown`** (new tool; command `document.markdown`; CLI `wordcraft-cli markdown <file> [out.md]`): the same walk as Markdown for reading: `#` headings, list labels as numbered (`1.`, `a)`, `-` for bullets, indented by level), GFM tables (merged cells noted under the table, nested tables after it), `**bold**`, `*italic*`, `~~strike~~`, links, `![alt](picture:name WxHpt)`, footnotes `[^1]`, headers and footers as `> **Header:**`, page breaks as `<!-- pagebreak -->` (what `import_markdown` reads); with markup (default) tracked changes and comments in CriticMarkup: `{++inserted++}`, `{--deleted--}`, `{==commented text==}{>>C1 Author (date): text \| reply: …<<}`. In parts of `part_size` characters (default 40,000, **no upper limit**), never trimmed by `--max-result-bytes`; `path` writes the whole document (or the part asked for) to a file. | same files | same tests; `cmd::whiq_preview::tests::markdown_goes_to_a_file_whole_or_in_parts_of_any_size` (the parts put together are the whole document) |
+| **Structure in `review_edit`**: `set_style {anchor, style}`, `insert_table_row {table (1-based) \| anchor, row?, before?, cells}`, `delete_table_row {table \| anchor, row?}`, `set_cell {table \| anchor, row, col, text}`, `delete_table`, `delete_picture {index \| alt \| anchor}`, `delete_comment {id \| anchor}`, `delete_section_break {section}`, in the same all-or-nothing batch as the text operations (tracked where Word tracks them: cell text, deleted rows and pictures). | `crates/engine/src/cmd/whiq_review.rs`, `review.rs` (`comment_at_caret` visible to it), `crates/mcp/src/whiq_review.rs` | contract `an_agent_works_a_word_document_like_a_person_in_word`, `hundreds_of_edits_go_in_one_call` |
+| **Bulk**: one `review_edit` call applies a list of operations (up to 10,000), one `batch` call runs a list of commands; both are undone whole by `cancel`. Measured over MCP stdio, debug build, a document of 20,000 paragraphs: a replace-all of 20,000 matches **71 s → 1.1 s**; 150 paragraph inserts 17 s → 5.6 s; 149 comments 18 s → 6.4 s; 300 mixed operations in one call **105 s → 12.9 s**; at the test's size (200 paragraphs) 300 operations take about 0.3 s and 300 batch commands 0.14 s. Three costs were per match or per operation over the whole document, and are gone: (1) every match's tracked deletion listed every paragraph path of the story (`Document::paths_between`, now direct for a range inside one paragraph); (2) every match's typing scanned the story twice for content controls (`controls::prepare_edit`, `check_deletions`): a text operation in a body that has no content controls, checked once per operation, skips them (`assume_no_controls`, a guard restored on drop; a locked control still refuses, test `a_locked_content_control_still_refuses_a_replace_all`); (3) every operation rebuilt the visible text of the whole document, and the change report built a whole document (with its style sheet) for each change's text: the visible text is kept per paragraph revision for the batch (`VIS_CACHE`), and a change inside one paragraph reads its text from the paragraph (`range_text`). Still per operation: finding the anchor scans the document's text (about 35 ms an operation at 20,000 paragraphs, debug build). | — | `hundreds_of_edits_go_in_one_call` (300 review operations: a replace-all of 200 places, 100 paragraphs, 100 comments, 98 table rows and a cell; 300 commands in a batch) |
+
+The agent's checklist (owner, 2026-10-30): every row is tested on a real `.docx`, saved and
+opened again, in `an_agent_works_a_word_document_like_a_person_in_word`.
+
+| Capability | Tool (and arguments) | Tested in `an_agent_works_a_word_document_like_a_person_in_word` unless noted |
+|---|---|---|
+| READ text in order, headings, lists | `export_markdown` (parts of any size), `get_text`, `export_text` | order of `# Site report` < `## Rooms` < the table; `1. Inspect the stair` / `2. …` |
+| READ tables | `export_markdown` (GFM, merged cells noted), `inspect_document` | `\| Hall \| 40 m² \|`; merged cells: `whiq_preview::tests::tables_keep_merged_cells_shading_and_borders` |
+| READ footnotes / endnotes | `export_markdown` (`[^1]` and `[^1]: …`) | `[^1]: Checked on 30 October.` |
+| READ headers / footers | `export_markdown` (`> **Header:**`, `> **Footer:**`) | `Acme Survey`, `Page …` |
+| READ comments | `export_markdown` (`{==…==}{>>C1 author: text<<}`), `list_changes` (`comments`) | `Before winter` |
+| READ tracked changes | `export_markdown` (`{++…++}`, `{--…--}`), `list_changes` | the replace of `m²` and the later accept / reject |
+| READ pictures with alt text and captions | `export_markdown` (`![alt](picture:name WxHpt)`, the caption paragraph after it) | `![Floor plan]`, `![Site photo]` |
+| READ fields | field results in `export_markdown` / `render_preview` (TOC entries, `Page 1 of 1`) | the TOC field's entries, the footer's page fields |
+| READ styles | `inspect_document` (`blocks[].style`), `render_preview` (`data-style`) | `Heading1`, `Heading2` |
+| READ a picture of a page | `render_page` (PNG at a DPI), `render_preview` (HTML) | page 1 at 40 dpi; the preview's stats (1 footnote, 1 comment) |
+| CREATE paragraphs, headings | `review_edit` `insert_paragraph {style}`, `type_text {paragraphs}`, `import_markdown` | `Actions` (Heading 2), `Appendix` (Heading 1) |
+| CREATE tables | `execute insert.table`, `import_markdown` | a 2×2 table filled with `set_cell` |
+| CREATE pictures | `execute insert.picture {path, alt}`, `import_markdown` | `Site photo` |
+| CREATE comments | `review_edit` `comment` | `Before winter` |
+| CREATE sections | `execute layout.break {kind: nextPage}` | the `Appendix` section starts a new page |
+| CREATE a table of contents | `execute references.toc` | the TOC's entries in the Markdown |
+| CREATE footnotes | `execute references.footnote {text}` | `[^1]` |
+| EDIT text | `review_edit` `replace` / `insert` / `delete` (tracked or not) | `insert " and dry"` (tracked) |
+| EDIT styles | `review_edit` `set_style`, `execute para.style` | `Appendix` → Heading 2 |
+| EDIT tables | `review_edit` `insert_table_row`, `set_cell` | `\| Lab \| 9 sq m \|`, `\| Store \| 7 sq m \|` |
+| EDIT accept / reject tracked changes | `accept_changes` / `reject_changes` (ids, author, kind, all) | ` and dry` rejected, the `sq m` replaces accepted |
+| EDIT in batches | `review_edit` (up to 10,000 operations), `batch` | `hundreds_of_edits_go_in_one_call` (300 + 300) |
+| DELETE paragraphs | `review_edit` `delete_paragraph` | `Obsolete paragraph` gone after save and reopen |
+| DELETE table rows | `review_edit` `delete_table_row` | the `Office` row gone |
+| DELETE pictures | `review_edit` `delete_picture {alt \| index \| anchor}` | `Site photo` gone |
+| DELETE comments | `review_edit` `delete_comment {id \| anchor}` | no `{>>` left |
+| DELETE sections | `review_edit` `delete_section_break {section}` | no section break left |
+| SEARCH find text → locations | `find_anchor` (exact / case / typography / fuzzy, paragraph and path) | `Office` → its path in the table |
+| SEARCH find and replace, tracked | `review_edit` `replace {occurrence: "all"}` | `m²` → `sq m`, 3 matches |
+| SEARCH find and replace, not tracked | `review_edit {tracked: false}`, `execute edit.replaceAll` | `gutter` → `downpipe` |
+
+Test status (Linux x86_64, debug build, no craft-fonts checkout on this machine; the release
+workflow runs the same suites with the pinned fonts): `cargo test --lib` of `wordcraft-doc` (150),
+`wordcraft-formats` (146), `wordcraft-engine` (636, `hostile_params_never_panic` among them) and
+`wordcraft-mcp` (18) pass; `wordcraft-cli` unit tests 16/16 and the contract suite 32/32 (three new);
+`cargo clippy -D warnings` and `cargo fmt --check` on the touched crates, `cargo check -p
+wordcraft-engine --target wasm32-unknown-unknown` and `cargo xtask layers` pass.
+
+Not done: a metafile picture (EMF/WMF) is a labelled placeholder in the preview (browsers do not
+draw them; the PNG pages of `render_page` do); page windows give the blocks that start on those
+pages (a block running on from the page before is in the earlier window); the preview's sheets are
+the document's page and section breaks, not its laid-out pages (one sheet can hold many printed
+pages; `render_page` shows the printed pages).
+
 ## Interface labels
 
 The six command labels the WHIQ commands add (Edit by Anchor, Change Report, Accept or Reject

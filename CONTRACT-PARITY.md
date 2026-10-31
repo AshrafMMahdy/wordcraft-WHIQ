@@ -80,6 +80,11 @@ are still read.
 
 - Domain tools and domain arguments (`render_page` / `render_range` / `render_slide`, …), and
   domain job thresholds (`--job-cells`, `--export-job-slides`).
+- The Preview pane's page (2026-10-30, WC whiq-v0.7.3): WC `render_preview {part?, part_size?,
+  pages?, section?, markup?, pictures?, picture_budget?, path?}` answers one self-contained HTML
+  page in `structuredContent.html` with `part`, `parts`, `next_part`, `blocks`, `stats`; and
+  `export_markdown {part?, part_size?, pages?, section?, markup?, path?}` the document as Markdown
+  in parts of any size. GC and DC: recorded in their own `WHIQ-CHANGES.md` when they add theirs.
 - GC `read_range` continues with a cell address: `continue_from` is the next cell and
   `next_range` the range to ask for (a 2-D range is not a list).
 - All three hold several documents per process (`documents` lists them, one `active`), named by

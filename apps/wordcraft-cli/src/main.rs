@@ -26,6 +26,12 @@ USAGE:
   wordcraft-cli text <file>                   plain text
   wordcraft-cli inspect <file>                document structure (JSON)
   wordcraft-cli render <file> <out.png> [--page N] [--scale S] [--dpi D] [--pages 2-4 (out-2.png…)] [--markup]
+  wordcraft-cli preview <file> <out.html> [--part N] [--part-size N] [--pages 2-4] [--section N] [--no-markup] [--no-pictures]
+                                              the preview page: one self-contained HTML page drawn from
+                                              the document (a part of a long one; prints the summary)
+  wordcraft-cli markdown <file> [<out.md>] [--part N] [--part-size N] [--pages 2-4] [--section N] [--no-markup]
+                                              the document as Markdown for reading (stdout, or the
+                                              file: the whole document unless a part or window is given)
   wordcraft-cli run [--file F | --template T] --cmd 'id={json}' [--cmd …] [--save OUT] [--print]
                     [--author NAME]           run commands headlessly, then save (--author names
                                               who tracked changes and comments are by)
@@ -80,7 +86,8 @@ same output on every machine.
 ";
 
 /// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
-const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero", "roundtrip-check"];
+const SUBCOMMANDS: &[&str] =
+    &["convert", "info", "text", "inspect", "render", "preview", "markdown", "run", "commands", "parity", "mcp", "zotero", "roundtrip-check"];
 
 fn wants_help(cmd: &str, rest: &[String]) -> bool {
     SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
@@ -98,8 +105,17 @@ fn open(path: &Path) -> Result<Session, String> {
 
 /// The commands that open a file, and which of their arguments not starting with `--` it is (as
 /// `pos` counts). `run` opens the value of `--file`.
-const OPENS_FILE: &[(&str, usize)] =
-    &[("convert", 0), ("info", 0), ("text", 0), ("inspect", 0), ("render", 0), ("zotero", 1), ("roundtrip-check", 0)];
+const OPENS_FILE: &[(&str, usize)] = &[
+    ("convert", 0),
+    ("info", 0),
+    ("text", 0),
+    ("inspect", 0),
+    ("render", 0),
+    ("preview", 0),
+    ("markdown", 0),
+    ("zotero", 1),
+    ("roundtrip-check", 0),
+];
 
 /// The arguments as text. Only the file the command opens may have a name that isn't valid Unicode,
 /// such as a Latin-1 one (#1440): it comes back as the path to open, and lossy among the arguments.
@@ -262,6 +278,15 @@ const RENDER_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--pages", takes_value: true },
     OptionSpec { name: "--dpi", takes_value: true },
     OptionSpec { name: "--markup", takes_value: false },
+];
+// WHIQ: the preview page and the Markdown, by part or window.
+const PREVIEW_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--part", takes_value: true },
+    OptionSpec { name: "--part-size", takes_value: true },
+    OptionSpec { name: "--pages", takes_value: true },
+    OptionSpec { name: "--section", takes_value: true },
+    OptionSpec { name: "--no-markup", takes_value: false },
+    OptionSpec { name: "--no-pictures", takes_value: false },
 ];
 const RUN_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--file", takes_value: true },
@@ -439,6 +464,53 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             }
             let list = Value::Array(out);
             write_stdout(|w| writeln!(w, "{list}"))
+        }
+        // WHIQ: the preview page (`document.preview`) and the Markdown (`document.markdown`).
+        "preview" | "markdown" => {
+            validate_options(cmd, &rest, PREVIEW_OPTIONS)?;
+            let input = pos(0)?;
+            let output = rest
+                .iter()
+                .enumerate()
+                .filter(|(n, a)| {
+                    !a.starts_with("--")
+                        && !(*n > 0 && rest.get(n - 1).is_some_and(|p| matches!(p.as_str(), "--part" | "--part-size" | "--pages" | "--section")))
+                })
+                .map(|(_, a)| a.clone())
+                .nth(1);
+            let mut params = json!({"markup": !rest.iter().any(|a| a == "--no-markup"), "pictures": !rest.iter().any(|a| a == "--no-pictures")});
+            for (flag, key) in [("--part", "part"), ("--part-size", "partSize"), ("--section", "section")] {
+                if let Some(v) = arg_value(&rest, flag) {
+                    let n: u64 = v.trim().parse().map_err(|_| format!("{cmd}: {flag} needs a whole number, not `{v}`"))?;
+                    params[key] = json!(n);
+                }
+            }
+            if let Some(v) = arg_value(&rest, "--pages") {
+                params["pages"] = json!(v);
+            }
+            let mut s = open(&input)?;
+            if cmd == "markdown" {
+                if let Some(o) = &output {
+                    params["path"] = json!(o);
+                }
+                let mut r = s.run("document.markdown", &params).map_err(|e| e.to_string())?;
+                return match r.get_mut("markdown").map(serde_json::Value::take) {
+                    Some(Value::String(md)) => write_stdout(|w| writeln!(w, "{md}")),
+                    _ => write_stdout(|w| writeln!(w, "{r}")),
+                };
+            }
+            let out = output.ok_or_else(|| format!("missing argument\n\n{USAGE}"))?;
+            let mut r = s.run("document.preview", &params).map_err(|e| e.to_string())?;
+            let html = match r.get_mut("html").map(serde_json::Value::take) {
+                Some(Value::String(h)) => h,
+                _ => String::new(),
+            };
+            wordcraft_engine::io::write_file(&out, html.as_bytes())?;
+            if let Some(m) = r.as_object_mut() {
+                m.remove("html");
+                m.insert("path".into(), json!(out));
+            }
+            write_stdout(|w| writeln!(w, "{r}"))
         }
         "run" => {
             validate_options("run", &rest, RUN_OPTIONS)?;

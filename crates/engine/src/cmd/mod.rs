@@ -48,6 +48,7 @@ pub mod text;
 pub mod tools;
 pub mod view;
 pub mod whiq_markdown;
+pub mod whiq_preview;
 pub mod whiq_review;
 pub mod wordart;
 
@@ -86,6 +87,8 @@ pub fn registry() -> Registry {
     v.extend(whiq_review::specs());
     // WHIQ: Markdown import of the platform's document shapes; themes.
     v.extend(whiq_markdown::specs());
+    // WHIQ: the Preview pane's page and the agent's Markdown, in parts.
+    v.extend(whiq_preview::specs());
     v.extend(file::specs());
     v.extend(options::specs());
     v.extend(design::specs());
