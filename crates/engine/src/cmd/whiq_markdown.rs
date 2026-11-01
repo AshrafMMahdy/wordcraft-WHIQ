@@ -655,7 +655,17 @@ fn import(s: &mut Session, v: &Value) -> CmdResult {
     let subtitle = get("subtitle").unwrap_or_default();
     let date = get("date").unwrap_or_default();
     let author = get("author").unwrap_or_default();
-    let cover = truthy("cover").unwrap_or(!title.is_empty()) && !title.is_empty();
+    // WHIQ (2026-11-01): a body that already opens with the title (its first paragraph, e.g. `# Title`) gets no cover by
+    // default — the title showed twice, a cover page and the heading under it. `cover: true` still makes one.
+    let opens_with_title = !title.is_empty()
+        && doc
+            .body
+            .iter()
+            .filter_map(|b| b.as_para())
+            .map(|p| p.plain_text())
+            .find(|t| !t.trim().is_empty())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(title.trim()));
+    let cover = truthy("cover").unwrap_or(!title.is_empty() && !opens_with_title) && !title.is_empty();
     // Markers → page breaks, callouts, the TOC's place.
     let mut out: Blocks = Vec::with_capacity(doc.body.len() + 8);
     let mut callout: Option<(Rgb, Rgb)> = None;
@@ -961,6 +971,20 @@ mod tests {
         let mut s = Session::new(Document::new());
         let r = s.run("file.importMarkdown", &json!({"markdown": md})).unwrap();
         (s, r)
+    }
+
+    #[test]
+    fn a_body_that_opens_with_the_title_gets_no_default_cover() {
+        // WHIQ 2026-11-01: title + "# Title" made a cover page and the same heading under it.
+        let mut s = Session::new(Document::new());
+        let r = s.run("file.importMarkdown", &json!({"markdown": "# Site Report\n\nText.\n", "title": "Site Report"})).unwrap();
+        assert_eq!(r["cover"].as_bool(), Some(false), "{r}");
+        let mut s = Session::new(Document::new());
+        let r = s.run("file.importMarkdown", &json!({"markdown": "# Site Report\n\nText.\n", "title": "Site Report", "cover": true})).unwrap();
+        assert_eq!(r["cover"].as_bool(), Some(true), "cover: true still makes one: {r}");
+        let mut s = Session::new(Document::new());
+        let r = s.run("file.importMarkdown", &json!({"markdown": "# Findings\n\nText.\n", "title": "Site Report"})).unwrap();
+        assert_eq!(r["cover"].as_bool(), Some(true), "a different first heading keeps the cover: {r}");
     }
 
     #[test]

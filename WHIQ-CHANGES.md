@@ -450,3 +450,10 @@ objects::tests::a_dragged_shape_leaves_the_text_behind_it`, "No adapter found");
 `real_word_files_keep_what_the_fork_keeps` passes on the Apache POI Word files (130 .docx/.docm in `test-data/document`)
 (`WHIQ_REAL_DOCX_DIR`); the contract suite passes 22/22 against the release binary and against
 the musl binary; `smoke.sh` passes on both.
+
+## v0.7.6 — hosted-test finding (2026-11-01)
+
+- **No double title from a Markdown import** — with a `title` and a body that already opens with that title (its first
+  paragraph, e.g. `# Title`), `file.importMarkdown` no longer makes a cover page by default (the title showed twice: the
+  cover and the heading under it). `cover: true` still makes one; a different first heading keeps the cover. Test:
+  `whiq_markdown.rs` `a_body_that_opens_with_the_title_gets_no_default_cover`.
