@@ -457,3 +457,10 @@ the musl binary; `smoke.sh` passes on both.
   paragraph, e.g. `# Title`), `file.importMarkdown` no longer makes a cover page by default (the title showed twice: the
   cover and the heading under it). `cover: true` still makes one; a different first heading keeps the cover. Test:
   `whiq_markdown.rs` `a_body_that_opens_with_the_title_gets_no_default_cover`.
+
+## The preview's header/footer page numbers show as fields (2026-11-02, whiq-v0.7.7)
+
+`render_preview` draws a header/footer once per preview sheet, and a sheet is not a printed page — a footer's PAGE /
+NUMPAGES fields showed their saved result, "Page 1 of 1" on every page of a pilot customer's document. In a header or
+footer a page-number field now shows as "#" (Word computes it on open and print); in the body a field keeps its result.
+`crates/formats/src/whiq_preview.rs`; test `page_number_fields_in_a_footer_show_as_a_field_not_the_saved_one`.

@@ -873,14 +873,14 @@ impl<'a> Walker<'a> {
                 deferred.push((html, md.trim().to_string()));
             }
             InlineObject::Field { instr, result, .. } => {
-                let shown = if result.is_empty() {
-                    match instr.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str() {
-                        "PAGE" | "NUMPAGES" | "SECTIONPAGES" | "SECTION" => "#".to_string(),
-                        _ => String::new(),
-                    }
-                } else {
-                    result.clone()
-                };
+                let page_field = matches!(
+                    instr.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str(),
+                    "PAGE" | "NUMPAGES" | "SECTIONPAGES" | "SECTION"
+                );
+                // WHIQ: a header/footer is drawn once per sheet, and a preview sheet is not a printed page, so a
+                // page number's stored result ("1" as saved) read "Page 1 of 1" on every page. In a header or footer
+                // a page-number field shows as "#" (Word computes it on print and on open).
+                let shown = if page_field && (result.is_empty() || self.in_hf) { "#".to_string() } else { result.clone() };
                 let shown: String = shown.chars().filter(|c| !c.is_control() || *c == '\t').collect();
                 if !shown.is_empty() {
                     segs.push(Seg::Text { text: symbol_text(&rc.font, &shown), rc: Box::new(rc.clone()) });
@@ -2721,6 +2721,34 @@ mod tests {
         assert_eq!(h.matches("Confidential").count(), 2);
         let m = md(&d);
         assert_eq!(m, "> **Header:** Company header\n\nPage one\n\n<!-- pagebreak -->\n\nPage two\n\n> **Footer:** Confidential");
+    }
+
+    /// WHIQ 2026-11-02 (pilot): a footer's PAGE / NUMPAGES fields read "Page 1 of 1" on every sheet (the
+    /// saved result); a preview sheet is not a printed page, so they show as "#" there. In the body a field
+    /// keeps its result.
+    #[test]
+    fn page_number_fields_in_a_footer_show_as_a_field_not_the_saved_one() {
+        let mut d = Document::new();
+        let field = |instr: &str| InlineObject::Field {
+            instr: instr.into(),
+            result: "1".into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        };
+        let mut foot = Paragraph::with_text("Page  of ", CharProps::default());
+        foot.insert_object(9, field("NUMPAGES"), &CharProps::default()).unwrap();
+        foot.insert_object(5, field("PAGE"), &CharProps::default()).unwrap();
+        d.parts.insert(6, Part { kind: PartKind::Footer, blocks: vec![para_block(foot)], ..Default::default() });
+        d.last_section.footers.default = Some(6);
+        let mut body = Paragraph::with_text("See page ", CharProps::default());
+        body.insert_object(9, field("PAGE"), &CharProps::default()).unwrap();
+        d.body = vec![para_block(body)];
+        let h = html(&d);
+        assert!(h.contains("Page # of #"), "{h}");
+        assert!(!h.contains("Page 1 of 1"), "{h}");
+        assert!(h.contains("See page 1"), "{h}");
     }
 
     #[test]
