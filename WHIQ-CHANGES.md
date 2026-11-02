@@ -464,3 +464,12 @@ the musl binary; `smoke.sh` passes on both.
 NUMPAGES fields showed their saved result, "Page 1 of 1" on every page of a pilot customer's document. In a header or
 footer a page-number field now shows as "#" (Word computes it on open and print); in the body a field keeps its result.
 `crates/formats/src/whiq_preview.rs`; test `page_number_fields_in_a_footer_show_as_a_field_not_the_saved_one`.
+
+## A picture given both sides keeps its aspect ratio unless unlocked (2026-11-02, whiq-v0.7.8)
+
+`picture.size` already locked the ratio by default for one side; given both, it set both, stretching the photo. Owner's
+rule, as in PowerPoint: for a picture with the ratio locked (the default), the width wins, the height follows, and the
+answer's `note` says the height asked for was not used and that `lockAspect: false` sets both freely (warning that a
+large change of shape squeezes or stretches the photo). With `lockAspect: false` both apply and the note says the shape
+changed. Shapes, charts and groups size as before; the app's own Size boxes send one side and are unchanged.
+Test: `cmd/objects.rs` `whiq_picture_both_sides_locked_the_width_wins_and_says_so`.

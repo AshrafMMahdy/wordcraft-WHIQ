@@ -989,12 +989,24 @@ fn size(s: &mut Session, v: &Value) -> CmdResult {
     let (_, o) = selected(s).ok_or_else(|| CmdError::Disabled("no object".into()))?;
     let (w0, h0) = obj_size(&o);
     let lock = p::bool(v, "lockAspect").unwrap_or(true);
+    let picture = matches!(o, InlineObject::Image { .. });
     let (mut w, mut h) = (w0, h0);
     if let Some(sc) = p::f32(v, "scale") {
         w *= sc / 100.0;
         h *= sc / 100.0;
     }
+    // WHIQ (owner, 2026-11-02): a picture keeps its aspect ratio unless unlocked, as in PowerPoint — given both sides with the
+    // ratio locked, the width wins, the height follows, and the answer says the height asked for was not used.
+    let mut note: Option<String> = None;
     match (p::f32(v, "width"), p::f32(v, "height")) {
+        (Some(nw), Some(nh)) if picture && lock && w0 > 0.0 => {
+            h = h0 * nw / w0;
+            w = nw;
+            note = Some(format!(
+                "Aspect ratio locked (a picture's default): the width was applied and the height followed to {:.2} pt; the height you asked ({nh} pt) was not used. To set both sides freely pass lockAspect: false — a large change of shape squeezes or stretches the photo.",
+                h.clamp(1.0, 4000.0)
+            ));
+        }
         (Some(nw), Some(nh)) => {
             w = nw;
             h = nh;
@@ -1017,11 +1029,21 @@ fn size(s: &mut Session, v: &Value) -> CmdResult {
     // Any drawing: a group's members scale with its frame (its child space is kept); a chart or
     // SmartArt graphic lays itself out again at the new size.
     let theme = s.doc.settings.theme_colors.clone();
-    with_obj(s, |o| {
+    let mut out = with_obj(s, |o| {
         o.set_size(w, h);
         super::chart::redraw(o, &theme);
         super::smart_art::redraw(o, &theme);
-    })
+    })?;
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    } else if picture && !lock && w0 > 0.0 && h0 > 0.0 && ((w / h) / (w0 / h0) - 1.0).abs() > 1e-4 {
+        out["note"] = json!(format!(
+            "Aspect ratio unlocked: the picture's shape changed from {:.3}:1 to {:.3}:1, so the photo is squeezed or stretched — render the page to check it reads right.",
+            w0 / h0,
+            w / h
+        ));
+    }
+    Ok(out)
 }
 
 /// Apply an image operation to the selected picture's bitmap (stored as a new PNG).
@@ -1581,6 +1603,28 @@ mod tests {
             let docx = crate::io::save_bytes("p.docx", &s.doc).unwrap();
             assert!(docx.windows(11).any(|w| w == b"word/media/"), "{id}: the saved file keeps the picture");
         }
+    }
+
+    /// WHIQ (owner, 2026-11-02): a picture keeps its ratio unless unlocked — both sides given while locked: the width wins and
+    /// the answer says so; unlocked: both apply and the answer notes the change of shape; one side: the other follows.
+    #[test]
+    fn whiq_picture_both_sides_locked_the_width_wins_and_says_so() {
+        let data = super::super::insert::base64_encode(&png(20, 10));
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        s.run("insert.picture", &json!({"data": data})).unwrap();
+        s.run("select.addObject", &json!({"index": 0})).ok();
+        let r = s.run("picture.size", &json!({"width": 300, "height": 300})).unwrap();
+        let (_, o) = selected(&s).unwrap();
+        let (w, h) = obj_size(&o);
+        assert!((w - 300.0).abs() < 0.01 && (h - 150.0).abs() < 0.01, "{w}x{h}");
+        assert!(r["note"].as_str().unwrap().contains("was not used"), "{r}");
+        let r = s.run("picture.size", &json!({"width": 100})).unwrap();
+        let (w, h) = obj_size(&selected(&s).unwrap().1);
+        assert!((w - 100.0).abs() < 0.01 && (h - 50.0).abs() < 0.01 && r.get("note").is_none(), "{w}x{h} {r}");
+        let r = s.run("picture.size", &json!({"width": 100, "height": 100, "lockAspect": false})).unwrap();
+        let (w, h) = obj_size(&selected(&s).unwrap().1);
+        assert!((w - 100.0).abs() < 0.01 && (h - 100.0).abs() < 0.01, "{w}x{h}");
+        assert!(r["note"].as_str().unwrap().contains("squeezed or stretched"), "{r}");
     }
 
     /// #965: two pictures inserted by commands in a row are both kept; the second doesn't
