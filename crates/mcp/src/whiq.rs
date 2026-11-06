@@ -434,6 +434,52 @@ fn exec_forgiving(b: &mut dyn Backend, id: &str, params: Value, warnings: &mut V
     }
 }
 
+/// One line of a `type_text {paragraphs: true}`: a new paragraph (after the first) whose
+/// direction comes from its first letter, then the line's text. `last` is the last command's
+/// result.
+fn type_paragraph(b: &mut dyn Backend, new_paragraph: bool, line: &str, last: &mut Value) -> Result<(), String> {
+    if new_paragraph {
+        *last = exec(b, "text.newParagraph", json!({}))?;
+        if let Some(rtl) = first_strong(line) {
+            exec(b, if rtl { "para.rtl" } else { "para.ltr" }, json!({"value": true}))?;
+        }
+    }
+    if !line.is_empty() {
+        *last = exec(b, "text.insert", json!({"text": line, "raw": true}))?;
+    }
+    Ok(())
+}
+
+/// WHIQ "Undo the call": the error of a call that failed half way. `rolled`: the document was
+/// put back as it was before the call, and the error says nothing of the call was applied.
+/// Either way `rolled_back` says which.
+pub(crate) fn nothing_applied(e: ToolError, rolled: bool) -> ToolError {
+    let e = if rolled {
+        let next_step = format!("nothing of this call was applied (the document is as it was before it): {}, then send it again", e.next_step);
+        ToolError { next_step, ..e }
+    } else {
+        e
+    };
+    e.with("rolled_back", json!(rolled))
+}
+
+/// WHIQ: what a tool call that panicked passes on to the runtime, which auto-saves and answers
+/// it: the panic's message, and whether the document was put back as it was before the call
+/// (`undone`).
+pub struct Panicked {
+    pub message: String,
+    pub undone: bool,
+}
+
+/// The message a panic carries (a `&str` or a `String`; a [`Panicked`] passes its own on).
+pub fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .or_else(|| p.downcast_ref::<Panicked>().map(|c| c.message.clone()))
+        .unwrap_or_default()
+}
+
 /// `Some(true)` when the first letter of `text` is right-to-left, `Some(false)` left-to-right,
 /// `None` without letters.
 pub fn first_strong(text: &str) -> Option<bool> {
@@ -702,8 +748,8 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let list = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
             let total = list.len();
             let mut out = Vec::new();
-            // WHIQ parity pass: a cancelled call leaves the document as it was before the call.
-            b.begin_call();
+            // WHIQ parity pass: a cancelled call leaves the document as it was before the call
+            // (call_tool took its snapshot). A failed command keeps the ones before it (below).
             for (i, c) in list.into_iter().enumerate() {
                 progress(i as u64, total as u64, "batch commands");
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("").to_string();
@@ -748,7 +794,7 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             let t = st("text").unwrap_or("");
             let mut last = Value::Null;
             let lines = t.split('\n').count();
-            b.begin_call();
+            // call_tool took the call's snapshot: a cancel or a failure puts the document back.
             for (i, line) in t.split('\n').enumerate() {
                 progress(i as u64, lines as u64, "typing paragraphs");
                 // A safe point between paragraphs: the whole call is undone.
@@ -766,15 +812,15 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
                     .with("rolled_back", json!(rolled))
                     .with("typed_paragraphs", json!(if rolled { 0 } else { i })));
                 }
-                if i > 0 {
-                    last = exec(b, "text.newParagraph", json!({})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
-                    if let Some(rtl) = first_strong(line) {
-                        exec(b, if rtl { "para.rtl" } else { "para.ltr" }, json!({"value": true}))
-                            .map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
+                if let Err(e) = type_paragraph(b, i > 0, line, &mut last) {
+                    // WHIQ "Undo the call": the paragraphs before it are taken back too.
+                    let rolled = b.rollback_call();
+                    let mut e = contract::classify(&e, "type_text", a, &[]);
+                    e.reason = format!("paragraph {} of {lines}: {}", i + 1, e.reason);
+                    if !rolled {
+                        e.next_step = format!("{}; the paragraphs before it are typed: send the rest of the text to go on", e.next_step);
                     }
-                }
-                if !line.is_empty() {
-                    last = exec(b, "text.insert", json!({"text": line, "raw": true})).map_err(|e| contract::classify(&e, "type_text", a, &[]))?;
+                    return Err(nothing_applied(e, rolled).with("typed_paragraphs", json!(if rolled { 0 } else { i })));
                 }
             }
             Ok(Out::Json(last))
@@ -820,7 +866,13 @@ fn run(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits, warnings: &m
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(Out::Json(json!({"slept_ms": ms})))
         }
-        "__panic" if limits.test_hooks => test_panic(),
+        "__panic" if limits.test_hooks => {
+            // Half a call first (`text`, typed), so the contract test sees it taken back.
+            if let Some(t) = st("text") {
+                exec(b, "text.insert", json!({"text": t, "raw": true})).map_err(|e| contract::classify(&e, "__panic", a, &[]))?;
+            }
+            test_panic()
+        }
         n if crate::whiq_review::handles(n) => crate::whiq_review::run(b, n, a, limits, warnings),
         _ => {
             // The upstream tool, its result mapped into the contract's shape.
@@ -905,6 +957,9 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     if opens {
         b.open_slot();
     }
+    // WHIQ "Undo the call": the document as it is before this call (after the open slot and the
+    // `document` switch), so a call that fails half way, is cancelled or panics puts it back.
+    b.begin_call();
     // Who is calling: their name on tracked changes and comments made by this call.
     let caller = args.get("caller").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
     let before = caller.as_ref().and_then(|_| b.author());
@@ -915,13 +970,14 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     }
     // A save names its author as the document's creator when it has none (as every craft app
     // does); the last modifier is stamped by the save itself.
+    let mut stamped = false;
     let saves = name == "save_document"
         || (name == "execute" && args.get("command").and_then(Value::as_str).is_some_and(|c| c.to_ascii_lowercase().starts_with("file.save")));
     if saves
         && let Some(who) = caller.clone().or_else(|| b.author()).filter(|a| !a.trim().is_empty() && a != "WordCraft User")
         && exec(b, "file.properties", json!({})).is_ok_and(|p| p["creator"].as_str().is_none_or(str::is_empty))
     {
-        let _ = exec(b, "file.properties", json!({"author": who}));
+        stamped = exec(b, "file.properties", json!({"author": who})).is_ok();
     }
     let policy =
         if !limits.keep_old || args.get("overwrite").and_then(Value::as_bool) == Some(true) { Overwrite::Replace } else { Overwrite::KeepOld };
@@ -929,15 +985,13 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     if wordcraft_engine::whiq_progress::current().is_none() {
         wordcraft_engine::whiq_progress::phase(&name);
     }
-    let (mut out, kept) = with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| with_overwrite(policy, || run(b, &name, &args, limits, &mut warnings))));
+    // WHIQ "Undo the call": a call that panicked half way, or a save that failed after its
+    // creator was stamped, leaves nothing behind: the document is as it was before the call.
+    let failed = !matches!(ran, Ok((Ok(_), _)));
+    let undone = (ran.is_err() || (stamped && failed)) && b.rollback_call();
     if opens {
-        b.end_open(out.is_ok());
-        if let (Ok(Out::Json(v)), Some(h)) = (&mut out, b.active_document()) {
-            if !v.is_object() {
-                *v = json!({"result": v.take()});
-            }
-            v["document"] = json!(h);
-        }
+        b.end_open(!failed);
     }
     b.end_call();
     if let (Some(_), Some(prev)) = (&caller, before) {
@@ -946,6 +1000,21 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value, limits: &Limits) ->
     if let Some(prev) = restore.filter(|_| !opens && name != "close_document") {
         // The document active before comes back (when it is still open).
         let _ = b.select_document(&prev);
+    }
+    // A panic goes on to the runtime (which auto-saves and answers it), saying whether the
+    // document was put back.
+    let (mut out, kept) = match ran {
+        Ok(r) => r,
+        Err(p) => std::panic::resume_unwind(Box::new(Panicked { message: panic_message(p.as_ref()), undone })),
+    };
+    if undone {
+        out = out.map_err(|e| nothing_applied(e, true));
+    }
+    if opens && let (Ok(Out::Json(v)), Some(h)) = (&mut out, b.active_document()) {
+        if !v.is_object() {
+            *v = json!({"result": v.take()});
+        }
+        v["document"] = json!(h);
     }
     let kept_json: Vec<Value> = kept
         .iter()
@@ -1065,7 +1134,8 @@ fn preview_result(v: Value, warnings: &[String]) -> Value {
 
 /// Test hook, reachable only with `WORDCRAFT_MCP_TEST_HOOKS=1` (never in normal use): an
 /// unexpected failure outside any command, so `tests/mcp-contract` can prove the work is
-/// auto-saved and the server keeps answering. The one deliberate panic in shipped code.
+/// auto-saved, the half-done call taken back, and the server keeps answering. The one
+/// deliberate panic in shipped code.
 #[allow(clippy::panic)]
 fn test_panic() -> Result<Out, ToolError> {
     std::panic::panic_any("__panic test hook")

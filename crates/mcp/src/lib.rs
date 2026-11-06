@@ -31,7 +31,8 @@ pub struct Headless {
     /// The active document's session.
     pub session: Session,
     roots: Option<Arc<AutomationRoots>>,
-    /// WHIQ parity pass: the document before the running multi-command call (for a cancel).
+    /// WHIQ: the document before the running call, for a call that is cancelled, fails half
+    /// way or panics ("Undo the call").
     before_call: Option<wordcraft_engine::EditSnapshot>,
     /// WHIQ: the active document's handle number (`doc-<n>`).
     handle: u64,
@@ -40,6 +41,13 @@ pub struct Headless {
     next_handle: u64,
     /// WHIQ: the document an open set aside ([`Backend::open_slot`]), until the open succeeds.
     set_aside: Option<u64>,
+    /// WHIQ: the running open reuses the blank, untouched active document ([`Backend::open_slot`]).
+    reused_blank: bool,
+}
+
+/// WHIQ: a blank, untouched document (no file, no changes, no text): an open uses it as it is.
+fn untouched(s: &Session) -> bool {
+    s.path.is_none() && !s.dirty && s.doc.plain_text(wordcraft_doc::StoryRef::Body).trim().is_empty()
 }
 
 /// WHIQ: the handle a document is named by (`document: "doc-3"`).
@@ -145,6 +153,7 @@ impl Default for Headless {
             parked: Vec::new(),
             next_handle: 2,
             set_aside: None,
+            reused_blank: false,
         }
     }
 }
@@ -190,8 +199,8 @@ impl Backend for Headless {
     }
     fn open_slot(&mut self) {
         // A blank, untouched document is used as it is; anything else stays open beside the new one.
-        let s = &self.session;
-        if s.path.is_none() && !s.dirty && s.doc.plain_text(wordcraft_doc::StoryRef::Body).trim().is_empty() {
+        self.reused_blank = untouched(&self.session);
+        if self.reused_blank {
             self.set_aside = None;
             return;
         }
@@ -204,6 +213,7 @@ impl Backend for Headless {
         self.before_call = None;
     }
     fn end_open(&mut self, opened: bool) {
+        let reused_blank = std::mem::take(&mut self.reused_blank);
         if let Some(n) = self.set_aside.take()
             && !opened
             && let Some(i) = self.parked.iter().position(|(h, _)| *h == n)
@@ -212,6 +222,11 @@ impl Backend for Headless {
             self.session = self.parked.remove(i).1;
             self.handle = n;
             self.next_handle -= 1;
+        } else if reused_blank && !opened && !untouched(&self.session) {
+            // An open into the blank document that failed half way (it holds a file now): the
+            // blank, untouched document it was comes back, under the same handle.
+            self.session = self.fresh_session();
+            self.before_call = None;
         }
     }
     fn close_active(&mut self, discard: bool) -> Result<(String, String), String> {

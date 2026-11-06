@@ -152,3 +152,204 @@ fn type_text_stops_at_a_refused_paragraph_break() {
     assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("paragraph break refused"), "{r}");
     assert_eq!(*calls.lock().unwrap(), vec!["text.insert", "text.newParagraph"]);
 }
+
+/// A headless session whose `nth` run of `command` fails (or, with `panics`, runs and then
+/// panics): a call that breaks half way, for "Undo the call".
+struct Faulty {
+    inner: Headless,
+    command: &'static str,
+    nth: usize,
+    seen: usize,
+    panics: bool,
+}
+
+impl Faulty {
+    fn server(command: &'static str, nth: usize, panics: bool) -> Server {
+        Server::new(Box::new(Faulty { inner: Headless::default(), command, nth, seen: 0, panics }))
+    }
+}
+
+impl crate::backend::Backend for Faulty {
+    #[allow(clippy::panic)]
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let hit = params["command"] == self.command && {
+            self.seen += 1;
+            self.seen == self.nth
+        };
+        if hit && !self.panics {
+            return Err(format!("{} refused", self.command));
+        }
+        let r = self.inner.call(method, params);
+        if hit {
+            std::panic::panic_any("half way");
+        }
+        r
+    }
+    fn has_ui(&self) -> bool {
+        false
+    }
+    fn describe(&self) -> String {
+        "faulty headless session".into()
+    }
+    fn snapshot(&mut self) -> Option<crate::recover::Snapshot> {
+        self.inner.snapshot()
+    }
+    fn author(&self) -> Option<String> {
+        self.inner.author()
+    }
+    fn begin_call(&mut self) {
+        self.inner.begin_call()
+    }
+    fn rollback_call(&mut self) -> bool {
+        self.inner.rollback_call()
+    }
+    fn end_call(&mut self) {
+        self.inner.end_call()
+    }
+    fn has_handles(&self) -> bool {
+        self.inner.has_handles()
+    }
+    fn active_document(&self) -> Option<String> {
+        self.inner.active_document()
+    }
+    fn select_document(&mut self, handle: &str) -> Result<(), Vec<String>> {
+        self.inner.select_document(handle)
+    }
+    fn open_slot(&mut self) {
+        self.inner.open_slot()
+    }
+    fn end_open(&mut self, opened: bool) {
+        self.inner.end_open(opened)
+    }
+}
+
+fn tool_err(s: &mut Server, name: &str, args: Value) -> Value {
+    let r = call(s, 12, "tools/call", json!({"name": name, "arguments": args}));
+    assert_eq!(r["result"]["isError"], true, "{name} should fail: {r}");
+    r["result"]["structuredContent"]["error"].clone()
+}
+
+/// The call panics half way (in MCP code, not in an engine command): what comes back to the
+/// runtime, which answers it.
+fn panicked(s: &mut Server, name: &str, args: Value) -> crate::whiq::Panicked {
+    let line = json!({"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+    let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.handle_line(&line))).expect_err("the call panics");
+    *p.downcast::<crate::whiq::Panicked>().expect("the call's panic, passed on")
+}
+
+fn text(s: &mut Server) -> String {
+    tool(s, "get_text", json!({}))["text"].as_str().unwrap_or("").trim_end().to_string()
+}
+
+/// "Undo the call": type_text {paragraphs: true} that fails on its third line types nothing; the
+/// selection and the undo history are as before it.
+#[test]
+fn type_text_that_fails_half_way_types_nothing() {
+    // text.insert runs: 1 "Before", 2 "one", 3 "two", 4 "three" (refused).
+    let mut s = Faulty::server("text.insert", 4, false);
+    tool(&mut s, "type_text", json!({"text": "Before"}));
+    let e = tool_err(&mut s, "type_text", json!({"text": "one\ntwo\nthree", "paragraphs": true}));
+    assert_eq!((e["rolled_back"].as_bool(), e["typed_paragraphs"].as_u64()), (Some(true), Some(0)), "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("nothing of this call was applied"), "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("paragraph 3 of 3"), "{e}");
+    assert_eq!(text(&mut s), "Before");
+    // The call left no undo step: one undo takes back the typing before it, redo brings it back.
+    tool(&mut s, "execute", json!({"command": "edit.undo"}));
+    assert_eq!(text(&mut s), "");
+    tool(&mut s, "execute", json!({"command": "edit.redo"}));
+    assert_eq!(text(&mut s), "Before");
+}
+
+/// "Undo the call": a panic half way through a call leaves the live document as it was before
+/// the call (and the caller's name is put back), and says so to the runtime.
+#[test]
+fn a_panic_half_way_leaves_the_document_as_it_was() {
+    // text.insert runs: 1 "Before", 2 "one", 3 "two" (runs, then panics).
+    let mut s = Faulty::server("text.insert", 3, true);
+    tool(&mut s, "type_text", json!({"text": "Before"}));
+    let author = s.backend().author();
+    let p = panicked(&mut s, "type_text", json!({"text": "one\ntwo", "paragraphs": true, "caller": "Reviewer"}));
+    assert!(p.undone);
+    assert_eq!(p.message, "half way");
+    assert_eq!(s.backend().author(), author);
+    assert_eq!(text(&mut s), "Before");
+    tool(&mut s, "type_text", json!({"text": "!"}));
+    assert_eq!(text(&mut s), "Before!");
+}
+
+/// "Undo the call": an open that panics half way brings back the document it set aside.
+#[test]
+fn an_open_that_panics_brings_back_the_open_document() {
+    let mut s = Faulty::server("file.new", 1, true);
+    tool(&mut s, "type_text", json!({"text": "Keep"}));
+    let active = s.backend().active_document();
+    assert!(panicked(&mut s, "new_document", json!({})).undone);
+    assert_eq!(s.backend().active_document(), active);
+    assert_eq!(text(&mut s), "Keep");
+}
+
+/// "Undo the call": an open into the blank document that panics after reading the file leaves
+/// the blank, untouched document (no file behind it: a save can't overwrite the file with it).
+#[test]
+fn an_open_into_the_blank_document_that_panics_leaves_it_blank() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-mcp-undo-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("on-disk.docx");
+    let mut w = Server::new(Box::new(Headless::default()));
+    tool(&mut w, "type_text", json!({"text": "On disk"}));
+    tool(&mut w, "save_document", json!({"path": path.to_string_lossy(), "overwrite": true}));
+    let mut s = Faulty::server("file.open", 1, true);
+    let active = s.backend().active_document();
+    assert!(panicked(&mut s, "open_document", json!({"path": path.to_string_lossy()})).undone);
+    assert_eq!(s.backend().active_document(), active);
+    assert_eq!(text(&mut s), "");
+    let snap = s.backend().snapshot().unwrap();
+    assert!(snap.path.is_none() && !snap.dirty, "{:?}", snap.path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Undo the call": compare_documents whose change report fails takes the comparison back.
+#[test]
+fn a_comparison_without_its_report_is_taken_back() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-mcp-undo-compare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let revised = dir.join("revised.docx");
+    let mut w = Server::new(Box::new(Headless::default()));
+    tool(&mut w, "type_text", json!({"text": "The revised text"}));
+    tool(&mut w, "save_document", json!({"path": revised.to_string_lossy(), "overwrite": true}));
+    let mut s = Faulty::server("review.changeReport", 1, false);
+    tool(&mut s, "type_text", json!({"text": "The original text"}));
+    let before = tool(&mut s, "inspect_document", json!({}));
+    let e = tool_err(&mut s, "compare_documents", json!({"revised": revised.to_string_lossy()}));
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("nothing of this call was applied"), "{e}");
+    assert_eq!(tool(&mut s, "inspect_document", json!({})), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// "Undo the call": a save that fails after stamping the caller as the document's creator takes
+/// the stamp back.
+#[test]
+fn a_failed_save_takes_back_the_creator_it_stamped() {
+    let mut s = Faulty::server("file.save", 1, false);
+    tool(&mut s, "type_text", json!({"text": "Unsaved"}));
+    let e = tool_err(&mut s, "save_document", json!({"path": "never-written.docx", "caller": "Reviewer"}));
+    assert_eq!(e["rolled_back"], true, "{e}");
+    let p = tool(&mut s, "execute", json!({"command": "file.properties"}));
+    assert!(p["creator"].as_str().is_none_or(str::is_empty), "{p}");
+    assert_eq!(text(&mut s), "Unsaved");
+}
+
+/// A batch keeps its rule: a failed command keeps the commands before it.
+#[test]
+fn a_failed_batch_command_keeps_the_ones_before_it() {
+    let mut s = Faulty::server("text.insert", 2, false);
+    let e = tool_err(
+        &mut s,
+        "batch",
+        json!({"commands": [{"command": "text.insert", "params": {"text": "kept"}}, {"command": "text.insert", "params": {"text": " lost"}}]}),
+    );
+    assert_eq!(e["failed_at"], 1, "{e}");
+    assert!(e.get("rolled_back").is_none(), "{e}");
+    assert_eq!(text(&mut s), "kept");
+}

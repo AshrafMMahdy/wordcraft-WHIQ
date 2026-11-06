@@ -146,7 +146,10 @@ pub fn run(b: &mut dyn Backend, name: &str, a: &Value, _limits: &Limits, _warnin
                 }
             }
             let compared = exec(b, "review.compare", p).map_err(|e| contract::classify(&e, name, &json!({"path": a.get("revised")}), &[]))?;
-            let mut report = exec(b, "review.changeReport", json!({})).map_err(|e| contract::classify(&e, name, a, &[]))?;
+            // WHIQ "Undo the call": without its report the comparison is taken back (call_tool
+            // took the call's snapshot), and the error says nothing of the call was applied.
+            let mut report = exec(b, "review.changeReport", json!({}))
+                .map_err(|e| crate::whiq::nothing_applied(contract::classify(&e, name, a, &[]), b.rollback_call()))?;
             report["compared"] = compared;
             Ok(Out::Json(report))
         }

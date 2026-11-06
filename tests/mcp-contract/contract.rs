@@ -346,11 +346,14 @@ fn a_panic_is_answered_and_the_work_auto_saved() {
     let d = Dir::new("panic");
     let mut m = Mcp::start(&d.0, &[]);
     m.ok("type_text", json!({"text": "Work before the failure"}));
-    let e = m.err("__panic", json!({}), "internal");
+    // The call types half of its work, then panics: that half is taken back ("Undo the call").
+    let e = m.err("__panic", json!({"text": " and half a call"}), "internal");
     let path = e["recovered_path"].as_str().unwrap().to_string();
     assert!(std::path::Path::new(&path).is_file(), "{e}");
     assert!(path.starts_with(&d.0.to_string_lossy().into_owned()), "inside the write root: {path}");
-    assert_eq!(text_of(&mut m), "Work before the failure", "the server keeps answering");
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("nothing of this call was applied"), "{e}");
+    assert_eq!(text_of(&mut m), "Work before the failure", "the server keeps answering, without the half call");
 }
 
 // §3 Memory pressure evicts the document after the call, auto-saved; the next call says so.

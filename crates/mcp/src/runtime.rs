@@ -651,8 +651,10 @@ pub fn serve(
                 let reply = match reply {
                     Ok(r) => r,
                     Err(p) => {
-                        let what =
-                            p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+                        let what = crate::whiq::panic_message(p.as_ref());
+                        // WHIQ "Undo the call": a tool call that panicked half way was taken back
+                        // (crate::whiq::call_tool): the live document is as it was before it.
+                        let undone = p.downcast_ref::<crate::whiq::Panicked>().is_some_and(|c| c.undone);
                         let saved = autosave_shared(&shared, "panic");
                         // The answer names the file: no marker needed for a later server.
                         if let Some(dir) = saved.as_ref().and_then(|p| p.parent()) {
@@ -665,14 +667,20 @@ pub fn serve(
                         let mut e = ToolError::new(
                             code::INTERNAL,
                             format!("internal error: {what}"),
-                            match &saved {
-                                Some(p) => format!(
+                            match (&saved, undone) {
+                                (Some(p), true) => format!(
+                                    "nothing of this call was applied (the document is as it was before it, and that work is also auto-saved at {}): send it again, changed if it fails the same way",
+                                    p.display()
+                                ),
+                                (None, true) => "nothing of this call was applied (the document is as it was before it): send it again, changed if it fails the same way (the failure was logged)".to_string(),
+                                (Some(p), false) => format!(
                                     "your work up to the previous call is auto-saved at {}: call open_document on it to continue",
                                     p.display()
                                 ),
-                                None => "the document had no unsaved changes; carry on (the failure was logged)".to_string(),
+                                (None, false) => "the document had no unsaved changes; carry on (the failure was logged)".to_string(),
                             },
-                        );
+                        )
+                        .with("rolled_back", json!(undone));
                         if let Some(p) = &saved {
                             e = e.with("recovered_path", json!(p.to_string_lossy()));
                         }

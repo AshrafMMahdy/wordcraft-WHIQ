@@ -473,3 +473,28 @@ answer's `note` says the height asked for was not used and that `lockAspect: fal
 large change of shape squeezes or stretches the photo). With `lockAspect: false` both apply and the note says the shape
 changed. Shapes, charts and groups size as before; the app's own Size boxes send one side and are unchanged.
 Test: `cmd/objects.rs` `whiq_picture_both_sides_locked_the_width_wins_and_says_so`.
+
+## Undo the call (2026-11-06)
+
+Owner's decision (2026-11-05): when one call fails half way, the document goes back to exactly how it was before that
+call, and the error says "nothing of this call was applied" (`rolled_back: true`) — send it again, fixed. `batch` keeps
+its rule (an error keeps commands 1..k-1, `failed_at`; a cancel rolls back).
+
+- `call_tool` now takes the call's snapshot (`Backend::begin_call`) for every call, after the open slot and the
+  `document` switch; `batch` and multi-paragraph `type_text` no longer take their own.
+- Multi-paragraph `type_text` that fails on line k: lines 1..k-1 are taken back (`typed_paragraphs: 0`); the reason
+  names the paragraph. A backend that can't roll back (a running app) keeps them and says so.
+- A panic in MCP code (outside an engine command, which already catches its own): `call_tool` puts the document back,
+  then the open slot, the caller's name and the active document as after any call, and passes the panic on
+  (`whiq::Panicked`); the runtime auto-saves as before and answers `internal` with `rolled_back` and "nothing of this
+  call was applied". An open that panics brings back the document it set aside; an open into the blank document that
+  panics leaves a blank, untouched one (no file behind it, so a later save can't write it over that file).
+- `compare_documents` whose change report fails takes the comparison back.
+- A save that stamped the caller as the document's creator and then failed takes the stamp back.
+
+`crates/mcp/src/whiq.rs` (`call_tool`, `type_paragraph`, `nothing_applied`, `Panicked`), `whiq_review.rs`, `lib.rs`
+(`end_open`), `runtime.rs` (panic arm). Tests: `crates/mcp/src/tests.rs` (`type_text_that_fails_half_way_types_nothing`,
+`a_panic_half_way_leaves_the_document_as_it_was`, `an_open_that_panics_brings_back_the_open_document`,
+`an_open_into_the_blank_document_that_panics_leaves_it_blank`, `a_comparison_without_its_report_is_taken_back`,
+`a_failed_save_takes_back_the_creator_it_stamped`, `a_failed_batch_command_keeps_the_ones_before_it`); contract
+`a_panic_is_answered_and_the_work_auto_saved` (`__panic {text}` types first, then panics).
