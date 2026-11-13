@@ -6,8 +6,8 @@ name: FreeBSD
 # or dependency change: a drifted dependency still shows up within a day, and always before a
 # release ships. PRs that change the FreeBSD packaging itself still run it.
 on:
-  schedule:
-    - cron: "27 4 * * *"
+  # WHIQ fork: the upstream's scheduled run ("27 4 * * *") is switched off here (owner 2026-11-13):
+  # this fork does not use it; run it by hand with workflow_dispatch when wanted.
   push:
     branches: [release]
   pull_request:
