@@ -505,4 +505,7 @@ The platform runs the server headless, where `screenshot`, `click`, `key` and `u
 them wastes a call on a refusal. `tools/list` now lists them only when the app is attached (`--connect`): hidden, not removed —
 a call still answers that it needs the app, and the pictures an agent can have headless stay listed. With the app every tool is
 listed as before, annotations unchanged. `crates/mcp/src/whiq.rs` (`DESKTOP_ONLY`, `listed_tools`); `server.rs` and the runtime's quick `tools/list` (`runtime.rs`, from `Shared::has_ui`, set by the CLI and `Server::new` / `with_shared`).
-Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (none listed headless, `render_page` still is, a `screenshot` call headless answers an error; with an attached app all four are listed with their annotations).
+Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (headless every tool but the four, named in
+the test; each of the four still answers `unsupported`; with an attached app every tool, the four's annotations and `caller`
+checked) and `the_stdio_loop_lists_desktop_only_tools_only_with_the_app` (the same through `runtime::serve`'s quick answer). A
+lock poisoned by a panic elsewhere still gives the real `has_ui` (never a default).

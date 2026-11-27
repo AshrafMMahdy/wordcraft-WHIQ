@@ -859,7 +859,10 @@ pub fn serve(
                         }
                         Some(r)
                     }
-                    "tools/list" => Some(json!({"tools": crate::whiq::listed_tools(shared.lock().map(|g| g.has_ui).unwrap_or(false))})),
+                    // `has_ui` is set once at start: a lock poisoned by a panic elsewhere still holds it (never a default)
+                    "tools/list" => {
+                        Some(json!({"tools": crate::whiq::listed_tools(shared.lock().map_or_else(|e| e.into_inner().has_ui, |g| g.has_ui))}))
+                    }
                     "resources/list" => Some(crate::server::resources_list()),
                     "resources/templates/list" => Some(json!({"resourceTemplates": []})),
                     _ => None,

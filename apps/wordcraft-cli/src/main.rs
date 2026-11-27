@@ -676,7 +676,7 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             let shared = wordcraft_mcp::runtime::SharedState::default();
             if let Ok(mut g) = shared.lock() {
                 g.backend = backend.describe();
-                g.has_ui = backend.has_ui();   // WHIQ: from the first `tools/list` on (the desktop-only tools: whiq::listed_tools)
+                g.has_ui = backend.has_ui(); // WHIQ: from the first `tools/list` on (the desktop-only tools: whiq::listed_tools)
             }
             if let (Ok(mut g), Some(r)) = (shared.lock(), wordcraft_engine::file_access::current()) {
                 g.read_root = r.read_root().map(std::path::Path::to_path_buf);

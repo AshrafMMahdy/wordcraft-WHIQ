@@ -110,31 +110,74 @@ fn render_and_screenshot_through_the_app_use_no_temp_file() {
 
 /// WHIQ: the tools that drive the desktop app's window are listed only with an app attached. The headless server
 /// hides them (an agent there could only get an error from them); a call to one still answers that it needs the app.
+/// WHIQ (2026-11-27): the tools that need the desktop app are not listed headless — hidden, not removed: a call still
+/// answers that it needs the app — and are listed, with their annotations, when the app is attached. The names are written
+/// out here, not read from `whiq::DESKTOP_ONLY`, so a tool left out of it fails this test.
 #[test]
 fn desktop_only_tools_are_listed_only_with_the_app() {
+    let hidden = ["screenshot", "click", "key", "ui_inspect"];
     let names = |s: &mut Server| -> Vec<String> {
         let r = call(s, 2, "tools/list", json!({}));
         r["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
     };
+    let all: Vec<String> =
+        crate::whiq::tool_definitions().as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect();
     let mut headless = Server::new(Box::new(Headless::default()));
-    let listed = names(&mut headless);
-    for n in crate::whiq::DESKTOP_ONLY {
-        assert!(!listed.iter().any(|t| t == n), "{n} is listed headless");
+    let want: Vec<String> = all.iter().filter(|n| !hidden.contains(&n.as_str())).cloned().collect();
+    assert_eq!(names(&mut headless), want, "headless: every tool but the desktop-only ones");
+    for (n, args) in [("screenshot", json!({})), ("click", json!({"x": 1, "y": 1})), ("key", json!({"key": "a"})), ("ui_inspect", json!({}))] {
+        let r = call(&mut headless, 3, "tools/call", json!({"name": n, "arguments": args}));
+        assert_eq!(r["result"]["structuredContent"]["error"]["code"], "unsupported", "{n} still answers that it needs the app: {r}");
     }
-    assert!(listed.iter().any(|t| t == "render_page"), "the picture of a page is still listed");
-    let r = call(&mut headless, 3, "tools/call", json!({"name": "screenshot", "arguments": {}}));
-    assert_eq!(r["result"]["isError"], true, "a hidden tool still answers: {r}");
     let mut app = Server::new(Box::new(FakeApp { calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }));
+    assert_eq!(names(&mut app), all, "with the app every tool, as before");
+    // the contract's per-tool checks (tests/mcp-contract) see only what is listed headless: the hidden ones are checked here
     let tools = call(&mut app, 4, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
-    // with the app all four are listed, their annotations as before (the contract's annotation test sees them headless no more)
-    for n in crate::whiq::DESKTOP_ONLY {
-        let t = tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} is not listed with the app"));
+    for n in hidden {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap();
+        for k in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+            assert!(t["annotations"][k].is_boolean(), "{n}: {k}");
+        }
         let reads = ["screenshot", "ui_inspect"].contains(&n);
         assert_eq!(t["annotations"]["readOnlyHint"], reads, "{n}");
         if reads {
             assert_eq!(t["annotations"]["destructiveHint"], false, "{n}");
         }
+        assert!(t["inputSchema"]["properties"]["caller"].is_object(), "{n} takes caller");
     }
+}
+
+/// WHIQ: the same through the stdio loop the CLI runs (`runtime::serve`), whose quick `tools/list` reads `Shared::has_ui`
+/// (set by the CLI before the loop starts): hidden headless, listed with an app.
+#[test]
+fn the_stdio_loop_lists_desktop_only_tools_only_with_the_app() {
+    let listed = |has_ui: bool| -> Vec<String> {
+        let shared = crate::runtime::SharedState::default();
+        shared.lock().unwrap().has_ui = has_ui;
+        let worker = shared.clone();
+        let make = move || {
+            let b: Box<dyn crate::backend::Backend> = if has_ui {
+                Box::new(FakeApp { calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) })
+            } else {
+                Box::new(Headless::default())
+            };
+            Server::new(b).with_shared(worker)
+        };
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+        let mut out = Vec::new();
+        crate::runtime::serve(make, shared, Default::default(), Default::default(), std::io::Cursor::new(input.as_bytes().to_vec()), &mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let r: Value = serde_json::from_str(text.lines().find(|l| l.contains("\"tools\"")).expect("a tools/list answer")).unwrap();
+        r["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
+    };
+    let headless = listed(false);
+    assert!(
+        !headless.iter().any(|n| ["screenshot", "click", "key", "ui_inspect"].contains(&n.as_str())) && headless.iter().any(|n| n == "render_page"),
+        "{headless:?}"
+    );
+    let app = listed(true);
+    assert!(["screenshot", "click", "key", "ui_inspect"].iter().all(|n| app.iter().any(|t| t == n)), "{app:?}");
 }
 
 /// #40: a headless session never reads or writes the person's custom dictionary file: an agent's
