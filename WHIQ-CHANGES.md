@@ -498,3 +498,11 @@ its rule (an error keeps commands 1..k-1, `failed_at`; a cancel rolls back).
 `an_open_into_the_blank_document_that_panics_leaves_it_blank`, `a_comparison_without_its_report_is_taken_back`,
 `a_failed_save_takes_back_the_creator_it_stamped`, `a_failed_batch_command_keeps_the_ones_before_it`); contract
 `a_panic_is_answered_and_the_work_auto_saved` (`__panic {text}` types first, then panics).
+
+## Desktop-only tools are not listed headless (2026-11-27)
+
+The platform runs the server headless, where `screenshot`, `click`, `key` and `ui_inspect` can only answer that they need the desktop app; an agent offered
+them wastes a call on a refusal. `tools/list` now lists them only when the app is attached (`--connect`): hidden, not removed —
+a call still answers that it needs the app, and the pictures an agent can have headless stay listed. With the app every tool is
+listed as before, annotations unchanged. `crates/mcp/src/whiq.rs` (`DESKTOP_ONLY`, `listed_tools`); `server.rs` and the runtime's quick `tools/list` (`runtime.rs`, from `Shared::has_ui`, set by the CLI and `Server::new` / `with_shared`).
+Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (none listed headless, `render_page` still is, a `screenshot` call headless answers an error; with an attached app all four are listed with their annotations).

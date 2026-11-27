@@ -108,6 +108,35 @@ fn render_and_screenshot_through_the_app_use_no_temp_file() {
     }
 }
 
+/// WHIQ: the tools that drive the desktop app's window are listed only with an app attached. The headless server
+/// hides them (an agent there could only get an error from them); a call to one still answers that it needs the app.
+#[test]
+fn desktop_only_tools_are_listed_only_with_the_app() {
+    let names = |s: &mut Server| -> Vec<String> {
+        let r = call(s, 2, "tools/list", json!({}));
+        r["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
+    };
+    let mut headless = Server::new(Box::new(Headless::default()));
+    let listed = names(&mut headless);
+    for n in crate::whiq::DESKTOP_ONLY {
+        assert!(!listed.iter().any(|t| t == n), "{n} is listed headless");
+    }
+    assert!(listed.iter().any(|t| t == "render_page"), "the picture of a page is still listed");
+    let r = call(&mut headless, 3, "tools/call", json!({"name": "screenshot", "arguments": {}}));
+    assert_eq!(r["result"]["isError"], true, "a hidden tool still answers: {r}");
+    let mut app = Server::new(Box::new(FakeApp { calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }));
+    let tools = call(&mut app, 4, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    // with the app all four are listed, their annotations as before (the contract's annotation test sees them headless no more)
+    for n in crate::whiq::DESKTOP_ONLY {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} is not listed with the app"));
+        let reads = ["screenshot", "ui_inspect"].contains(&n);
+        assert_eq!(t["annotations"]["readOnlyHint"], reads, "{n}");
+        if reads {
+            assert_eq!(t["annotations"]["destructiveHint"], false, "{n}");
+        }
+    }
+}
+
 /// #40: a headless session never reads or writes the person's custom dictionary file: an agent's
 /// Add to Dictionary stays in memory (only the desktop app saves the dictionary).
 #[test]

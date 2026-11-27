@@ -92,6 +92,7 @@ impl Server {
         let shared = crate::runtime::SharedState::default();
         if let Ok(mut g) = shared.lock() {
             g.backend = backend.describe();
+            g.has_ui = backend.has_ui();
         }
         Self { backend, initialized: false, limits: Default::default(), shared, notice: None, started: std::time::Instant::now() }
     }
@@ -108,6 +109,7 @@ impl Server {
     pub fn with_shared(mut self, shared: crate::runtime::SharedState) -> Self {
         let dir = if let Ok(mut g) = shared.lock() {
             g.backend = self.backend.describe();
+            g.has_ui = self.backend.has_ui();
             g.author = self.backend.author();
             g.write_root.clone()
         } else {
@@ -209,7 +211,7 @@ impl Server {
         match method {
             "initialize" => Ok(initialize_result(params, &self.backend.describe())),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": crate::whiq::tool_definitions()})),
+            "tools/list" => Ok(json!({"tools": crate::whiq::listed_tools(self.backend.has_ui())})),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);

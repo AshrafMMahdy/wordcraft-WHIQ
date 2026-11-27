@@ -321,6 +321,19 @@ pub fn tool_definitions() -> Value {
     Value::Array(out)
 }
 
+/// WHIQ: the tools that drive the desktop app's window (they work only with `--connect` to a running app).
+pub const DESKTOP_ONLY: [&str; 4] = ["screenshot", "click", "key", "ui_inspect"];
+
+/// WHIQ: the tools as `tools/list` answers them: without a desktop app attached (`has_ui` false: the headless
+/// server), the desktop-only tools are not listed — hidden, not removed: their code stays, and a call to one still
+/// answers that it needs the desktop app.
+pub fn listed_tools(has_ui: bool) -> Value {
+    match tool_definitions() {
+        Value::Array(v) if !has_ui => Value::Array(v.into_iter().filter(|t| !DESKTOP_ONLY.iter().any(|n| t["name"].as_str() == Some(*n))).collect()),
+        all => all,
+    }
+}
+
 /// Short names agents use for tools.
 const ALIASES: &[(&str, &str)] = &[
     ("open", "open_document"),

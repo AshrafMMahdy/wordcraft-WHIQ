@@ -54,6 +54,8 @@ pub struct Shared {
     pub write_root: Option<PathBuf>,
     pub author: Option<String>,
     pub backend: String,
+    /// WHIQ: a desktop app is attached (`--connect`): its desktop-only tools are listed (`whiq::listed_tools`).
+    pub has_ui: bool,
     /// The document states auto-saved (none is saved twice).
     pub autosaved: Vec<(u64, u64)>,
     /// The last checkpoint: its file, the document state it holds, when.
@@ -857,7 +859,7 @@ pub fn serve(
                         }
                         Some(r)
                     }
-                    "tools/list" => Some(json!({"tools": crate::whiq::tool_definitions()})),
+                    "tools/list" => Some(json!({"tools": crate::whiq::listed_tools(shared.lock().map(|g| g.has_ui).unwrap_or(false))})),
                     "resources/list" => Some(crate::server::resources_list()),
                     "resources/templates/list" => Some(json!({"resourceTemplates": []})),
                     _ => None,
